@@ -1,0 +1,12 @@
+ultralytics
+fastapi
+uvicorn
+python-multipart
+aiofiles
+opencv-python
+matplotlib
+pandas
+pyyaml
+openai
+python-dotenv
+google-generativeai

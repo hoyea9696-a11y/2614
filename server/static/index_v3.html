@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Detector - Precision Vision Platform</title>
+    <link rel="stylesheet" href="static/style.css?v=20260511_v7">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;900&family=Outfit:wght@700;800&display=swap"
+        rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        /* 修復佈局的同時，確保內容不遺失 */
+        .main-content {
+            flex: 1;
+            height: 100vh;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .page {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: none;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            overflow-y: auto;
+            box-sizing: border-box;
+        }
+
+        .page.active {
+            display: block;
+            opacity: 1;
+        }
+
+        .page iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="logo">AI 偵測平台</div>
+            <div class="nav-item active" onclick="switchPage('datasets')"><span>資料集管理</span></div>
+            <div class="nav-item" onclick="switchPage('labeling')"><span>影像標記任務</span></div>
+            <div class="nav-item" onclick="switchPage('train')"><span>模型訓練中心</span></div>
+            <div class="nav-item" onclick="switchPage('verify')"><span>AI 驗證中心</span></div>
+            <div class="nav-item" onclick="switchPage('diagnosis')"><span>模型效能診斷</span></div>
+
+            <div id="system-monitor"
+                style="margin-top: auto; padding: 20px; background: rgba(0,0,0,0.2); border-top: 1px solid rgba(255,255,255,0.05); font-size: 0.75rem;">
+                <div
+                    style="color: #64748b; margin-bottom: 12px; font-weight: 800; letter-spacing: 1.5px; font-size: 0.65rem;">
+                    HARDWARE STATUS</div>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    <div style="display: flex; flex-direction: column; gap: 2px;">
+                        <span style="color: #475569; font-weight: 600;">PROCESSOR</span>
+                        <span id="sys-cpu"
+                            style="color: #cbd5e1; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">-</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="color: #475569; font-weight: 600;">MEMORY</span>
+                        <span id="sys-ram" style="color: #cbd5e1; font-weight: 700;">-</span>
+                    </div>
+                    <div id="sys-mode" class="tag"
+                        style="background: #334155; color: #fff; padding: 4px; text-align: center; margin-top: 5px;">
+                        DETECTING...</div>
+                    <span id="sys-gpu"
+                        style="color: #64748b; font-size: 0.65rem; text-align: center;">Scanning...</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <!-- 0. 資料集管理 -->
+            <div id="page-datasets" class="page active" style="opacity: 1; overflow: hidden;">
+                <iframe id="iframe-datasets" src="about:blank"></iframe>
+            </div>
+
+            <!-- 1. 影像標記任務 -->
+            <div id="page-labeling" class="page" style="overflow: hidden;">
+                <iframe id="iframe-labeling" src="about:blank"></iframe>
+            </div>
+
+            <!-- 2. 模型訓練中心 -->
+            <div id="page-train" class="page" style="padding: 24px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+                    <h2 class="title-gradient">模型訓練中心</h2>
+                </div>
+                <div class="card">
+                    <div class="params-grid" style="grid-template-columns: 1fr 1fr; margin-bottom: 1.5rem;">
+                        <div class="param-item"><label>訓練名稱</label><input type="text" id="train-model-name"
+                                value="my_model" class="tech-input" style="width: 100%;"></div>
+                        <div class="param-item">
+                            <label>模型型號</label>
+                            <select id="train-model-variant" class="tech-select">
+                                <option value="yolov9s.pt">YOLOv9-S</option>
+                                <option value="yolov9m.pt" selected>YOLOv9-M</option>
+                                <option value="yolov9c.pt">YOLOv9-C</option>
+                                <option value="yolov9e.pt">YOLOv9-E</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div
+                        style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 1.5rem; margin-top: 1.5rem;">
+                        <div class="param-item"><label>輪次</label><input type="number" id="train-epochs" value="50"
+                                class="tech-input"></div>
+                        <div class="param-item"><label>早停 (Patience)</label><input type="number" id="train-patience"
+                                value="50" class="tech-input" title="連續幾輪沒進步就停止"></div>
+                        <div class="param-item"><label>批次</label><select id="train-batch" class="tech-select">
+                                <option value="4">4</option>
+                                <option value="8">8</option>
+                                <option value="16" selected>16</option>
+                            </select></div>
+                        <div class="param-item"><label>解析度</label><select id="train-imgsz" class="tech-select">
+                                <option value="320">320</option>
+                                <option value="640" selected>640</option>
+                                <option value="1280">1280</option>
+                            </select></div>
+                    </div>
+                    <div style="display: flex; gap: 1rem; margin-top: 2.5rem; align-items: flex-end;">
+                        <div class="param-item" style="flex: 1;">
+                            <label>訓練資料集</label>
+                            <div style="display: flex; gap: 8px;">
+                                <select id="train-dataset-select" class="tech-select" style="flex: 1;">
+                                    <option value="">-- 請選擇已匯入的資料集 --</option>
+                                </select>
+                                <button class="btn secondary-btn" style="padding: 0 12px;" onclick="loadTrainDatasets()"
+                                    title="重新整理">&#x21bb;</button>
+                            </div>
+                        </div>
+                        <button id="start-train-btn" class="btn primary-btn" style="width: 200px; height: 42px;"
+                            onclick="startTraining()">啟動訓練</button>
+                    </div>
+
+                    <div id="dataset-stats" class="card stats-dashboard-box"
+                        style="display:none; margin-top: 2.5rem; background: rgba(15, 23, 42, 0.9); border: 1px solid rgba(0, 212, 255, 0.3); padding: 30px;">
+                        <div style="display: flex; justify-content: space-around; text-align: center;">
+                            <div class="stat-item">
+                                <div style="color: #cbd5e1; margin-bottom: 12px; font-weight: 600;">🖼️ 圖片總數</div>
+                                <div style="font-size: 2.5rem; font-weight: 800; color: #00d4ff;"><span
+                                        id="stat-img-count">0</span></div>
+                            </div>
+                            <div class="stat-item">
+                                <div style="color: #cbd5e1; margin-bottom: 12px; font-weight: 600;">🏷️ 已配對標記</div>
+                                <div style="font-size: 2.5rem; font-weight: 800; color: #10b981;"><span
+                                        id="stat-matched-count">0</span></div>
+                            </div>
+                            <div class="stat-item">
+                                <div style="color: #cbd5e1; margin-bottom: 12px; font-weight: 600;">⚠️ 未配對圖片</div>
+                                <div style="font-size: 2.5rem; font-weight: 800; color: #f87171;"><span
+                                        id="stat-unmatched-count">0</span></div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 10px;">
+                            <div style="color: #fff; margin-bottom: 10px;">📄 資料集組態預覽</div>
+                            <pre id="yaml-content-display"
+                                style="background: #000; padding: 15px; color: #34d399; font-family: monospace; white-space: pre-wrap; max-height: 150px; overflow-y: auto;">等待分析...</pre>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="training-progress-card" class="card" style="display:none; margin-top: 2rem;">
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                        <h3 style="margin:0;">訓練即時狀態</h3>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button id="pause-train-btn" class="btn secondary-btn" onclick="togglePause()">暫停</button>
+                            <button class="btn danger-btn" onclick="terminateTraining()">終止</button>
+                        </div>
+                    </div>
+                    <div id="train-status-text" style="color: #3b82f6; font-weight: 600;">等待啟動...</div>
+                    <div
+                        style="height: 12px; margin-top: 10px; background: #e2e8f0; border-radius: 6px; overflow: hidden;">
+                        <div id="train-progress-bar" style="width:0%; height:100%; background: #3b82f6;"></div>
+                    </div>
+                    <div style="height: 400px; margin-top: 2rem;"><canvas id="trainChart"></canvas></div>
+                </div>
+            </div>
+
+
+            <!-- 3. AI 影像驗證中心 -->
+            <div id="page-verify" class="page" style="padding: 24px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+                    <h2 class="title-gradient">AI 影像驗證中心</h2>
+                    <button class="btn danger-btn" style="font-size: 0.7rem;" onclick="clearFiles()">清空伺服器資料</button>
+                </div>
+
+                <div class="card" style="position: relative;">
+                    <div class="params-grid">
+                        <div class="param-item">
+                            <label>選用模型</label>
+                            <select id="verify-model-select" class="tech-select model-selector">
+                                <option value="yolov9s.pt">YOLOv9 S</option>
+                                <option value="yolov9m.pt" selected>YOLOv9 M</option>
+                                <option value="yolov9c.pt">YOLOv9 C</option>
+                                <option value="yolov9e.pt">YOLOv9 E</option>
+                            </select>
+                        </div>
+                        <div class="param-item">
+                            <label>影像解析度</label>
+                            <select id="verify-imgsz-select" class="tech-select imgsz-selector">
+                                <option value="320">320 px</option>
+                                <option value="640" selected>640 px</option>
+                                <option value="1280">1280 px</option>
+                            </select>
+                        </div>
+                        <div class="param-item">
+                            <label>過濾強度 (Conf)</label>
+                            <input type="range" id="verify-conf-range" class="conf-range" min="0" max="1" step="0.05" value="0.25"
+                                oninput="this.nextElementSibling.innerText = this.value">
+                            <span class="conf-val">0.25</span>
+                        </div>
+                        <div class="param-item">
+                            <label>敏感度 (IoU)</label>
+                            <input type="range" id="verify-iou-range" class="iou-range" min="0" max="1" step="0.05" value="0.45"
+                                oninput="this.nextElementSibling.innerText = this.value">
+                            <span class="iou-val">0.45</span>
+                        </div>
+                        <div class="param-item">
+                            <label>TTA 增強</label>
+                            <input type="checkbox" id="verify-tta-toggle" style="width:20px; height:20px; accent-color: #3b82f6;">
+                        </div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 1rem; margin-top: 2rem; flex-wrap: wrap;">
+                        <button class="btn secondary-btn" onclick="document.getElementById('file-input-verify-files').click()">選擇影像上傳</button>
+                        <button class="btn secondary-btn" onclick="document.getElementById('file-input-verify-folder').click()">選擇資料夾上傳</button>
+                        <button class="btn primary-btn" onclick="startUnifiedVerification()">啟動 AI 檢測</button>
+                        <span id="verify-status-text" style="font-size: 0.85rem; color: #64748b; font-weight: 600;">尚未選擇任何項目</span>
+                        
+                        <input type="file" id="file-input-verify-files" multiple accept="image/*" style="display:none;" onchange="handleVerifyUpload(this, 'files')">
+                        <input type="file" id="file-input-verify-folder" webkitdirectory directory multiple style="display:none;" onchange="handleVerifyUpload(this, 'folder')">
+                    </div>
+                </div>
+
+                <div id="verify-results-container" class="results-grid" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; margin-top: 2rem;">
+                    <!-- 結果影像會顯示在這裡 -->
+                </div>
+            </div>
+
+            <!-- 1.5 模型效能診斷 -->
+            <div id="page-diagnosis" class="page" style="padding: 24px; overflow-y: auto;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+                    <div style="display: flex; align-items: center; gap: 15px;">
+                        <h2 class="title-gradient" style="margin: 0;">模型效能診斷 (Evaluation Dashboard)</h2>
+                        <select id="diagnosis-model-select" class="tech-select" style="min-width: 200px;">
+                            <option value="">-- 請選擇要診斷的模型 --</option>
+                        </select>
+                    </div>
+                    <button class="btn primary-btn" onclick="loadDiagnosisCharts()" style="font-size: 0.8rem;">載入報告</button>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
+                    <div class="card">
+                        <h3 style="margin-top:0; color: #3b82f6;">混淆矩陣 (Confusion Matrix)</h3>
+                        <p style="color: #94a3b8; font-size: 0.8rem; margin-bottom: 1rem;">用於分析模型是否將某個類別誤認為另一個類別。</p>
+                        <img id="chart-confusion" src="" onclick="openLightbox(this.src)" style="width: 100%; border-radius: 8px; background: rgba(0,0,0,0.2); cursor: zoom-in;">
+                    </div>
+                    <div class="card">
+                        <h3 style="margin-top:0; color: #10b981;">F1-Score 曲線</h3>
+                        <p style="color: #94a3b8; font-size: 0.8rem; margin-bottom: 1rem;">評估精準度與召回率的平衡表現。</p>
+                        <img id="chart-f1" src="" onclick="openLightbox(this.src)" style="width: 100%; border-radius: 8px; background: rgba(0,0,0,0.2); cursor: zoom-in;">
+                    </div>
+                    <div class="card" style="grid-column: span 2;">
+                        <h3 style="margin-top:0; color: #f59e0b;">P-R 曲線 (Precision-Recall)</h3>
+                        <p style="color: #94a3b8; font-size: 0.8rem; margin-bottom: 1rem;">顯示模型在不同門檻下的檢測效能。</p>
+                        <img id="chart-pr" src="" onclick="openLightbox(this.src)" style="width: 100%; border-radius: 8px; background: rgba(0,0,0,0.2); cursor: zoom-in;">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="alert-box" class="alert"></div>
+
+    <!-- 圖片放大 Lightbox -->
+    <div id="lightbox-overlay" onclick="closeLightbox()" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.92); z-index:9998; align-items:center; justify-content:center; cursor:zoom-out;">
+        <button onclick="closeLightbox()" style="position:absolute; top:20px; right:28px; background:none; border:none; color:#fff; font-size:2rem; cursor:pointer; z-index:9999; line-height:1;">&times;</button>
+        <img id="lightbox-img" src="" style="max-width:90vw; max-height:90vh; border-radius:12px; box-shadow: 0 0 60px rgba(0,0,0,0.8); object-fit:contain;">
+    </div>
+    
+    <!-- 自動標記進度懸浮面板 -->
+    <div id="auto-label-panel" style="display: none; position: fixed; bottom: 100px; left: 24px; width: 260px; background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px); border: 1px solid #3b82f6; border-radius: 12px; padding: 16px; z-index: 999; box-shadow: 0 8px 32px rgba(0,0,0,0.5);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <div style="color: #fff; font-size: 0.85rem; font-weight: 700; display: flex; align-items: center; gap: 8px;">
+                <div class="pulse-icon" style="width: 8px; height: 8px; background: #10b981; border-radius: 50%;"></div>
+                自動標記執行中...
+            </div>
+            <div id="auto-label-percent" style="color: #3b82f6; font-size: 0.8rem; font-weight: 800; font-family: 'Outfit';">0%</div>
+        </div>
+        <div style="height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden; margin-bottom: 10px;">
+            <div id="auto-label-bar" style="height: 100%; width: 0%; background: linear-gradient(to right, #3b82f6, #8b5cf6); transition: width 0.3s ease;"></div>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: #94a3b8;">
+            <span id="auto-label-stats">已處理: 0 / 0</span>
+            <span id="auto-label-count" style="color: #10b981;">標記: 0 張</span>
+        </div>
+    </div>
+
+    <style>
+        .pulse-icon { animation: pulse 1.5s infinite; }
+        @keyframes pulse { 
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.3); opacity: 0.5; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+    </style>
+
+    <!-- AI Chat Assistant UI -->
+    <div id="ai-chat-btn" onclick="toggleChat()"
+        style="position: fixed; bottom: 24px; right: 24px; width: 60px; height: 60px; border-radius: 50%; background: linear-gradient(135deg, #3b82f6, #8b5cf6); box-shadow: 0 4px 15px rgba(59, 130, 246, 0.4); display: flex; align-items: center; justify-content: center; cursor: pointer; z-index: 1000; transition: transform 0.2s;">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        </svg>
+    </div>
+
+    <div id="ai-chat-window"
+        style="display: none; position: fixed; bottom: 100px; right: 24px; width: 350px; height: 500px; background: rgba(30, 41, 59, 0.95); backdrop-filter: blur(10px); border: 1px solid rgba(59, 130, 246, 0.3); border-radius: 16px; box-shadow: 0 10px 40px rgba(59, 130, 246, 0.2); z-index: 1000; flex-direction: column; overflow: hidden;">
+        <div style="background: linear-gradient(to right, #3b82f6, #8b5cf6); height: 4px; width: 100%;"></div>
+        <div
+            style="background: rgba(30, 41, 59, 0.8); padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;">
+            <div style="color: white; font-weight: 700; display: flex; align-items: center; gap: 8px;">
+                <span
+                    style="display:inline-block; width:8px; height:8px; background:#10b981; border-radius:50%;"></span>
+                AI Assistant
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <select id="ai-model-select"
+                    style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; outline: none;">
+                    <option value="gemini">Gemini 1.5 Flash</option>
+                    <option value="gemma">Gemma 4</option>
+                    <option value="gemini-pro">Gemini 1.5 Pro</option>
+                    <option value="groq">Groq (Llama 3.3)</option>
+                    <option value="local">Local (Ollama)</option>
+                </select>
+                <button onclick="toggleChat()" style="background: none; border: none; color: #94a3b8; cursor: pointer;">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <div id="ai-chat-history"
+            style="flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; font-size: 0.9rem;">
+            <div
+                style="align-self: flex-start; background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.2); padding: 10px 14px; border-radius: 12px; color: #e2e8f0; max-width: 85%;">
+                你好！我是 AI 助手。
+            </div>
+        </div>
+        <!-- Quick Actions -->
+        <div style="padding: 8px 12px; display: flex; gap: 6px; overflow-x: auto; background: rgba(15, 23, 42, 0.8);">
+            <button onclick="quickPrompt('幫我分析最近一次的訓練成果')"
+                style="background: rgba(59, 130, 246, 0.2); border: 1px solid rgba(59, 130, 246, 0.4); color: #60a5fa; padding: 4px 10px; border-radius: 12px; font-size: 0.7rem; cursor: pointer;">📊
+                分析訓練</button>
+            <button onclick="quickPrompt('目前資料集有什麼優化建議嗎？')"
+                style="background: rgba(59, 130, 246, 0.2); border: 1px solid rgba(59, 130, 246, 0.4); color: #60a5fa; padding: 4px 10px; border-radius: 12px; font-size: 0.7rem; cursor: pointer;">📁
+                資料集建議</button>
+            <button onclick="quickPrompt('解釋一下 YOLO 的 mAP50 代表什麼')"
+                style="background: rgba(59, 130, 246, 0.2); border: 1px solid rgba(59, 130, 246, 0.4); color: #60a5fa; padding: 4px 10px; border-radius: 12px; font-size: 0.7rem; cursor: pointer;">💡
+                名詞解釋</button>
+        </div>
+        <!-- Input Area (Fixed Height) -->
+        <div
+            style="height: 60px; min-height: 60px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,0.1); background: #1e293b;">
+            <div style="display: flex; gap: 8px; height: 100%;">
+                <input type="text" id="ai-chat-input" placeholder="輸入問題..."
+                    style="flex: 1; padding: 0 14px; background: rgba(255,255,255,0.05); border: 1px solid #3b82f6; border-radius: 8px; color: white; outline: none; height: 100%;"
+                    onkeypress="if(event.key === 'Enter') sendChatMessage()">
+                <button onclick="sendChatMessage()"
+                    style="background: #3b82f6; border: none; color: white; padding: 0 16px; border-radius: 8px; cursor: pointer; font-weight: 600; height: 100%;">送出</button>
+            </div>
+        </div>
+    </div>
+
+
+    <script>
+        // 終極防快取：直接在 HTML 內嵌執行頁面記憶
+        document.addEventListener('DOMContentLoaded', () => {
+            const timestamp = Date.now();
+            const pages = {
+                'iframe-datasets': `http://127.0.0.1:8001/static/datasets.html?t=${timestamp}`,
+                'iframe-labeling': `http://127.0.0.1:8002/static/labeling.html?t=${timestamp}`
+            };
+
+            // 逐一初始化
+            for (const [id, url] of Object.entries(pages)) {
+                const iframe = document.getElementById(id);
+                if (iframe) iframe.src = url;
+            }
+
+            setTimeout(() => {
+                const lastPage = localStorage.getItem('ai_detector_active_page') || 'datasets';
+                if (window.switchPage) switchPage(lastPage);
+            }, 500);
+        });
+
+        // 跨頁面即時更新監聽
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'LABEL_SAVED') {
+                // 手動儲存：只通知資料集頁面更新進度條，不動標記頁面
+                const dsIframe = document.getElementById('iframe-datasets');
+                if (dsIframe && dsIframe.contentWindow) {
+                    dsIframe.contentWindow.postMessage({ type: 'REFRESH_DATA' }, '*');
+                }
+            } else if (event.data.type === 'AUTO_LABEL_DONE') {
+                // 自動標記完成：通知所有子頁面重新讀取
+                document.querySelectorAll('iframe').forEach(iframe => {
+                    if (iframe.contentWindow) {
+                        iframe.contentWindow.postMessage({ type: 'REFRESH_DATA' }, '*');
+                    }
+                });
+            }
+        });
+    </script>
+    <div id="alert-box" class="alert"></div>
+    <script src="static/app.js?v=20260515_v9"></script>
+</body>
+
+</html>

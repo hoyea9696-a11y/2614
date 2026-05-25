@@ -1,0 +1,15 @@
+train: train/images
+val: valid/images
+test: ../test/images
+nc: 3
+names:
+- rose
+- sunflower
+- tulip
+roboflow:
+  workspace: thanh-phap
+  project: flowers-detection-yuchd
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/thanh-phap/flowers-detection-yuchd/dataset/1
+path: C:\Users\freddy_huang\Downloads\Flowers Detection.v1-roboflow-instant-1--eval-.yolov8

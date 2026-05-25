@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Detector - Precision Vision Platform</title>
+    <link rel="stylesheet" href="static/style.css?v=20260511_v7">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;900&family=Outfit:wght@700;800&display=swap"
+        rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        /* 修復佈局的同時，確保內容不遺失 */
+        .main-content {
+            flex: 1;
+            height: 100vh;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .page {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: none;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            overflow-y: auto;
+            box-sizing: border-box;
+        }
+
+        .page.active {
+            display: block;
+            opacity: 1;
+        }
+
+        .page iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="logo">AI 偵測平台</div>
+            <div class="nav-item active" onclick="switchPage('datasets')"><span>資料集管理</span></div>
+            <div class="nav-item" onclick="switchPage('labeling')"><span>影像標記任務</span></div>
+            <div class="nav-item" onclick="switchPage('train')"><span>模型訓練中心</span></div>
+            <div class="nav-item" onclick="switchPage('single-verify')"><span>單張影像驗證</span></div>
+            <div class="nav-item" onclick="switchPage('batch-verify')"><span>批量資料夾驗證</span></div>
+
+            <div id="system-monitor"
+                style="margin-top: auto; padding: 20px; background: rgba(0,0,0,0.2); border-top: 1px solid rgba(255,255,255,0.05); font-size: 0.75rem;">
+                <div
+                    style="color: #64748b; margin-bottom: 12px; font-weight: 800; letter-spacing: 1.5px; font-size: 0.65rem;">
+                    HARDWARE STATUS</div>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    <div style="display: flex; flex-direction: column; gap: 2px;">
+                        <span style="color: #475569; font-weight: 600;">PROCESSOR</span>
+                        <span id="sys-cpu"
+                            style="color: #cbd5e1; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">-</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="color: #475569; font-weight: 600;">MEMORY</span>
+                        <span id="sys-ram" style="color: #cbd5e1; font-weight: 700;">-</span>
+                    </div>
+                    <div id="sys-mode" class="tag"
+                        style="background: #334155; color: #fff; padding: 4px; text-align: center; margin-top: 5px;">
+                        DETECTING...</div>
+                    <span id="sys-gpu"
+                        style="color: #64748b; font-size: 0.65rem; text-align: center;">Scanning...</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <!-- 0. 資料集管理 -->
+            <div id="page-datasets" class="page active" style="opacity: 1; overflow: hidden;">
+                <iframe id="iframe-datasets" src="http://localhost:8001/static/datasets.html?v=V3.1"></iframe>
+            </div>
+
+            <!-- 1. 影像標記任務 -->
+            <div id="page-labeling" class="page" style="overflow: hidden;">
+                <iframe id="iframe-labeling" src="http://localhost:8002/static/labeling.html?v=V3.1"></iframe>
+            </div>
+
+            <!-- 2. 模型訓練中心 -->
+            <div id="page-train" class="page" style="padding: 24px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+                    <h2 class="title-gradient">模型訓練中心</h2>
+                </div>
+                <div class="card">
+                    <div class="params-grid" style="grid-template-columns: 1fr 1fr; margin-bottom: 1.5rem;">
+                        <div class="param-item"><label>訓練名稱</label><input type="text" id="train-model-name"
+                                value="my_model" class="tech-input" style="width: 100%;"></div>
+                        <div class="param-item">
+                            <label>模型型號</label>
+                            <select id="train-model-variant" class="tech-select">
+                                <option value="yolov9s.pt">YOLOv9-S</option>
+                                <option value="yolov9m.pt" selected>YOLOv9-M</option>
+                                <option value="yolov9c.pt">YOLOv9-C</option>
+                                <option value="yolov9e.pt">YOLOv9-E</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div
+                        style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 1.5rem; margin-top: 1.5rem;">
+                        <div class="param-item"><label>輪次</label><input type="number" id="train-epochs" value="50"
+                                class="tech-input"></div>
+                        <div class="param-item"><label>早停 (Patience)</label><input type="number" id="train-patience"
+                                value="50" class="tech-input" title="連續幾輪沒進步就停止"></div>
+                        <div class="param-item"><label>批次</label><select id="train-batch" class="tech-select">
+                                <option value="4">4</option>
+                                <option value="8">8</option>
+                                <option value="16" selected>16</option>
+                            </select></div>
+                        <div class="param-item"><label>解析度</label><select id="train-imgsz" class="tech-select">
+                                <option value="320">320</option>
+                                <option value="640" selected>640</option>
+                                <option value="1280">1280</option>
+                            </select></div>
+                    </div>
+                    <div style="display: flex; gap: 1rem; margin-top: 2.5rem; align-items: flex-end;">
+                        <div class="param-item" style="flex: 1;">
+                            <label>訓練資料集</label>
+                            <div style="display: flex; gap: 8px;">
+                                <select id="train-dataset-select" class="tech-select" style="flex: 1;">
+                                    <option value="">-- 請選擇已匯入的資料集 --</option>
+                                </select>
+                                <button class="btn secondary-btn" style="padding: 0 12px;" onclick="loadTrainDatasets()"
+                                    title="重新整理">&#x21bb;</button>
+                            </div>
+                        </div>
+                        <button id="start-train-btn" class="btn primary-btn" style="width: 200px; height: 42px;"
+                            onclick="startTraining()">啟動訓練</button>
+                    </div>
+
+                    <div id="dataset-stats" class="card stats-dashboard-box"
+                        style="display:none; margin-top: 2.5rem; background: rgba(15, 23, 42, 0.9); border: 1px solid rgba(0, 212, 255, 0.3); padding: 30px;">
+                        <div style="display: flex; justify-content: space-around; text-align: center;">
+                            <div class="stat-item">
+                                <div style="color: #cbd5e1; margin-bottom: 12px; font-weight: 600;">🖼️ 圖片總數</div>
+                                <div style="font-size: 2.5rem; font-weight: 800; color: #00d4ff;"><span
+                                        id="stat-img-count">0</span></div>
+                            </div>
+                            <div class="stat-item">
+                                <div style="color: #cbd5e1; margin-bottom: 12px; font-weight: 600;">🏷️ 已配對標記</div>
+                                <div style="font-size: 2.5rem; font-weight: 800; color: #10b981;"><span
+                                        id="stat-matched-count">0</span></div>
+                            </div>
+                            <div class="stat-item">
+                                <div style="color: #cbd5e1; margin-bottom: 12px; font-weight: 600;">⚠️ 未配對圖片</div>
+                                <div style="font-size: 2.5rem; font-weight: 800; color: #f87171;"><span
+                                        id="stat-unmatched-count">0</span></div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 10px;">
+                            <div style="color: #fff; margin-bottom: 10px;">📄 資料集組態預覽</div>
+                            <pre id="yaml-content-display"
+                                style="background: #000; padding: 15px; color: #34d399; font-family: monospace; white-space: pre-wrap; max-height: 150px; overflow-y: auto;">等待分析...</pre>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="training-progress-card" class="card" style="display:none; margin-top: 2rem;">
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                        <h3 style="margin:0;">訓練即時狀態</h3>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button id="pause-train-btn" class="btn secondary-btn" onclick="togglePause()">暫停</button>
+                            <button class="btn danger-btn" onclick="terminateTraining()">終止</button>
+                        </div>
+                    </div>
+                    <div id="train-status-text" style="color: #3b82f6; font-weight: 600;">等待啟動...</div>
+                    <div
+                        style="height: 12px; margin-top: 10px; background: #e2e8f0; border-radius: 6px; overflow: hidden;">
+                        <div id="train-progress-bar" style="width:0%; height:100%; background: #3b82f6;"></div>
+                    </div>
+                    <div style="height: 400px; margin-top: 2rem;"><canvas id="trainChart"></canvas></div>
+                </div>
+            </div>
+
+
+            <!-- 3. 單張影像驗證 -->
+            <div id="page-single-verify" class="page" style="padding: 24px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+                    <h2 class="title-gradient">單張影像快速驗證</h2>
+                    <button class="btn danger-btn" style="font-size: 0.7rem;" onclick="clearFiles()">清空伺服器資料</button>
+                </div>
+
+                <div class="card" style="position: relative;">
+                    <div class="help-icon" onclick="toggleTooltip('single')">?</div>
+                    <div id="tooltip-single" class="tooltip-box">
+                        <h4>參數引導</h4>
+                        <ul>
+                            <li><strong>TTA</strong>: 增強推理。</li>
+                            <li><strong>Conf</strong>: 過濾強度。</li>
+                            <li><strong>IoU</strong>: 敏感度。</li>
+                        </ul>
+                    </div>
+                    <div class="params-grid">
+                        <div class="param-item">
+                            <label>選用模型</label>
+                            <select class="tech-select model-selector" onchange="syncParams(this, '.model-selector')">
+                                <option value="yolov9s.pt">YOLOv9 S</option>
+                                <option value="yolov9m.pt" selected>YOLOv9 M</option>
+                                <option value="yolov9c.pt">YOLOv9 C</option>
+                                <option value="yolov9e.pt">YOLOv9 E</option>
+                            </select>
+                        </div>
+                        <div class="param-item">
+                            <label>影像解析度</label>
+                            <select class="tech-select imgsz-selector" onchange="syncParams(this, '.imgsz-selector')">
+                                <option value="320">320 px</option>
+                                <option value="640" selected>640 px</option>
+                                <option value="1280">1280 px</option>
+                            </select>
+                        </div>
+                        <div class="param-item">
+                            <label>過濾強度 (Conf)</label>
+                            <input type="range" class="conf-range" min="0" max="1" step="0.05" value="0.25"
+                                oninput="syncParams(this, '.conf-range')">
+                            <span class="conf-val">0.25</span>
+                        </div>
+                        <div class="param-item">
+                            <label>敏感度 (IoU)</label>
+                            <input type="range" class="iou-range" min="0" max="1" step="0.05" value="0.45"
+                                oninput="syncParams(this, '.iou-range')">
+                            <span class="iou-val">0.45</span>
+                        </div>
+                        <div class="param-item">
+                            <label>TTA 增強</label>
+                            <input type="checkbox" class="augment-toggle" style="width:20px;height:20px;"
+                                onchange="syncParams(this, '.augment-toggle')">
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 1rem; margin-top: 2rem;">
+                        <button class="btn secondary-btn"
+                            onclick="document.getElementById('file-input-single').click()">選擇影像</button>
+                        <button class="btn primary-btn" onclick="startVerification('single')">啟動檢測</button>
+                        <input type="file" id="file-input-single" style="display:none;"
+                            onchange="handleFilesUpload(this, 'single')">
+                    </div>
+                </div>
+                <div class="card preview-card" style="padding:0; margin-top: 2rem;"><img id="prediction-img-single"
+                        class="main-preview-img"></div>
+            </div>
+
+            <!-- 4. 批量資料夾驗證 -->
+            <div id="page-batch-verify" class="page" style="padding: 24px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+                    <h2 class="title-gradient">批量資料夾深度驗證</h2>
+                    <button class="btn danger-btn" style="font-size: 0.7rem;" onclick="clearFiles()">清空伺服器資料</button>
+                </div>
+                <div class="card" style="position: relative;">
+                    <div class="help-icon" onclick="toggleTooltip('batch')">?</div>
+                    <div class="params-grid">
+                        <div class="param-item">
+                            <label>選用模型</label>
+                            <select class="tech-select model-selector" onchange="syncParams(this, '.model-selector')">
+                                <option value="yolov9s.pt">YOLOv9 S</option>
+                                <option value="yolov9m.pt" selected>YOLOv9 M</option>
+                                <option value="yolov9c.pt">YOLOv9 C</option>
+                                <option value="yolov9e.pt">YOLOv9 E</option>
+                            </select>
+                        </div>
+                        <div class="param-item">
+                            <label>影像解析度</label>
+                            <select class="tech-select imgsz-selector" onchange="syncParams(this, '.imgsz-selector')">
+                                <option value="640" selected>640 px</option>
+                            </select>
+                        </div>
+                        <div class="param-item">
+                            <label>過濾強度 (Conf)</label>
+                            <input type="range" class="conf-range" min="0" max="1" step="0.05" value="0.25"
+                                oninput="syncParams(this, '.conf-range')">
+                            <span class="conf-val">0.25</span>
+                        </div>
+                        <div class="param-item">
+                            <label>敏感度 (IoU)</label>
+                            <input type="range" class="iou-range" min="0" max="1" step="0.05" value="0.45"
+                                oninput="syncParams(this, '.iou-range')">
+                            <span class="iou-val">0.45</span>
+                        </div>
+                        <div class="param-item">
+                            <label>TTA 增強</label>
+                            <input type="checkbox" class="augment-toggle" style="width:20px;height:20px;"
+                                onchange="syncParams(this, '.augment-toggle')">
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 1rem; margin-top: 2rem;">
+                        <button class="btn secondary-btn"
+                            onclick="document.getElementById('file-input-batch').click()">選擇資料夾</button>
+                        <button class="btn primary-btn" onclick="startBatchVerification()">啟動批量檢測</button>
+                        <input type="file" id="file-input-batch" webkitdirectory directory style="display:none;"
+                            onchange="handleFilesUpload(this, 'batch')">
+                    </div>
+                </div>
+                <div class="card preview-card" style="padding:0; margin-top: 2rem;"><img id="prediction-img-batch"
+                        class="main-preview-img"></div>
+            </div>
+        </div>
+    </div>
+    <div id="alert-box" class="alert"></div>
+
+    <!-- AI Chat Assistant UI -->
+    <div id="ai-chat-btn" onclick="toggleChat()"
+        style="position: fixed; bottom: 24px; right: 24px; width: 60px; height: 60px; border-radius: 50%; background: linear-gradient(135deg, #3b82f6, #8b5cf6); box-shadow: 0 4px 15px rgba(59, 130, 246, 0.4); display: flex; align-items: center; justify-content: center; cursor: pointer; z-index: 1000; transition: transform 0.2s;">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        </svg>
+    </div>
+
+    <div id="ai-chat-window"
+        style="display: none; position: fixed; bottom: 100px; right: 24px; width: 350px; height: 500px; background: rgba(30, 41, 59, 0.95); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 16px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5); z-index: 1000; flex-direction: column; overflow: hidden;">
+        <div
+            style="background: linear-gradient(to right, #1e293b, #334155); padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;">
+            <div style="color: white; font-weight: 700; display: flex; align-items: center; gap: 8px;">
+                <span
+                    style="display:inline-block; width:8px; height:8px; background:#10b981; border-radius:50%;"></span>
+                AI Assistant
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <select id="ai-model-select"
+                    style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; outline: none;">
+                    <option value="gemini">Gemini Flash</option>
+                    <option value="gemma">Gemma 4</option>
+                    <option value="groq">Groq (Llama3)</option>
+                    <option value="local">Local (Ollama)</option>
+                </select>
+                <button onclick="toggleChat()" style="background: none; border: none; color: #94a3b8; cursor: pointer;">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <div id="ai-chat-history"
+            style="flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; font-size: 0.9rem;">
+            <div
+                style="align-self: flex-start; background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.2); padding: 10px 14px; border-radius: 12px; color: #e2e8f0; max-width: 85%;">
+                你好！我是 AI 助手。
+            </div>
+        </div>
+        <!-- Quick Actions -->
+    </div>
+    <div style="padding: 12px; border-top: 1px solid rgba(255,255,255,0.05); background: rgba(15, 23, 42, 0.5);">
+        <div style="display: flex; gap: 8px;">
+            <input type="text" id="ai-chat-input" placeholder="輸入問題..."
+                style="flex: 1; padding: 10px 14px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: white; outline: none;"
+                onkeypress="if(event.key === 'Enter') sendChatMessage()">
+            <button onclick="sendChatMessage()"
+                style="background: #3b82f6; border: none; color: white; padding: 0 16px; border-radius: 8px; cursor: pointer; font-weight: 600;">送出</button>
+        </div>
+    </div>
+    </div>
+    </div>
+
+    <script src="static/app.js?v=20260511_v7"></script>
+    <script>
+        // 終極防快取：直接在 HTML 內嵌執行頁面記憶
+        document.addEventListener('DOMContentLoaded', () => {
+            // 動態為所有 iframe 加上時間戳記，確保永遠不讀取舊快取
+            const timestamp = Date.now();
+            document.querySelectorAll('iframe').forEach(iframe => {
+                const baseSrc = iframe.src.split('?')[0];
+                iframe.src = `${baseSrc}?t=${timestamp}`;
+            });
+
+            setTimeout(() => {
+                const lastPage = localStorage.getItem('ai_detector_active_page') || 'datasets';
+                if (window.switchPage) switchPage(lastPage);
+            }, 300);
+        });
+
+        // 跨頁面即時更新進度條
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'LABEL_SAVED') {
+                const dsIframe = document.getElementById('iframe-datasets');
+                if (dsIframe && dsIframe.contentWindow) {
+                    dsIframe.contentWindow.postMessage({ type: 'REFRESH_DATASETS' }, '*');
+                }
+            }
+        });
+    </script>
+</body>
+
+</html>

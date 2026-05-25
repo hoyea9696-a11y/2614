@@ -1,0 +1,10 @@
+names:
+- daisy
+- dandelion
+- roses
+- sunflower
+- tulips
+path: C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\花
+test: C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\花\test.txt
+train: C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\花\train.txt
+val: C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\花\val.txt

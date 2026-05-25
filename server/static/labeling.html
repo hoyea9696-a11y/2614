@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Detector - 資料標記</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=Outfit:wght@600;900&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --bg-deep: #f1f5f9;
+            --card-bg: #ffffff;
+            --accent-blue: #3b82f6;
+            --border-color: #e2e8f0;
+        }
+
+        body {
+            margin: 0;
+            font-family: 'Inter', sans-serif;
+            background: #f1f5f9;
+            background-image:
+                radial-gradient(rgba(0, 123, 255, 0.05) 1px, transparent 0),
+                radial-gradient(at 0% 0%, rgba(0, 123, 255, 0.35) 0px, transparent 55%),
+                radial-gradient(at 100% 0%, rgba(108, 92, 231, 0.25) 0px, transparent 55%),
+                radial-gradient(at 100% 100%, rgba(0, 123, 255, 0.35) 0px, transparent 55%),
+                radial-gradient(at 0% 100%, rgba(108, 92, 231, 0.25) 0px, transparent 55%);
+            background-size: 30px 30px, 100% 100%, 100% 100%, 100% 100%, 100% 100%;
+            background-attachment: fixed;
+            color: #1e293b;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .title-gradient {
+            background: linear-gradient(135deg, #0f172a 20%, #3b82f6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-family: 'Outfit', sans-serif;
+            font-weight: 800;
+            font-size: 1.8rem;
+        }
+
+        .btn {
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: 0.2s;
+            font-size: 0.9rem;
+        }
+
+        .primary-btn {
+            background: var(--accent-blue);
+            color: #fff;
+        }
+
+        .secondary-btn {
+            background: #334155;
+            color: #f1f5f9;
+        }
+
+        .tool-btn {
+            background: #334155;
+            color: #fff;
+            padding: 10px;
+            border-radius: 8px;
+            cursor: pointer;
+            width: 44px;
+            height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .tool-btn.active {
+            background: var(--accent-blue);
+            box-shadow: 0 0 15px rgba(59, 130, 246, 0.5);
+        }
+
+        #canvas-container {
+            background: #000;
+            border-radius: 8px;
+            position: relative;
+            overflow: hidden;
+            display: block;
+            min-height: 400px;
+        }
+
+        .class-item {
+            background: #f8fafc;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            padding: 12px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: 0.2s;
+        }
+
+        .class-item:hover {
+            background: #f1f5f9;
+        }
+
+        .class-item.active {
+            border-color: var(--accent-blue);
+            background: rgba(59, 130, 246, 0.1);
+            box-shadow: 0 0 0 1px var(--accent-blue);
+        }
+
+        #alert-box {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 15px 30px;
+            border-radius: 10px;
+            background: #3b82f6;
+            color: #fff;
+            z-index: 10000;
+            display: none;
+            font-weight: 800;
+            font-size: 1.2rem;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+        }
+    </style>
+</head>
+
+<body>
+    <div id="alert-box">測試提示框</div>
+    <div style="padding: 24px; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <h2 class="title-gradient">影像標記工作區 <span
+                    style="font-size: 0.9rem; color: #3b82f6; font-weight: 800;"></span></h2>
+            <div
+                style="display: flex; gap: 12px; background: #fff; padding: 6px; border-radius: 10px; border: 1px solid var(--border-color); align-items: center;">
+                
+                <!-- 標記框顯示/隱藏控制 -->
+                <div style="display: flex; gap: 6px; border-right: 1px solid var(--border-color); padding-right: 12px; margin-right: 4px;">
+                    <button id="btn-hide-boxes" class="btn secondary-btn" style="padding: 6px 12px; font-size: 0.75rem; background: #64748b;" onclick="toggleBoxesVisibility(false)" title="隱藏所有標記框">隱藏標記框</button>
+                    <button id="btn-show-boxes" class="btn primary-btn" style="padding: 6px 12px; font-size: 0.75rem; background: var(--accent-blue);" onclick="toggleBoxesVisibility(true)" title="顯示所有標記框">顯示標記框</button>
+                </div>
+
+                <button id="btn-select" class="tool-btn active" onclick="setMode('select')"><svg width="20" height="20"
+                        viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z" />
+                        <path d="M13 13l6 6" />
+                    </svg></button>
+                <button id="btn-draw" class="tool-btn" onclick="setMode('draw')"><svg width="20" height="20"
+                        viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                    </svg></button>
+                <button id="btn-poly" class="tool-btn" onclick="setMode('poly')"><svg width="20" height="20"
+                        viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <path d="M12 2l9 7-3.5 11h-11l-3.5-11 9-7z" />
+                    </svg></button>
+            </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 340px; gap: 24px; flex: 1; min-height: 0;">
+            <div class="card" style="display: flex; flex-direction: column; overflow: hidden;">
+                <div
+                    style="background: #f8fafc; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color);">
+                    <div style="display: flex; flex-direction: column; gap: 4px; flex: 1;">
+                        <div style="display: flex; align-items: center; gap: 12px;">
+                            <div id="labeling-filename"
+                                style="font-weight: 800; color: #1e293b; font-size: 1rem; min-width: 80px;">[0/0]</div>
+                            <div id="label-status-badge"
+                                style="padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 700; background: #94a3b8; color: #fff;">
+                                等待載入</div>
+                            <div id="dataset-summary"
+                                style="font-size: 0.75rem; color: #64748b; font-weight: 600; margin-left: auto;">已標記: 0
+                                / 總計: 0</div>
+                        </div>
+                        <input type="range" id="image-jump-slider" min="0" max="0" value="0"
+                            style="width: 100%; height: 6px; background: #e2e8f0; border-radius: 3px; cursor: pointer; accent-color: var(--accent-blue);"
+                            oninput="jumpToImage(this.value)">
+                    </div>
+                    <div style="display: flex; gap: 8px; margin-left: 16px;">
+                        <button class="btn secondary-btn"
+                            style="padding: 6px 12px; font-size: 0.75rem; background: #475569;"
+                            onclick="jumpToUnlabeled(-1)" title="跳轉到上一個未標記圖片">🔍 上一個未標</button>
+                        <button class="btn secondary-btn" style="padding: 6px 12px; font-size: 0.8rem;"
+                            onclick="prevLabelImg()">◀ 上一張</button>
+                        <button class="btn secondary-btn" style="padding: 6px 12px; font-size: 0.8rem;"
+                            onclick="nextLabelImg()">下一張 ▶</button>
+                        <button class="btn secondary-btn"
+                            style="padding: 6px 12px; font-size: 0.75rem; background: #475569;"
+                            onclick="jumpToUnlabeled(1)" title="跳轉到下一個未標記圖片">🔍 下一個未標</button>
+                    </div>
+                </div>
+                <div id="canvas-container" style="flex: 1;">
+                    <div id="canvas-viewport" style="transform-origin: 0 0; position: absolute;">
+                        <img id="labeling-img" draggable="false" style="display: none;">
+                        <canvas id="labeling-canvas" style="position: absolute; top: 0; left: 0;"></canvas>
+                    </div>
+                </div>
+                <div style="padding: 16px 20px; background: #1e293b; display: flex; justify-content: space-between;">
+                    <button class="btn primary-btn" onclick="saveLabels()">儲存標記</button>
+                    <button class="btn secondary-btn" style="color: #10b981;" onclick="goToTraining()">前往訓練</button>
+                </div>
+            </div>
+
+            <div class="card" style="display: flex; flex-direction: column; padding: 20px;">
+                <h3 style="margin: 0 0 16px 0;">標籤類別管理</h3>
+                <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+                    <input type="text" id="new-class-name" placeholder="輸入新類別名稱..."
+                        style="flex:1; padding: 10px; border: 1px solid var(--border-color); border-radius: 6px; font-size: 0.9rem;">
+                    <button class="btn secondary-btn" style="padding: 0 15px;" onclick="addNewClass()">+</button>
+                </div>
+                <div id="class-list" style="flex: 1; overflow-y: auto;"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        console.log("Labeling.html 終極版代碼啟動");
+
+        let labelFiles = []; let currentLabelIdx = 0; let customClasses = [{ id: 0, name: '預設類別', color: '#3b82f6' }];
+        let selectedClassId = 0; let annotations = []; let historyStack = []; let currentMode = 'select';
+        let selectedBoxIdx = -1; let isDrawing = false; let isResizing = false; let isMoving = false;
+        let startPos = { x: 0, y: 0 }; let moveOffset = { x: 0, y: 0 }; let polyPoints = [];
+        let zoomScale = 1, panX = 0, panY = 0; let isPanning = false, panStart = { x: 0, y: 0 };
+        let currentDs = null; let currentLabelPath = "";
+        let showBoxes = true;
+        let expandedClassIds = new Set();
+
+        function toggleBoxesVisibility(show) {
+            showBoxes = show;
+            // 更新按鈕樣式
+            document.getElementById('btn-show-boxes').className = show ? 'btn primary-btn' : 'btn secondary-btn';
+            document.getElementById('btn-show-boxes').style.background = show ? 'var(--accent-blue)' : '#64748b';
+            document.getElementById('btn-hide-boxes').className = !show ? 'btn primary-btn' : 'btn secondary-btn';
+            document.getElementById('btn-hide-boxes').style.background = !show ? '#ef4444' : '#64748b';
+            
+            // 如果隱藏標記框，清空當前選取
+            if (!show) {
+                selectedBoxIdx = -1;
+            }
+            redrawCanvas();
+            showHint(show ? "已顯示所有標記框" : "已隱藏所有標記框", show ? "var(--accent-blue)" : "#64748b");
+        }
+
+        function showHint(text, color = '#3b82f6') {
+            const b = document.getElementById('alert-box');
+            b.innerText = text; b.style.background = color; b.style.display = 'block';
+            setTimeout(() => b.style.display = 'none', 2000);
+        }
+
+        function pushHistory() {
+            historyStack.push(JSON.parse(JSON.stringify(annotations)));
+            if (historyStack.length > 50) historyStack.shift();
+        }
+
+        window.addEventListener('message', (e) => {
+            console.log("Labeling Module Received:", e.data);
+            if (e.data.type === 'DATASET_SELECTED' || e.data.type === 'INIT_LABELING') {
+                loadDatasetFromServer(e.data.dataset);
+            } else if (e.data.type === 'REFRESH_DATA') {
+                // 自動標記完成，重新載入但保持當前圖片位置
+                if (currentDs) {
+                    const savedIdx = currentLabelIdx;
+                    loadDatasetFromServer(currentDs, savedIdx);
+                }
+            }
+        });
+
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log("標記工作區 DOM 載入完成");
+            // 請求父視窗再次傳送當前資料集 (防止漏接)
+            if (window.parent) window.parent.postMessage({ type: 'REQUEST_DS' }, '*');
+
+            const saved = localStorage.getItem('ai_detector_active_ds');
+            if (saved) loadDatasetFromServer(JSON.parse(saved));
+            bindCanvasEvents();
+        });
+
+        async function loadDatasetFromServer(ds, startIdx = 0) {
+            if (!ds || !ds.name) return;
+            console.log("正在從伺服器載入資料集:", ds.name);
+            currentDs = ds; annotations = [];
+            try {
+                // 強制使用 8000 埠的 API
+                const res = await fetch(`http://127.0.0.1:8000/api/datasets/files?name=${encodeURIComponent(ds.name)}`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    if (data.classes) customClasses = data.classes.map((n, i) => ({ id: i, name: n, color: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4'][i % 7] }));
+                    if (data.files && data.files.length > 0) {
+                        labelFiles = data.files;
+                        document.getElementById('image-jump-slider').max = labelFiles.length - 1;
+                        const safeIdx = Math.min(startIdx, labelFiles.length - 1);
+                        loadLabelImage(safeIdx);
+                    } else {
+                        labelFiles = [];
+                        console.warn("該資料集目前沒有圖片");
+                    }
+                    renderClassList();
+                }
+            } catch (e) { console.error("API 載入失敗:", e); }
+        }
+
+        async function loadLabelImage(idx) {
+            if (!labelFiles || idx < 0 || idx >= labelFiles.length) return;
+            currentLabelIdx = idx;
+            const file = labelFiles[idx];
+
+            // 更新 UI 元件
+            document.getElementById('labeling-filename').innerText = `[${idx + 1}/${labelFiles.length}]`;
+            document.getElementById('image-jump-slider').value = idx;
+
+            const badge = document.getElementById('label-status-badge');
+            badge.innerText = file.labeled ? '已標記' : '未標記';
+            badge.style.background = file.labeled ? '#10b981' : '#94a3b8';
+
+            const img = document.getElementById('labeling-img');
+            img.style.display = 'none';
+
+            // 重設標記與畫布
+            annotations = [];
+            zoomScale = 1; panX = 0; panY = 0;
+            selectedBoxIdx = -1;
+            expandedClassIds.clear();
+            redrawCanvas();
+
+            // 1. 先設定好圖片載入完成後的動作
+            img.onload = async () => {
+                try {
+                    await setupCanvas();
+
+                    // 2. 只有在畫布準備好後才解析標記
+                    const safeLPath = lPath.split('/').map(encodeURIComponent).join('/');
+                    const lRes = await fetch(`http://127.0.0.1:8000/api/datasets/label/${encodeURIComponent(currentDs.name)}/${safeLPath}`);
+                    const lData = await lRes.json();
+                    currentLabelPath = lPath;
+                    if (lData.status === 'success' && lData.content) {
+                        parseYOLOLabels(lData.content);
+                    }
+
+                    redrawCanvas();
+                    img.style.display = 'block';
+                    renderClassList();
+                    updateDatasetSummary();
+                } catch (err) {
+                    console.error("Canvas Setup Failed:", err);
+                    img.style.display = 'block';
+                    redrawCanvas();
+                }
+            };
+
+            // 處理圖片載入失敗的情況
+            img.onerror = () => {
+                console.error("圖片載入失敗:", file.name);
+                showHint("無法載入圖片", "#ef4444");
+            };
+
+            // 3. 計算標記路徑與啟動下載
+            // 統一將反斜線替換為正斜線，確保跨平台相容
+            const normalizedName = file.name.replace(/\\/g, '/');
+            let lPath = normalizedName.substring(0, normalizedName.lastIndexOf('.')) + '.txt';
+            if (normalizedName.includes('images/')) {
+                lPath = normalizedName.replace('images/', 'labels/').substring(0, normalizedName.lastIndexOf('.')) + '.txt';
+            }
+            const safeImgPath = normalizedName.split('/').map(encodeURIComponent).join('/');
+            img.src = `http://127.0.0.1:8000/api/datasets/image/${encodeURIComponent(currentDs.name)}/${safeImgPath}`;
+        }
+
+        function updateDatasetSummary() {
+            const labeledCount = labelFiles.filter(f => f.labeled).length;
+            document.getElementById('dataset-summary').innerText = `已標記: ${labeledCount} / ${labelFiles.length}`;
+        }
+
+        async function jumpToImage(idx) {
+            await saveLabels();
+            loadLabelImage(parseInt(idx));
+        }
+
+        async function jumpToUnlabeled(dir) {
+            await saveLabels();
+            let i = currentLabelIdx + dir;
+            while (i >= 0 && i < labelFiles.length) {
+                if (!labelFiles[i].labeled) { loadLabelImage(i); return; }
+                i += dir;
+            }
+            showHint("已無更多未標記圖片", "#f59e0b");
+        }
+
+        function parseYOLOLabels(txt) {
+            const cvs = document.getElementById('labeling-canvas');
+            txt.trim().split('\n').forEach(line => {
+                const p = line.trim().split(/\s+/); if (p.length < 3) return;
+                const cid = parseInt(p[0]);
+                if (p.length === 5) {
+                    const cx = parseFloat(p[1]) * cvs.width, cy = parseFloat(p[2]) * cvs.height, w = parseFloat(p[3]) * cvs.width, h = parseFloat(p[4]) * cvs.height;
+                    annotations.push({ type: 'rect', classId: cid, x: cx - w / 2, y: cy - h / 2, w, h });
+                }
+            });
+        }
+
+        function setupCanvas() {
+            return new Promise((resolve, reject) => {
+                const img = document.getElementById('labeling-img'), cvs = document.getElementById('labeling-canvas'), cnt = document.getElementById('canvas-container');
+                let attempts = 0;
+                const check = () => {
+                    attempts++;
+                    if (attempts > 100) { reject("Canvas setup timeout"); return; }
+                    if (cnt.clientWidth === 0 || img.naturalWidth === 0) { setTimeout(check, 50); return; }
+
+                    const ratio = Math.min(cnt.clientWidth / img.naturalWidth, cnt.clientHeight / img.naturalHeight);
+                    cvs.width = img.naturalWidth * ratio;
+                    cvs.height = img.naturalHeight * ratio;
+                    img.style.width = cvs.width + 'px';
+                    img.style.height = cvs.height + 'px';
+
+                    // 確保置中
+                    const left = (cnt.clientWidth - cvs.width) / 2;
+                    const top = (cnt.clientHeight - cvs.height) / 2;
+                    const viewport = document.getElementById('canvas-viewport');
+                    viewport.style.left = left + 'px';
+                    viewport.style.top = top + 'px';
+
+                    applyZoom();
+                    resolve();
+                };
+                check();
+            });
+        }
+
+        function getResizeHandle(x, y, b) {
+            const s = 10 / zoomScale; // 根據縮放調整偵測範圍
+            if (Math.abs(x - b.x) < s && Math.abs(y - b.y) < s) return 'tl';
+            if (Math.abs(x - (b.x + b.w)) < s && Math.abs(y - b.y) < s) return 'tr';
+            if (Math.abs(x - b.x) < s && Math.abs(y - (b.y + b.h)) < s) return 'bl';
+            if (Math.abs(x - (b.x + b.w)) < s && Math.abs(y - (b.y + b.h)) < s) return 'br';
+            return null;
+        }
+
+        function bindCanvasEvents() {
+            const cnt = document.getElementById('canvas-container');
+
+            cnt.onwheel = (e) => {
+                e.preventDefault();
+                const r = cnt.getBoundingClientRect();
+                const sx = e.clientX - r.left;
+                const sy = e.clientY - r.top;
+                const old = zoomScale;
+                zoomScale = Math.max(0.5, Math.min(8, zoomScale * (e.deltaY > 0 ? 0.9 : 1.1)));
+                panX = sx - (sx - panX) * (zoomScale / old);
+                panY = sy - (sy - panY) * (zoomScale / old);
+                applyZoom();
+                redrawCanvas();
+            };
+
+            cnt.onmousedown = (e) => {
+                e.preventDefault();
+                const w = screenToWorld(e.clientX, e.clientY);
+
+                // 中鍵平移
+                if (e.button === 1) {
+                    isPanning = true;
+                    const r = cnt.getBoundingClientRect();
+                    panStart = { x: e.clientX - r.left - panX, y: e.clientY - r.top - panY };
+                    return;
+                }
+
+                if (currentMode === 'select' && showBoxes) {
+                    // 1. 優先偵測縮放手柄
+                    if (selectedBoxIdx !== -1 && annotations[selectedBoxIdx].type === 'rect') {
+                        const h = getResizeHandle(w.x, w.y, annotations[selectedBoxIdx]);
+                        if (h) {
+                            pushHistory(); // 縮放前存檔
+                            isResizing = true;
+                            resizeHandle = h;
+                            redrawCanvas();
+                            return;
+                        }
+                    }
+
+                    // 2. 偵測選中物件
+                    let hit = -1;
+                    for (let i = annotations.length - 1; i >= 0; i--) {
+                        const a = annotations[i];
+                        if (a.hidden) continue;
+                        if (w.x >= a.x && w.x <= a.x + a.w && w.y >= a.y && w.y <= a.y + a.h) {
+                            hit = i;
+                            break;
+                        }
+                    }
+
+                    if (hit !== -1) {
+                        pushHistory(); // 移動前存檔
+                        selectedBoxIdx = hit;
+                        isMoving = true;
+                        selectedClassId = annotations[hit].classId;
+                        renderClassList();
+                        const a = annotations[hit];
+                        moveOffset = { x: w.x - a.x, y: w.y - a.y };
+                    } else {
+                        selectedBoxIdx = -1;
+                    }
+                    redrawCanvas();
+                } else if (currentMode === 'draw') {
+                    pushHistory(); // 繪製前存檔
+                    isDrawing = true;
+                    startPos = w;
+                }
+            };
+            cnt.onmousemove = (e) => {
+                const w = screenToWorld(e.clientX, e.clientY);
+                if (isPanning) { const r = cnt.getBoundingClientRect(); panX = (e.clientX - r.left) - panStart.x; panY = (e.clientY - r.top) - panStart.y; applyZoom(); return; }
+
+                if (isResizing && selectedBoxIdx !== -1) {
+                    const a = annotations[selectedBoxIdx];
+                    if (resizeHandle === 'tl') { a.w += a.x - w.x; a.h += a.y - w.y; a.x = w.x; a.y = w.y; }
+                    else if (resizeHandle === 'tr') { a.w = w.x - a.x; a.h += a.y - w.y; a.y = w.y; }
+                    else if (resizeHandle === 'bl') { a.w += a.x - w.x; a.x = w.x; a.h = w.y - a.y; }
+                    else if (resizeHandle === 'br') { a.w = w.x - a.x; a.h = w.y - a.y; }
+                    redrawCanvas();
+                } else if (isMoving && selectedBoxIdx !== -1) {
+                    const a = annotations[selectedBoxIdx]; a.x = w.x - moveOffset.x; a.y = w.y - moveOffset.y; redrawCanvas();
+                } else if (isDrawing) redrawCanvas(w);
+            };
+            cnt.onmouseup = (e) => {
+                if (isDrawing && currentMode === 'draw') {
+                    const w = screenToWorld(e.clientX, e.clientY);
+                    const nx = Math.min(startPos.x, w.x), ny = Math.min(startPos.y, w.y);
+                    const nw = Math.abs(w.x - startPos.x), nh = Math.abs(w.y - startPos.y);
+                    if (nw > 5 && nh > 5) {
+                        annotations.push({ type: 'rect', classId: selectedClassId, x: nx, y: ny, w: nw, h: nh });
+                    }
+                }
+                isPanning = false; isDrawing = false; isMoving = false; isResizing = false; redrawCanvas();
+            };
+        }
+
+        function screenToWorld(cx, cy) { const c = document.getElementById('labeling-canvas'), r = c.getBoundingClientRect(); return { x: (cx - r.left) / r.width * c.width, y: (cy - r.top) / r.height * c.height }; }
+        function applyZoom() { document.getElementById('canvas-viewport').style.transform = `translate(${panX}px, ${panY}px) scale(${zoomScale})`; }
+        function redrawCanvas(p = null) {
+            const c = document.getElementById('labeling-canvas'), ctx = c.getContext('2d'); ctx.clearRect(0, 0, c.width, c.height);
+            if (showBoxes) {
+                annotations.forEach((a, i) => {
+                    if (a.hidden) return;
+                    const cls = customClasses.find(x => x.id === a.classId) || customClasses[0];
+                    ctx.strokeStyle = cls.color; ctx.lineWidth = (i === selectedBoxIdx) ? 3 : 2;
+                    ctx.strokeRect(a.x, a.y, a.w, a.h); ctx.fillStyle = cls.color + '22'; ctx.fillRect(a.x, a.y, a.w, a.h);
+
+                    // 繪製縮放手柄 (僅針對選中的矩形)
+                    if (i === selectedBoxIdx && a.type === 'rect') {
+                        ctx.fillStyle = '#fff';
+                        const s = 6 / zoomScale;
+                        [[a.x, a.y], [a.x + a.w, a.y], [a.x, a.y + a.h], [a.x + a.w, a.y + a.h]].forEach(([hx, hy]) => {
+                            ctx.fillRect(hx - s, hy - s, s * 2, s * 2);
+                            ctx.strokeRect(hx - s, hy - s, s * 2, s * 2);
+                        });
+                    }
+
+                    ctx.fillStyle = cls.color; ctx.font = 'bold 12px Inter'; ctx.fillText(cls.name, a.x + 4, a.y - 4);
+                });
+            }
+            if (isDrawing && p) { ctx.strokeStyle = '#3b82f6'; ctx.strokeRect(Math.min(startPos.x, p.x), Math.min(startPos.y, p.y), Math.abs(p.x - startPos.x), Math.abs(p.y - startPos.y)); }
+        }
+
+        async function saveLabels() {
+            if (!currentDs) return; const c = document.getElementById('labeling-canvas');
+            const txt = annotations.map(a => `${a.classId} ${((a.x + a.w / 2) / c.width).toFixed(6)} ${((a.y + a.h / 2) / c.height).toFixed(6)} ${(a.w / c.width).toFixed(6)} ${(a.h / c.height).toFixed(6)}`).join('\n');
+            const fd = new FormData(); fd.append('ds_name', currentDs.name); fd.append('label_path', currentLabelPath); fd.append('content', txt);
+            await fetch('http://127.0.0.1:8000/api/datasets/save_label', { method: 'POST', body: fd });
+
+            // 更新本地狀態與頂部標籤
+            const isLabeled = annotations.length > 0;
+            labelFiles[currentLabelIdx].labeled = isLabeled;
+
+            const badge = document.getElementById('label-status-badge');
+            if (badge) {
+                badge.innerText = isLabeled ? '已標記' : '未標記';
+                badge.style.background = isLabeled ? '#10b981' : '#94a3b8';
+            }
+
+            updateDatasetSummary();
+            showHint("標記已儲存", "#10b981");
+
+            // 通知外殼同步更新資料集進度條
+            if (window.parent) {
+                window.parent.postMessage({ type: 'LABEL_SAVED' }, '*');
+            }
+        }
+
+        function renderClassList() {
+            const list = document.getElementById('class-list'); list.innerHTML = '';
+
+            const counts = {};
+            annotations.forEach(a => { counts[a.classId] = (counts[a.classId] || 0) + 1; });
+
+            customClasses.forEach(c => {
+                const count = counts[c.id] || 0;
+                const isExpanded = expandedClassIds.has(c.id);
+                
+                const item = document.createElement('div');
+                item.className = `class-item ${selectedClassId === c.id ? 'active' : ''}`;
+                item.style.marginBottom = isExpanded ? '4px' : '8px'; // 展開時微調間距
+                
+                // 三角形展開按鈕 (僅在數量大於 0 時顯示，否則顯示佔位空間)
+                const triangleHtml = count > 0 ? `
+                    <button onclick="event.stopPropagation();toggleClassExpand(${c.id})" style="pointer-events:auto;background:none;border:none;color:#64748b;cursor:pointer;padding:2px;margin-right:6px;display:flex;align-items:center;justify-content:center;transition:transform 0.2s;transform:${isExpanded ? 'rotate(90deg)' : 'rotate(0deg)'};" title="打開/收合個別標記框">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" style="pointer-events:none;"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                    </button>
+                ` : `<div style="width: 16px; margin-right: 6px;"></div>`;
+
+                item.innerHTML = `
+                    <div style="pointer-events:none;display:flex;align-items:center;gap:4px;">
+                        ${triangleHtml}
+                        <span style="font-weight:700;">${c.name}</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span style="font-size: 0.8rem; font-weight: 800; color: ${count > 0 ? '#3b82f6' : '#94a3b8'}; background: ${count > 0 ? 'rgba(59, 130, 246, 0.1)' : 'transparent'}; padding: 2px 6px; border-radius: 4px;">${count}</span>
+                        <button onclick="event.stopPropagation();editClassName(${c.id})" style="pointer-events:auto;background:none;border:none;color:#94a3b8;cursor:pointer;padding:2px;" title="修改名稱">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path></svg>
+                        </button>
+                        <button onclick="event.stopPropagation();deleteClass(${c.id}, '${c.name}')" style="pointer-events:auto;background:none;border:none;color:#f87171;cursor:pointer;padding:2px;" title="刪除類別">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                        </button>
+                        <div style="pointer-events:none;width:12px;height:12px;border-radius:50%;background:${c.color};"></div>
+                    </div>`;
+
+                item.onclick = async () => {
+                    selectedClassId = c.id;
+                    if (selectedBoxIdx !== -1) {
+                        annotations[selectedBoxIdx].classId = c.id;
+                        redrawCanvas();
+                        showHint(`已變更為: ${c.name}`, c.color);
+                        await saveLabels();
+                    }
+                    renderClassList();
+                };
+                list.appendChild(item);
+
+                // 展開時渲染子標記框清單
+                if (count > 0 && isExpanded) {
+                    const subContainer = document.createElement('div');
+                    subContainer.style.cssText = "margin-left: 20px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px; border-left: 2px solid var(--border-color); padding-left: 12px; margin-top: -2px;";
+                    
+                    let annoSubIdx = 1;
+                    annotations.forEach((a, originalIdx) => {
+                        if (a.classId !== c.id) return;
+                        
+                        const subIdx = annoSubIdx++;
+                        const isSelected = selectedBoxIdx === originalIdx;
+                        const isHidden = a.hidden || false;
+                        
+                        const subItem = document.createElement('div');
+                        subItem.style.cssText = `
+                            display: flex;
+                            justify-content: space-between;
+                            align-items: center;
+                            padding: 8px 12px;
+                            background: ${isSelected ? 'rgba(59, 130, 246, 0.08)' : '#f8fafc'};
+                            border: 1px solid ${isSelected ? 'var(--accent-blue)' : 'var(--border-color)'};
+                            border-radius: 8px;
+                            font-size: 0.8rem;
+                            cursor: pointer;
+                            transition: 0.2s;
+                            box-shadow: ${isSelected ? '0 0 0 1px var(--accent-blue)' : 'none'};
+                            opacity: ${isHidden ? 0.6 : 1};
+                        `;
+                        
+                        // 懸停與選取回饋
+                        subItem.onmouseenter = () => { if (!isSelected) subItem.style.background = '#f1f5f9'; };
+                        subItem.onmouseleave = () => { if (!isSelected) subItem.style.background = '#f8fafc'; };
+                        
+                        subItem.onclick = (e) => {
+                            e.stopPropagation();
+                            if (isHidden) {
+                                showHint("請先顯示該標記框以進行選取", "#64748b");
+                                return;
+                            }
+                            selectIndividualBox(originalIdx);
+                        };
+
+                        subItem.innerHTML = `
+                            <span style="font-weight: 600; color: ${isSelected ? 'var(--accent-blue)' : '#334155'};">${c.name} ${subIdx}</span>
+                            <div style="display:flex; align-items:center; gap: 8px;">
+                                <button onclick="event.stopPropagation();toggleBoxSingleVisibility(${originalIdx})" style="pointer-events:auto;background:none;border:none;color:${isHidden ? '#ef4444' : '#64748b'};cursor:pointer;padding:2px;display:flex;align-items:center;" title="${isHidden ? '顯示此標記框' : '隱藏此標記框'}">
+                                    ${isHidden ? 
+                                      `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>` : 
+                                      `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>`
+                                    }
+                                </button>
+                            </div>
+                        `;
+                        subContainer.appendChild(subItem);
+                    });
+                    list.appendChild(subContainer);
+                }
+            });
+        }
+
+        function toggleClassExpand(classId) {
+            if (expandedClassIds.has(classId)) {
+                expandedClassIds.delete(classId);
+            } else {
+                expandedClassIds.add(classId);
+            }
+            renderClassList();
+        }
+
+        function selectIndividualBox(idx) {
+            selectedBoxIdx = idx;
+            const a = annotations[idx];
+            selectedClassId = a.classId;
+            redrawCanvas();
+            renderClassList();
+        }
+
+        function toggleBoxSingleVisibility(idx) {
+            annotations[idx].hidden = !annotations[idx].hidden;
+            if (annotations[idx].hidden && selectedBoxIdx === idx) {
+                selectedBoxIdx = -1;
+            }
+            redrawCanvas();
+            renderClassList();
+        }
+
+        window.onkeydown = (e) => {
+            // Ctrl + Z (上一步)
+            if (e.ctrlKey && e.key.toLowerCase() === 'z') {
+                e.preventDefault();
+                if (historyStack.length > 0) {
+                    annotations = historyStack.pop();
+                    redrawCanvas();
+                    renderClassList();
+                    showHint("已撤銷上一步", "#475569");
+                }
+                return;
+            }
+
+            // Delete / Backspace (刪除選中框)
+            if ((e.key === 'Delete' || e.key === 'Backspace') && selectedBoxIdx !== -1) {
+                e.preventDefault();
+                pushHistory(); // 刪除前先存入歷史紀錄
+                annotations.splice(selectedBoxIdx, 1);
+                selectedBoxIdx = -1;
+                redrawCanvas();
+                renderClassList();
+                showHint("已刪除標記", "#ef4444");
+            }
+        };
+
+        function setMode(m) { currentMode = m; document.querySelectorAll('.tool-btn').forEach(b => b.classList.toggle('active', b.id === 'btn-' + m)); }
+        async function prevLabelImg() { await saveLabels(); if (currentLabelIdx > 0) loadLabelImage(currentLabelIdx - 1); }
+        async function nextLabelImg() { await saveLabels(); if (currentLabelIdx < labelFiles.length - 1) loadLabelImage(currentLabelIdx + 1); }
+        function goToTraining() { saveLabels().then(() => { window.parent.postMessage({ type: 'SWITCH_PAGE', pageId: 'train' }, '*'); }); }
+        async function addNewClass() {
+            const input = document.getElementById('new-class-name');
+            const name = input.value.trim(); if (!name) return;
+            const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4'];
+            customClasses.push({ id: customClasses.length, name: name, color: colors[customClasses.length % 7] });
+            input.value = ''; renderClassList(); await saveClassesFile();
+            showHint('已新增類別: ' + name, '#10b981');
+        }
+        async function saveClassesFile() {
+            if (!currentDs) return;
+            const fd = new FormData(); fd.append('ds_name', currentDs.name); fd.append('classes', JSON.stringify(customClasses.map(c => c.name)));
+            await fetch('http://127.0.0.1:8000/api/datasets/save_classes', { method: 'POST', body: fd });
+        }
+        async function editClassName(id) {
+            const cls = customClasses.find(c => c.id === id); if (!cls) return;
+            const newName = prompt('請輸入新的類別名稱:', cls.name);
+            if (newName && newName.trim() !== '') { cls.name = newName.trim(); renderClassList(); redrawCanvas(); await saveClassesFile(); }
+        }
+        async function deleteClass(id, name) {
+            if (customClasses.length <= 1) { alert('至少需保留一個類別！'); return; }
+            if (!confirm(`確定要刪除類別「${name}」嗎？\n這不會刪除已標記的框，但可能會導致顯示類別不正確。`)) return;
+            customClasses = customClasses.filter(c => c.id !== id);
+            // 重新排列 ID 確保連續
+            customClasses = customClasses.map((c, i) => ({ ...c, id: i }));
+            if (selectedClassId >= customClasses.length) selectedClassId = 0;
+            renderClassList(); await saveClassesFile();
+            showHint('已刪除類別: ' + name, '#ef4444');
+        }
+    </script>
+</body>
+
+</html>
