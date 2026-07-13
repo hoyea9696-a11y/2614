@@ -1,0 +1,6 @@
+names:
+  0: object
+path: C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\測試
+test: C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\測試\test.txt
+train: C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\測試\train.txt
+val: C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\測試\val.txt

@@ -1,0 +1,37 @@
+{
+  "project_name": "AI_Detector",
+  "last_updated": "2026-07-09T15:40:00+08:00",
+  "dataset": {
+    "imported": false,
+    "name": null,
+    "path": null,
+    "image_count": 0,
+    "label_count": 0,
+    "health_analysis": {
+      "passed": false,
+      "score": null,
+      "coverage": null,
+      "balance": null,
+      "last_checked": null
+    }
+  },
+  "annotation": {
+    "status": "pending",
+    "unlabeled_count": null,
+    "last_checked": null
+  },
+  "model": {
+    "trained": false,
+    "exp_name": null,
+    "best_model_path": null,
+    "last_training_metrics": {
+      "mAP50": null,
+      "final_loss": null,
+      "total_epochs": null
+    },
+    "evaluation": {
+      "passed": false,
+      "last_evaluated": null
+    }
+  }
+}

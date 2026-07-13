@@ -1,5 +1,19 @@
 # AI Detector 更新紀錄 (Update Log)
 
+## [2026-05-29] 更新 Gemini API 模型版本
+
+### 修正問題
+- **模型已停用**：Gemini 1.5 系列 (Flash & Pro) 已經移除且停止服務。
+
+### 變更內容
+- **[.env](file:///c:/Users/freddy_huang/OneDrive%20-%20ASUS/Desktop/AI-project/.env)**:
+  - 將 `GEMINI_FLASH_MODEL` 更新為 `gemini-2.5-flash`
+  - 將 `GEMINI_PRO_MODEL` 更新為 `gemini-2.5-pro`
+- **[server/static/index_v3.html](file:///c:/Users/freddy_huang/OneDrive%20-%20ASUS/Desktop/AI-project/server/static/index_v3.html)**:
+  - 將 AI 助手對話窗的 LLM 下拉選單 (`#ai-model-select`) 中的選項從 Gemini 1.5 系列同步更新為 Gemini 2.0。
+- **[server/ai_service.py](file:///c:/Users/freddy_huang/OneDrive%20-%20ASUS/Desktop/AI-project/server/ai_service.py)**:
+  - 修正後端直接寫死 `gemini-1.5-pro-latest` 以及無法正確讀取 `.env` 中 `GEMINI_FLASH_MODEL` 與 `GEMINI_PRO_MODEL` 變數的問題。
+
 ## [2026-05-21] 影像驗證中心修復
 
 ### 修正問題

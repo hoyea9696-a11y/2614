@@ -32,7 +32,8 @@ class AIService:
         config = {
             "gemini_api_key": os.getenv("GEMINI_API_KEY"),
             "groq_api_key": os.getenv("GROQ_API_KEY"),
-            "gemini_model": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+            "gemini_flash_model": os.getenv("GEMINI_FLASH_MODEL", "gemini-2.5-flash"),
+            "gemini_pro_model": os.getenv("GEMINI_PRO_MODEL", "gemini-2.5-pro"),
             "groq_model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
             "ollama_model": os.getenv("OLLAMA_MODEL", "llama3.2"),
             "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
@@ -56,9 +57,9 @@ class AIService:
         conf = self._get_config()
         
         # 決定具體的 Gemini 系列模型
-        gemini_model = conf.get("gemini_model", "gemini-1.5-flash")
+        gemini_model = conf.get("gemini_flash_model", "gemini-2.5-flash")
         if platform == "gemini-pro":
-            gemini_model = "gemini-1.5-pro-latest"
+            gemini_model = conf.get("gemini_pro_model", "gemini-2.5-pro")
             platform = "gemini"
         elif platform == "gemma":
             # Gemma 2 系列在 Groq 上更穩定，如果沒 Groq 則走 Ollama
@@ -67,7 +68,7 @@ class AIService:
             else:
                 platform = "local"
         else:
-            gemini_model = conf.get("gemini_model", "gemini-1.5-flash")
+            gemini_model = conf.get("gemini_flash_model", "gemini-2.5-flash")
         
         # 從 context_data 讀取已由 main.py 準備好的健康數據
         health_info = ""
@@ -129,7 +130,7 @@ class AIService:
             return f"[{platform.upper()} 錯誤]: {str(e)}"
 
     def _chat_gemini_rest(self, messages, system_prompt, api_key, model_name):
-        # 切換回 v1beta 以支援 1.5-flash 模型
+        # 切換回 v1beta 以支援 Gemini 2.0 模型
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         contents = []
         
@@ -156,7 +157,7 @@ class AIService:
     def chat_with_image(self, prompt: str, base64_image: str) -> str:
         conf = self._get_config()
         # 視覺標記同樣切換回 v1beta
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{conf['gemini_model']}:generateContent?key={conf['gemini_api_key']}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{conf.get('gemini_flash_model', 'gemini-2.5-flash')}:generateContent?key={conf['gemini_api_key']}"
         
         payload = {
             "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}}]}],
