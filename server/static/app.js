@@ -473,15 +473,19 @@ async function sendChatMessage() {
 
     const loadingId = appendMessage(`[${modelType.toUpperCase()}] 思考中...`, 'ai', true);
 
+    // Manager Agent 走獨立的 /api/agent/chat（LangGraph + Tool），跟原本的
+    // /api/ai/chat（Gemini/Groq/Local 的一般對話）分開，互不影響
+    const isManagerAgent = modelType === 'manager-agent';
+    const requestUrl = isManagerAgent ? '/api/agent/chat' : '/api/ai/chat';
+    const requestBody = isManagerAgent
+        ? { message: text }
+        : { messages: chatMessages, context_data: contextData, model_type: modelType };
+
     try {
-        const res = await fetch('/api/ai/chat', {
+        const res = await fetch(requestUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                messages: chatMessages, 
-                context_data: contextData,
-                model_type: modelType
-            })
+            body: JSON.stringify(requestBody)
         });
         const data = await res.json();
         
