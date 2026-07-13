@@ -731,6 +731,31 @@ async def get_auto_label_status():
     return auto_label_status
 
 # ------------------------------
+# Manager Agent API（LangGraph，獨立於既有 AI 助手對話窗，不影響原本功能）
+# ------------------------------
+class ManagerAgentChatRequest(BaseModel):
+    message: str
+
+_manager_agent_graph = None
+
+def _get_manager_agent_graph():
+    global _manager_agent_graph
+    if _manager_agent_graph is None:
+        from manager_agent import build_manager_agent, get_default_chat_model
+        _manager_agent_graph = build_manager_agent(get_default_chat_model())
+    return _manager_agent_graph
+
+@app.post("/api/agent/chat")
+async def agent_chat(request: ManagerAgentChatRequest):
+    from langchain_core.messages import HumanMessage
+    try:
+        graph = _get_manager_agent_graph()
+        result = graph.invoke({"messages": [HumanMessage(content=request.message)]})
+        return {"status": "success", "reply": result["messages"][-1].content}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ------------------------------
 # 靜態檔案掛載 (使用絕對路徑以確保多埠啟動正常)
 # ------------------------------
 app.mount("/static", NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
