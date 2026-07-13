@@ -10,3 +10,4 @@ pyyaml
 openai
 python-dotenv
 google-generativeai
+langgraph
