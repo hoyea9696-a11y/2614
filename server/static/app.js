@@ -441,6 +441,14 @@ window.onload = () => {
 // ------------------------------
 let chatMessages = [];
 
+function onAiModelSelectChange() {
+    // Manager Agent 底層要用哪個 LLM，用第二個下拉選單另外選——切到別的選項時就隱藏，
+    // 避免使用者以為一般聊天視窗也能選 Manager Agent 的引擎
+    const modelType = document.getElementById('ai-model-select').value;
+    const engineSelect = document.getElementById('manager-agent-engine-select');
+    engineSelect.style.display = modelType === 'manager-agent' ? 'inline-block' : 'none';
+}
+
 function toggleChat() {
     const chatWindow = document.getElementById('ai-chat-window');
     const btn = document.getElementById('ai-chat-btn');
@@ -474,11 +482,13 @@ async function sendChatMessage() {
     const loadingId = appendMessage(`[${modelType.toUpperCase()}] 思考中...`, 'ai', true);
 
     // Manager Agent 走獨立的 /api/agent/chat（LangGraph + Tool），跟原本的
-    // /api/ai/chat（Gemini/Groq/Local 的一般對話）分開，互不影響
+    // /api/ai/chat（Gemini/Groq/Local 的一般對話）分開，互不影響。Manager Agent
+    // 底層要用哪個 LLM 是另一個下拉選單決定的（manager-agent-engine-select），
+    // 跟一般聊天視窗的 modelType 是兩件事，不要混在一起。
     const isManagerAgent = modelType === 'manager-agent';
     const requestUrl = isManagerAgent ? '/api/agent/chat' : '/api/ai/chat';
     const requestBody = isManagerAgent
-        ? { message: text }
+        ? { message: text, model_type: document.getElementById('manager-agent-engine-select').value }
         : { messages: chatMessages, context_data: contextData, model_type: modelType };
 
     try {
@@ -493,7 +503,12 @@ async function sendChatMessage() {
         
         if (data.status === 'success') {
             let reply = data.reply;
-            
+
+            // 決策過程是答案的成因，先顯示過程再顯示結論，符合實際發生的順序。
+            if (isManagerAgent && data.trace) {
+                appendTraceCard(data.trace);
+            }
+
             // 檢查是否有健康度數據標籤 [HEALTH_DATA: {json}]
             const healthMatch = reply.match(/\[HEALTH_DATA: ({.*?})\]/);
             if (healthMatch) {
@@ -504,7 +519,7 @@ async function sendChatMessage() {
             } else {
                 appendMessage(reply, 'ai');
             }
-            
+
             chatMessages.push({ role: 'assistant', content: reply });
         } else {
             appendMessage("發生錯誤: " + data.message, 'error');
@@ -565,6 +580,88 @@ function appendHealthCard(data) {
             }
         });
     }, 100);
+}
+
+const MANAGER_AGENT_NODE_LABELS = {
+    planner: '🗺️ Planner（規劃）',
+    manager: '🧭 Manager（決策）',
+    observer: '🔍 Observer（觀測）',
+    data_agent: '📁 Data Agent',
+    model_agent: '🤖 Model Agent',
+    evaluation_agent: '📊 Evaluation Agent'
+};
+
+function escapeHtml(value) {
+    const div = document.createElement('div');
+    div.textContent = value === null || value === undefined ? '' : String(value);
+    return div.innerHTML;
+}
+
+// 把 /api/agent/chat 回傳的 trace（Planner 的計畫、Manager 的路由決策、
+// Observer 的判讀、各子 Agent 呼叫的工具）視覺化成可展開的決策過程卡片，
+// 不然使用者只看得到最終一句回覆，看不出三個 Agent 實際怎麼協作。
+function appendTraceCard(trace) {
+    if (!trace || trace.length === 0) return;
+    const container = document.getElementById('ai-chat-history');
+
+    const wrapper = document.createElement('details');
+    wrapper.style.cssText = "align-self: flex-start; width: 92%; margin-top: 6px; background: #0f172a; border: 1px solid rgba(59,130,246,0.3); border-radius: 10px; padding: 8px 12px; font-size: 0.72rem; color: #94a3b8; overflow-wrap: anywhere; word-break: break-word;";
+
+    const summary = document.createElement('summary');
+    summary.style.cssText = "cursor: pointer; color: #60a5fa; font-weight: 600; outline: none;";
+    summary.textContent = `🔬 決策過程（共 ${trace.length} 步，點開查看）`;
+    wrapper.appendChild(summary);
+
+    const stepsHtml = trace.map((step, i) => {
+        const label = MANAGER_AGENT_NODE_LABELS[step.node] || step.node;
+        let inner = `<div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(148,163,184,0.15);">`;
+        inner += `<div style="color:#e2e8f0; font-weight:600;">#${i + 1} ${escapeHtml(label)}</div>`;
+
+        if (step.decision) {
+            inner += `<div>→ 交給：<b>${escapeHtml(step.decision)}</b></div>`;
+        }
+        if (step.plan && step.plan.goal) {
+            inner += `<div>🎯 目標：${escapeHtml(step.plan.goal)}</div>`;
+            if (step.plan.steps && step.plan.steps.length) {
+                inner += '<ul style="margin:4px 0 0 16px; padding:0;">' +
+                    step.plan.steps.map(s => `<li>[${escapeHtml(s.status)}] ${escapeHtml(s.description)}（${escapeHtml(s.agent)}）</li>`).join('') +
+                    '</ul>';
+            }
+        }
+        if (step.tool_calls && step.tool_calls.length) {
+            inner += step.tool_calls.map(tc => {
+                if (tc.tool) {
+                    return `<div>🔧 呼叫工具：<b>${escapeHtml(tc.tool)}</b>（${escapeHtml(JSON.stringify(tc.args))}）</div>`;
+                }
+                return `<div>📥 工具回傳（${escapeHtml(tc.tool_result)}）：${escapeHtml(typeof tc.output === 'string' ? tc.output : JSON.stringify(tc.output))}</div>`;
+            }).join('');
+        }
+        if (step.report) {
+            inner += `<div>📝 回報：status=<b>${escapeHtml(step.report.status)}</b>` +
+                (step.report.reason_code ? ` reason_code=${escapeHtml(step.report.reason_code)}` : '') +
+                `<br>理由：${escapeHtml(step.report.reason)}` +
+                (step.report.suggestion ? `<br>建議：${escapeHtml(step.report.suggestion)}` : '') +
+                `</div>`;
+        }
+        if (step.evaluation) {
+            inner += `<div>🔍 判讀：verdict=<b>${escapeHtml(step.evaluation.verdict)}</b>` +
+                `，有進展=${step.evaluation.progress_since_last_round ? '是' : '否'}` +
+                (step.evaluation.contradiction ? '，⚠️ 偵測到矛盾' : '') +
+                `</div>`;
+        }
+        if (step.text) {
+            inner += `<div>💬 ${escapeHtml(step.text)}</div>`;
+        }
+        inner += `</div>`;
+        return inner;
+    }).join('');
+
+    const stepsContainer = document.createElement('div');
+    stepsContainer.innerHTML = stepsHtml;
+    wrapper.appendChild(stepsContainer);
+
+    container.appendChild(wrapper);
+    container.scrollTop = container.scrollHeight;
 }
 
 function appendMessage(text, sender, isLoading = false) {

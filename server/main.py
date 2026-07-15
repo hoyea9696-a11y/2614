@@ -735,23 +735,36 @@ async def get_auto_label_status():
 # ------------------------------
 class ManagerAgentChatRequest(BaseModel):
     message: str
+    model_type: str = "gemini"
 
-_manager_agent_graph = None
+# 依 model_type 各自快取一份 Graph，換模型（gemini/groq/gemma/local）不用重啟服務
+_manager_agent_graphs = {}
 
-def _get_manager_agent_graph():
-    global _manager_agent_graph
-    if _manager_agent_graph is None:
-        from manager_agent import build_manager_agent, get_default_chat_model
-        _manager_agent_graph = build_manager_agent(get_default_chat_model())
-    return _manager_agent_graph
+def _get_manager_agent_graph(model_type: str = "gemini"):
+    if model_type not in _manager_agent_graphs:
+        from manager_agent import get_default_chat_model
+        from multi_agent import build_multi_agent
+        _manager_agent_graphs[model_type] = build_multi_agent(get_default_chat_model(model_type))
+    return _manager_agent_graphs[model_type]
 
 @app.post("/api/agent/chat")
 async def agent_chat(request: ManagerAgentChatRequest):
-    from langchain_core.messages import HumanMessage
+    from multi_agent import run_with_trace
     try:
-        graph = _get_manager_agent_graph()
-        result = graph.invoke({"messages": [HumanMessage(content=request.message)]})
-        return {"status": "success", "reply": result["messages"][-1].content}
+        graph = _get_manager_agent_graph(request.model_type)
+        reply, trace = run_with_trace(graph, request.message)
+        return {"status": "success", "reply": reply, "trace": trace}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/agent/graph")
+async def agent_graph(model_type: str = "gemini"):
+    """觀測層：回傳 Multi-Agent 的靜態拓樸（Mermaid 語法），可以貼到
+    https://mermaid.live 或前端的 mermaid renderer 看 Manager / Data Agent /
+    Model Agent / Evaluation Agent 之間的連線關係。"""
+    try:
+        graph = _get_manager_agent_graph(model_type)
+        return {"status": "success", "mermaid": graph.get_graph().draw_mermaid()}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

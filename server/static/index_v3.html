@@ -334,7 +334,7 @@
                 AI Assistant
             </div>
             <div style="display: flex; align-items: center; gap: 10px;">
-                <select id="ai-model-select"
+                <select id="ai-model-select" onchange="onAiModelSelectChange()"
                     style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; outline: none;">
                     <option value="gemini">Gemini 2.5 Flash</option>
                     <option value="gemma">Gemma 4</option>
@@ -342,6 +342,14 @@
                     <option value="groq">Groq (Llama 3.3)</option>
                     <option value="local">Local (Ollama)</option>
                     <option value="manager-agent">Manager Agent（測試版）</option>
+                </select>
+                <select id="manager-agent-engine-select"
+                    title="Manager Agent 底層要用哪個 LLM 推理"
+                    style="display:none; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; outline: none;">
+                    <option value="gemini">Gemini 2.5 Flash</option>
+                    <option value="gemma">Gemma 4</option>
+                    <option value="groq">Groq (Llama 3.3)</option>
+                    <option value="local">Local (Ollama)</option>
                 </select>
                 <button onclick="toggleChat()" style="background: none; border: none; color: #94a3b8; cursor: pointer;">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
