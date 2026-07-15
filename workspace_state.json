@@ -2,17 +2,17 @@
   "project_name": "AI_Detector",
   "last_updated": "2026-07-09T15:40:00+08:00",
   "dataset": {
-    "imported": false,
-    "name": null,
-    "path": null,
-    "image_count": 0,
-    "label_count": 0,
+    "imported": true,
+    "name": "花",
+    "path": "C:\\Users\\freddy_huang\\OneDrive - ASUS\\Desktop\\AI-project\\data\\datasets\\花",
+    "image_count": 514,
+    "label_count": 514,
     "health_analysis": {
-      "passed": false,
-      "score": null,
-      "coverage": null,
-      "balance": null,
-      "last_checked": null
+      "passed": true,
+      "score": 83.5,
+      "coverage": 100.0,
+      "balance": 72.4,
+      "last_checked": "2026-07-15T10:45:20.739917+08:00"
     }
   },
   "annotation": {
@@ -21,17 +21,17 @@
     "last_checked": null
   },
   "model": {
-    "trained": false,
-    "exp_name": null,
-    "best_model_path": null,
+    "trained": true,
+    "exp_name": "manager_agent_test4",
+    "best_model_path": "C:\\Users\\freddy_huang\\OneDrive - ASUS\\Desktop\\AI-project\\runs\\train\\manager_agent_test4\\weights\\best.pt",
     "last_training_metrics": {
-      "mAP50": null,
-      "final_loss": null,
-      "total_epochs": null
+      "mAP50": 0.8629,
+      "final_loss": 1.735,
+      "total_epochs": 15
     },
     "evaluation": {
-      "passed": false,
-      "last_evaluated": null
+      "passed": true,
+      "last_evaluated": "2026-07-15T13:55:41.249995+08:00"
     }
   }
 }

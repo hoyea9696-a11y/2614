@@ -7,11 +7,15 @@ ai_analyzer.py 的既有邏輯，也不涉及任何 LLM 呼叫。
 
 Manager Agent 本身（何時呼叫、要不要呼叫）留給 Step 3 的 PR。
 """
+import io
+import os
 import sys
+import zipfile
 from pathlib import Path
 from typing import Annotated, Optional
 
 import cv2
+import requests
 from pydantic import Field
 from langchain_core.tools import tool
 
@@ -27,12 +31,59 @@ from ai_analyzer import ai_analyzer
 DATASET_DIR = PROJECT_ROOT / "data" / "datasets"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "outputs"
 
+ROBOFLOW_EXPORT_FORMAT = "yolov5pytorch"  # Roboflow 沒有獨立的 yolov9 匯出格式，但輸出的 YOLO txt 格式跟 ultralytics 相容
+
+
+def _count_images(path: Path) -> int:
+    if not path.exists():
+        return 0
+    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
+    return sum(len(list(path.rglob(ext))) for ext in exts)
+
+
+def _sanitize_name(name: str) -> str:
+    """只取檔名部分並擋掉「.」「..」，避免 dataset_name/model_name（來自 LLM，
+    間接來自使用者訊息）被拿來做路徑遍歷，跳出 DATASET_DIR/runs 之外讀寫檔案。"""
+    cleaned = Path(str(name)).name
+    if not cleaned or cleaned in (".", ".."):
+        raise ValueError(f"不合法的名稱：{name!r}")
+    return cleaned
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
+    """解壓前先確認每個成員的目標路徑都落在 dest 底下，防止惡意/被竄改的 zip
+    用 ../../ 這種路徑跳出去覆寫任意檔案（zip slip）。"""
+    dest_root = dest.resolve()
+    for member in zf.infolist():
+        target = (dest / member.filename).resolve()
+        if target != dest_root and dest_root not in target.parents:
+            raise ValueError(f"壓縮檔內含不安全的路徑，已中止解壓：{member.filename}")
+    zf.extractall(dest)
+
+
+def _load_roboflow_key() -> Optional[str]:
+    key = os.environ.get("ROBOFLOW_API_KEY")
+    if key:
+        return key
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("ROBOFLOW_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
 
 @tool
 def check_dataset_health(
     dataset_name: Annotated[str, Field(description="資料集名稱，對應 data/datasets/ 底下的資料夾名")],
 ) -> dict:
     """檢查資料集的健康度（標記覆蓋率、類別平衡、圖片與標籤總數），回傳 0-100 的健康分數。"""
+    try:
+        dataset_name = _sanitize_name(dataset_name)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
     return ai_analyzer.analyze_dataset_health(dataset_name)
 
 
@@ -45,9 +96,26 @@ def train_yolo_model(
     batch: Annotated[int, Field(description="batch size")] = 16,
     model_name: Annotated[str, Field(description="輸出的實驗名稱，會存在 runs/train/<model_name> 底下")] = "exp",
 ) -> dict:
-    """使用指定資料集訓練 YOLO 模型，回傳最終狀態（completed/error/stopped）。"""
-    trainer = YOLOTrainer(data_root=str(DATASET_DIR))
+    """使用指定資料集訓練 YOLO 模型，回傳最終狀態（completed/error/stopped）。
+
+    若本機找不到這個資料集（沒有圖片），會回傳 status="dataset_not_found"，
+    這時應該呼叫 download_roboflow_dataset 從 Roboflow Universe 補齊資料後再重試，
+    不要直接放棄。"""
+    try:
+        dataset_name = _sanitize_name(dataset_name)
+        model_name = _sanitize_name(model_name)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
     ds_path = DATASET_DIR / dataset_name
+    if _count_images(ds_path) == 0:
+        return {
+            "status": "dataset_not_found",
+            "message": f"本機找不到資料集 {dataset_name}（沒有圖片），"
+                       f"請呼叫 download_roboflow_dataset 從 Roboflow Universe 下載後再重試",
+        }
+
+    trainer = YOLOTrainer(data_root=str(DATASET_DIR))
     data_yaml = trainer.prepare_dataset(str(ds_path))
     trainer.train(
         variant=variant,
@@ -95,4 +163,68 @@ def run_yolo_inference(
     return {"objects": detections, "annotated_image_path": str(out_path)}
 
 
-ALL_TOOLS = [check_dataset_health, train_yolo_model, evaluate_yolo_model, run_yolo_inference]
+@tool
+def download_roboflow_dataset(
+    workspace: Annotated[str, Field(description="Roboflow workspace slug，來自 universe.roboflow.com/<workspace>/<project> 網址")],
+    project: Annotated[str, Field(description="Roboflow project slug，同樣來自該網址")],
+    version: Annotated[int, Field(description="要下載的資料集版本號，通常從 1 開始")] = 1,
+    dataset_name: Annotated[Optional[str], Field(description="下載後存到 data/datasets/ 底下的資料夾名稱，留空則用 project slug")] = None,
+) -> dict:
+    """從 Roboflow Universe 下載指定的公開資料集，解壓成 YOLO 格式存到 data/datasets/<dataset_name>/，
+    下載完就能直接被 train_yolo_model 使用。
+
+    呼叫前要先猜出正確的 workspace 與 project slug（來自 universe.roboflow.com 的網址，
+    例如 https://universe.roboflow.com/roboflow-100/vehicles-oal2j 對應
+    workspace="roboflow-100", project="vehicles-oal2j"）。不確定的話就用最符合關鍵字的
+    猜測去試；回傳 status="not_found" 代表這個 workspace/project 不存在，換一個猜測再試一次。
+    """
+    api_key = _load_roboflow_key()
+    if not api_key:
+        return {"status": "error", "message": "未設定 ROBOFLOW_API_KEY，無法下載"}
+
+    try:
+        target_name = _sanitize_name(dataset_name or project)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+    export_url = (
+        f"https://api.roboflow.com/{workspace}/{project}/{version}/{ROBOFLOW_EXPORT_FORMAT}"
+        f"?api_key={api_key}"
+    )
+
+    try:
+        resp = requests.get(export_url, timeout=30)
+    except requests.RequestException as e:
+        return {"status": "error", "message": f"連線失敗：{e}"}
+
+    if resp.status_code == 404:
+        return {
+            "status": "not_found",
+            "message": f"找不到 {workspace}/{project} 第 {version} 版，換一個 workspace/project 猜測再試",
+        }
+    if not resp.ok:
+        return {"status": "error", "message": f"Roboflow 回應錯誤（HTTP {resp.status_code}）：{resp.text[:200]}"}
+
+    link = resp.json().get("export", {}).get("link")
+    if not link:
+        return {"status": "error", "message": "回應中沒有下載連結，可能該版本不支援匯出"}
+
+    zip_resp = requests.get(link, timeout=120)
+    zip_resp.raise_for_status()
+
+    ds_path = DATASET_DIR / target_name
+    ds_path.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+            _safe_extract_zip(zf, ds_path)
+    except (zipfile.BadZipFile, ValueError) as e:
+        return {"status": "error", "message": f"解壓失敗：{e}"}
+
+    return {
+        "status": "success",
+        "dataset_name": target_name,
+        "source": f"roboflow:{workspace}/{project}/v{version}",
+        "image_count": _count_images(ds_path),
+    }
+
+
+ALL_TOOLS = [check_dataset_health, train_yolo_model, evaluate_yolo_model, run_yolo_inference, download_roboflow_dataset]
