@@ -445,8 +445,8 @@ function onAiModelSelectChange() {
     // Manager Agent 底層要用哪個 LLM，用第二個下拉選單另外選——切到別的選項時就隱藏，
     // 避免使用者以為一般聊天視窗也能選 Manager Agent 的引擎
     const modelType = document.getElementById('ai-model-select').value;
-    const engineSelect = document.getElementById('manager-agent-engine-select');
-    engineSelect.style.display = modelType === 'manager-agent' ? 'inline-block' : 'none';
+    const engineBar = document.getElementById('manager-agent-engine-bar');
+    engineBar.style.display = modelType === 'manager-agent' ? 'flex' : 'none';
 }
 
 function toggleChat() {
