@@ -590,6 +590,7 @@ async function sendManagerAgentMessage(text, loadingId) {
                     appendTraceStep(traceRefs, payload);
                 } else if (payload.type === 'final') {
                     finalReply = payload.reply;
+                    if (traceRefs) finishTraceCard(traceRefs, payload.usage, payload.llm_calls);
                 } else if (payload.type === 'error') {
                     sawError = true;
                     if (!traceRefs) traceRefs = createTraceCard();
@@ -730,6 +731,9 @@ function renderTraceStepHtml(step, index) {
     if (step.text) {
         inner += `<div>💬 ${escapeHtml(step.text)}</div>`;
     }
+    if (step.usage) {
+        inner += `<div style="color:#64748b;">🔢 tokens：input ${step.usage.input_tokens} / output ${step.usage.output_tokens}</div>`;
+    }
     inner += `</div>`;
     return inner;
 }
@@ -774,6 +778,16 @@ function appendTraceError(refs, message) {
     errDiv.textContent = `⚠️ 執行中發生錯誤：${message}`;
     refs.stepsContainer.appendChild(errDiv);
     refs.summary.textContent = `🔬 決策過程（共 ${refs.stepCount} 步，中途失敗）`;
+}
+
+// 跑完後在卡片底部補一行總計，讓使用者不用自己把每一步的 token 加起來。
+// usage/llmCalls 可能是 undefined（模型沒填 usage_metadata，例如本機 Ollama）。
+function finishTraceCard(refs, usage, llmCalls) {
+    if (!usage || !usage.total_tokens) return;
+    const summaryDiv = document.createElement('div');
+    summaryDiv.style.cssText = "margin-top:8px; padding-top:8px; border-top:1px solid rgba(148,163,184,0.15); color:#64748b;";
+    summaryDiv.textContent = `📊 共 ${llmCalls || 0} 次 LLM 呼叫，${usage.total_tokens} tokens（input ${usage.input_tokens} / output ${usage.output_tokens}）`;
+    refs.stepsContainer.appendChild(summaryDiv);
 }
 
 function appendMessage(text, sender, isLoading = false) {

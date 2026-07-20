@@ -203,6 +203,7 @@ class SupervisorState(TypedDict):
     plan: Optional[dict]
     evaluation: Optional[dict]
     stall_count: int
+    usage: Optional[dict]
 
 
 def _build_sub_agent(chat_model, tools, system_prompt):
@@ -256,6 +257,20 @@ def _extract_text(content) -> str:
                 parts.append(block.get("text", ""))
         return "".join(parts)
     return str(content) if content else ""
+
+
+def _usage_from_message(m) -> Optional[dict]:
+    """從一則 AIMessage 撈 usage_metadata（input/output/total tokens）——不是每個
+    provider、每個模型都會填這個欄位（例如本機 Ollama 常常沒有），拿不到就回
+    None，不要假裝有數字。"""
+    usage = getattr(m, "usage_metadata", None) if m is not None else None
+    if not usage:
+        return None
+    return {
+        "input_tokens": usage.get("input_tokens", 0) or 0,
+        "output_tokens": usage.get("output_tokens", 0) or 0,
+        "total_tokens": usage.get("total_tokens", 0) or 0,
+    }
 
 
 def _parse_tool_content(content) -> dict:
@@ -336,16 +351,25 @@ def build_multi_agent(chat_model):
     # method="function_calling" 明確指定用 Tool-Calling 做結構化輸出——Groq 的
     # llama-3.3 等模型不支援 with_structured_output 預設用的 json_schema
     # response_format（實測會直接回 400），但都支援 function calling。
-    decision_model = chat_model.with_structured_output(Decision, method="function_calling")
-    planner_model = chat_model.with_structured_output(Plan, method="function_calling")
+    # include_raw=True 讓 invoke() 多回傳原始 AIMessage（.invoke 預設只給解析後的
+    # Pydantic 物件），這樣才能撈到 usage_metadata 算 token 用量——結構化決策本身
+    # 邏輯不變，只是多留一份原始訊息。
+    decision_model = chat_model.with_structured_output(Decision, method="function_calling", include_raw=True)
+    planner_model = chat_model.with_structured_output(Plan, method="function_calling", include_raw=True)
 
     def planner_node(state: SupervisorState) -> dict:
         context = [SystemMessage(content=PLANNER_SYSTEM_PROMPT)] + list(state["messages"])
-        plan = planner_model.invoke(context)
+        result = planner_model.invoke(context)
+        plan = result["parsed"]
         # 重新規劃後一定要把舊的 evaluation 清掉，不然 decision_engine 下一輪還是會讀到
         # 舊的 verdict="plan_invalid"，繞回 planner -> manager -> planner 一直重複，
         # 直到 MAX_ROUNDS 才停下來。
-        return {"plan": _plan_to_state(plan), "stall_count": 0, "evaluation": None}
+        return {
+            "plan": _plan_to_state(plan),
+            "stall_count": 0,
+            "evaluation": None,
+            "usage": _usage_from_message(result["raw"]),
+        }
 
     def observer_node(state: SupervisorState) -> dict:
         """讀最新一份 AgentReport，判讀它對 Plan 來說代表什麼，寫成結構化 Evaluation。
@@ -457,11 +481,13 @@ def build_multi_agent(chat_model):
         if plan_summary:
             context.append(SystemMessage(content=f"目前的計畫進度：\n{plan_summary}"))
         context += list(state["messages"])
-        decision = decision_model.invoke(context)
+        result = decision_model.invoke(context)
+        decision = result["parsed"]
+        usage = _usage_from_message(result["raw"])
 
         if decision.action == "call_agent" and decision.target_agent:
             plan = _mark_step_in_progress(state.get("plan"), decision.target_agent)
-            return {"next": decision.target_agent, "rounds": rounds, "retry_counters": retry_counters, "plan": plan}
+            return {"next": decision.target_agent, "rounds": rounds, "retry_counters": retry_counters, "plan": plan, "usage": usage}
 
         reply_text = decision.final_reply or decision.rationale
         return {
@@ -469,6 +495,7 @@ def build_multi_agent(chat_model):
             "rounds": rounds,
             "retry_counters": retry_counters,
             "messages": [AIMessage(content=reply_text)],
+            "usage": usage,
         }
 
     def _run_sub_agent(agent_name, sub_agent, state: SupervisorState) -> dict:
@@ -544,6 +571,17 @@ def stream_trace(graph, user_message: str, thread_id: str):
             "evaluation": None,
             "last_report": None,
         }
+        total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        llm_calls = 0
+
+        def _add_usage(usage):
+            nonlocal llm_calls
+            if not usage:
+                return
+            for k in total_usage:
+                total_usage[k] += usage[k]
+            llm_calls += 1
+
         for step in graph.stream(initial_input, config=config, stream_mode="updates"):
             for node_name, node_output in step.items():
                 entry = {"type": "step", "node": node_name}
@@ -556,11 +594,18 @@ def stream_trace(graph, user_message: str, thread_id: str):
                 if "plan" in node_output and node_output["plan"]:
                     entry["plan"] = node_output["plan"]
 
+                # Planner/Decision Engine 呼叫 LLM 的 usage 直接附在 node_output 上
+                # （見 planner_node/decision_engine），子 Agent 的 usage 則要從它
+                # 這輪新增的每一則 AIMessage 各自撈（一次 ReAct 迴圈可能呼叫多次）。
+                node_usage = node_output.get("usage")
+                _add_usage(node_usage)
+
                 new_messages = node_output.get("messages") or []
                 all_messages.extend(new_messages)
 
                 tool_calls = []
                 last_text = None
+                sub_agent_usage = None
                 for m in new_messages:
                     calls = getattr(m, "tool_calls", None)
                     if calls:
@@ -570,14 +615,23 @@ def stream_trace(graph, user_message: str, thread_id: str):
                     elif getattr(m, "content", None):
                         last_text = _extract_text(m.content)
 
+                    msg_usage = _usage_from_message(m)
+                    if msg_usage:
+                        _add_usage(msg_usage)
+                        sub_agent_usage = sub_agent_usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+                        for k in sub_agent_usage:
+                            sub_agent_usage[k] += msg_usage[k]
+
                 if tool_calls:
                     entry["tool_calls"] = tool_calls
                 if last_text:
                     entry["text"] = last_text
+                if node_usage or sub_agent_usage:
+                    entry["usage"] = node_usage or sub_agent_usage
                 yield entry
     except Exception as e:
         yield {"type": "error", "message": str(e)}
         return
 
     reply = _extract_text(all_messages[-1].content) if len(all_messages) > 1 else ""
-    yield {"type": "final", "reply": reply}
+    yield {"type": "final", "reply": reply, "usage": total_usage, "llm_calls": llm_calls}
