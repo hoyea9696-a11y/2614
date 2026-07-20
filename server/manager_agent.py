@@ -64,8 +64,11 @@ def get_default_chat_model(model_type: str = "gemini"):
     - gemini：langchain_google_genai，原生支援 structured output。
     - gpt：OpenAI 官方 API（langchain_openai.ChatOpenAI 預設走 OpenAI 端點），
       預設用 gpt-4.1-mini，可用 .env 的 OPENAI_MODEL 覆蓋。
-    - llama4-scout：Groq 上的 Llama 4 Scout（OpenAI 相容端點），可用 .env 的
-      LLAMA4_SCOUT_MODEL 覆蓋 model id。
+    - gpt-oss：Groq 上的 openai/gpt-oss-120b（OpenAI 相容端點），可用 .env 的
+      GPT_OSS_MODEL 覆蓋 model id。原本這裡是 Llama 4 Scout
+      （meta-llama/llama-4-scout-17b-16e-instruct），但 Groq 已在 2026-06-17
+      棄用該模型，實測會直接回 404 model_not_found，改用 Groq 官方建議的
+      替代模型。
 
     Manager Agent 的 ReAct 迴圈跟 Decision Engine 都依賴 tool-calling／structured
     output，這三個選項都經過 with_structured_output(method="function_calling")
@@ -90,9 +93,9 @@ def get_default_chat_model(model_type: str = "gemini"):
             api_key=conf.get("openai_api_key"),
         )
 
-    if platform in ("llama4-scout", "llama-4-scout"):
+    if platform in ("gpt-oss", "llama4-scout", "llama-4-scout"):
         return ChatOpenAI(
-            model=conf.get("llama4_scout_model", "meta-llama/llama-4-scout-17b-16e-instruct"),
+            model=conf.get("gpt_oss_model", "openai/gpt-oss-120b"),
             api_key=conf.get("groq_api_key"),
             base_url="https://api.groq.com/openai/v1",
         )
