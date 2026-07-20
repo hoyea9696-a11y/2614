@@ -143,6 +143,13 @@ MANAGER_SYSTEM_PROMPT = """你是 Manager Agent，系統唯一的決策者。你
 - action="finish"：任務已完成或已經有足夠答案，final_reply 填入要給使用者看的完整回覆
 - action="ask_user"：需要使用者提供更多資訊才能繼續，final_reply 填入要問使用者的問題
 
+Roboflow workspace/project slug、確切下載網址這類技術細節，是 data_agent 自己的職責
+（它會自己猜、猜錯再換一個試），不算「缺資訊」——Plan 已經把某個步驟指派給某個子
+Agent 時，直接呼叫那個子 Agent 讓它自己想辦法，不要因為使用者沒有提供這些技術細節
+就選 ask_user。action="ask_user" 只留給子 Agent 已經回報卡住（例如 blocked/
+dataset_not_found 重試上限用完），且需要使用者提供只有人類才知道的資訊
+（例如使用者自己要驗證的圖片檔案本身）時才用。
+
 子 Agent 的 suggestion 只是參考意見，不代表你一定要照做，你可以選擇別的 Agent 或直接結束。"""
 
 # 已知的 Gate 失敗類型，直接用固定規則決定下一步找誰，不問 LLM——
