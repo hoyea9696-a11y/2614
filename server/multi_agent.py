@@ -26,7 +26,8 @@ Engine 的 LLM fallback 一直用同一份 Plan 瞎猜。
 
 依照 .agents/AGENTS.md 的分工設計，並對齊
 「AI Detector Multi-Agent System Architecture.docx」的 Agent / Skill / Tool 分層：
-- Data Agent：資料集相關，綁 DATA_TOOLS（check_dataset_health / download_roboflow_dataset）。
+- Data Agent：資料集相關，綁 DATA_TOOLS（check_dataset_health / import_images_to_dataset /
+  download_roboflow_dataset）。
 - Model Agent：只綁 Skill 層的 skill_train / skill_infer，不直接綁原始 Tool——
   訓練/推論裡「資料集存不存在」「該用哪個模型權重」這些判斷已經寫成確定性 Gate
   收在 skills.py，Model Agent 不用自己猜。
@@ -52,10 +53,10 @@ SERVER_DIR = Path(__file__).resolve().parent
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from agent_tools import check_dataset_health, download_roboflow_dataset
+from agent_tools import check_dataset_health, import_images_to_dataset, download_roboflow_dataset
 from skills import skill_train, skill_infer, skill_eval
 
-DATA_TOOLS = [check_dataset_health, download_roboflow_dataset]
+DATA_TOOLS = [check_dataset_health, import_images_to_dataset, download_roboflow_dataset]
 MODEL_TOOLS = [skill_train, skill_infer]
 EVAL_TOOLS = [skill_eval]
 
@@ -76,13 +77,18 @@ def report_to_manager(
     return {"status": status, "reason": reason, "suggestion": suggestion, "reason_code": reason_code}
 
 
-DATA_AGENT_PROMPT = """你是 Data Agent，只負責資料集相關的任務：
-- 檢查資料集健康度（check_dataset_health）
-- 本機找不到資料集時，從 Roboflow Universe 下載補齊（download_roboflow_dataset）：
-  自己猜最符合的 workspace/project slug，猜錯（status=not_found）就換一個再試，
-  最多嘗試 3 次，全部失敗才回報無法補齊。
+DATA_AGENT_PROMPT = """你是 Data Agent，只負責資料集相關的任務，依下面順序判斷該用哪個工具：
+1. 先呼叫 check_dataset_health 確認本機這個資料集是否已經有圖片——已經有就不用再匯入
+   或下載，直接回報現況即可。
+2. 使用者提到本機/已上傳有現成圖片路徑（例如推論頁面暫存上傳的 data/uploads/ 或
+   temp_verify/），且本機資料集還沒有圖片時，呼叫 import_images_to_dataset 把這些
+   圖片匯入。這個工具只搬圖片、不會產生標記檔，匯入後健康度是 0% 標記率是正常現象，
+   不用因此判定失敗。
+3. 本機、使用者提供的路徑都沒有圖片可用時，才呼叫 download_roboflow_dataset 從
+   Roboflow Universe 下載補齊：自己猜最符合的 workspace/project slug，猜錯
+   （status=not_found）就換一個再試，最多嘗試 3 次，全部失敗才回報無法補齊。
 
-完成後一定要呼叫 report_to_manager 回報結果：本機/Roboflow 都找不到資料就
+完成後一定要呼叫 report_to_manager 回報結果：本機、上傳、Roboflow 都找不到資料就
 status="blocked"、reason_code="dataset_not_found"；其他情況成功就 status="success"，
 reason_code 留空。
 

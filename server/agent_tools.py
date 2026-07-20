@@ -9,6 +9,7 @@ Manager Agent 本身（何時呼叫、要不要呼叫）留給 Step 3 的 PR。
 """
 import io
 import os
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -85,6 +86,52 @@ def check_dataset_health(
     except ValueError as e:
         return {"status": "error", "message": str(e)}
     return ai_analyzer.analyze_dataset_health(dataset_name)
+
+
+@tool
+def import_images_to_dataset(
+    source_path: Annotated[str, Field(description="要匯入的圖片路徑，可以是單一圖片檔案，也可以是一個資料夾（例如推論頁面暫存上傳圖片的 data/uploads/ 或 temp_verify/）")],
+    dataset_name: Annotated[str, Field(description="要匯入到的目標資料集名稱，對應 data/datasets/ 底下的資料夾名")],
+) -> dict:
+    """把本機任意路徑（例如使用者已經上傳的圖片）匯入成資料集，存到 data/datasets/<dataset_name>/images/，
+    之後就能被 check_dataset_health / train_yolo_model 使用。
+
+    這個工具只搬圖片，不會產生任何標記檔（.txt），匯入後 check_dataset_health 會如實顯示
+    0% 標記率，這是正常情況，不代表匯入失敗——用於「先驗證看看、之後再標記」這種流程。"""
+    try:
+        dataset_name = _sanitize_name(dataset_name)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
+    src = Path(source_path)
+    if not src.exists():
+        return {"status": "error", "message": f"來源路徑不存在：{source_path}"}
+
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+    if src.is_file():
+        candidates = [src] if src.suffix.lower() in exts else []
+    else:
+        candidates = [p for p in src.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+
+    if not candidates:
+        return {"status": "error", "message": f"來源路徑底下沒有找到任何圖片：{source_path}"}
+
+    dest_dir = DATASET_DIR / dataset_name / "images"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    imported_paths = []
+    for img in candidates:
+        dest = dest_dir / img.name
+        shutil.copy2(img, dest)
+        imported_paths.append(str(dest.resolve()))
+
+    return {
+        "status": "success",
+        "dataset_name": dataset_name,
+        "imported_count": len(imported_paths),
+        "imported_paths": imported_paths,
+        "total_images_now": _count_images(DATASET_DIR / dataset_name),
+    }
 
 
 @tool
@@ -227,4 +274,4 @@ def download_roboflow_dataset(
     }
 
 
-ALL_TOOLS = [check_dataset_health, train_yolo_model, evaluate_yolo_model, run_yolo_inference, download_roboflow_dataset]
+ALL_TOOLS = [check_dataset_health, import_images_to_dataset, train_yolo_model, evaluate_yolo_model, run_yolo_inference, download_roboflow_dataset]
