@@ -358,9 +358,8 @@
                 title="Manager Agent 底層要用哪個 LLM 推理"
                 style="flex: 1; min-width: 0; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; outline: none;">
                 <option value="gemini">Gemini 2.5 Flash</option>
-                <option value="gemma">Gemma 4</option>
-                <option value="groq">Groq (Llama 3.3)</option>
-                <option value="local">Local (Ollama)</option>
+                <option value="gpt">GPT (OpenAI)</option>
+                <option value="llama4-scout">Llama 4 Scout (Groq)</option>
             </select>
             <button onclick="resetManagerAgentThread()" title="清空目前的對話記憶，開始一段新對話"
                 style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 10px; border-radius: 8px; font-size: 0.72rem; cursor: pointer; white-space: nowrap;">
