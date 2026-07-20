@@ -57,25 +57,24 @@ def _load_env():
 
 
 def get_default_chat_model(model_type: str = "gemini"):
-    """依 model_type 選擇底層 LLM。設定（API Key、模型名稱、Ollama 位址）直接沿用
-    ai_service.py 的 _get_config()，不重複定義一次同樣的 .env 讀取邏輯——跟一般
-    聊天視窗（/api/ai/chat）共用同一份設定來源，改 .env 兩邊都會同時生效。
+    """依 model_type 選擇 Manager Agent 底層的 LLM。設定（API Key、模型名稱）直接
+    沿用 ai_service.py 的 _get_config()，不重複定義一次同樣的 .env 讀取邏輯。
 
-    Gemini 走原生 langchain_google_genai；Groq/Gemma/Local 都是 OpenAI 相容端點，
-    統一用 langchain_openai.ChatOpenAI 呼叫（只是換 base_url/api_key）。
+    Manager Agent 引擎選單目前只開放三個選項：
+    - gemini：langchain_google_genai，原生支援 structured output。
+    - gpt：OpenAI 官方 API（langchain_openai.ChatOpenAI 預設走 OpenAI 端點），
+      預設用 gpt-4.1-mini，可用 .env 的 OPENAI_MODEL 覆蓋。
+    - llama4-scout：Groq 上的 Llama 4 Scout（OpenAI 相容端點），可用 .env 的
+      LLAMA4_SCOUT_MODEL 覆蓋 model id。
 
-    注意：Manager Agent 的 ReAct 迴圈跟 Decision Engine 都依賴 tool-calling／
-    structured output，Groq 上的一般對話模型（llama-3.3 等）支援沒問題，但本機
-    Ollama 模型是否支援 function calling 要看實際模型，不保證都能正常跑完整個
-    多輪協調流程。"""
+    Manager Agent 的 ReAct 迴圈跟 Decision Engine 都依賴 tool-calling／structured
+    output，這三個選項都經過 with_structured_output(method="function_calling")
+    驗證過可以跑，不是隨便換一個模型都保證能跑完整個多輪協調流程。"""
     _load_env()
     from ai_service import AIService
 
     conf = AIService()._get_config()
     platform = (model_type or "gemini").lower()
-    if platform == "gemma":
-        # 跟 ai_service.py 同一套判斷：Gemma 系列在 Groq 上更穩定，沒有 Groq 金鑰才退回本機 Ollama
-        platform = "groq" if conf.get("groq_api_key") else "local"
 
     if platform in ("gemini", "gemini-pro"):
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -85,17 +84,20 @@ def get_default_chat_model(model_type: str = "gemini"):
 
     from langchain_openai import ChatOpenAI
 
-    if platform == "groq":
+    if platform in ("gpt", "openai"):
         return ChatOpenAI(
-            model=conf.get("groq_model", "llama-3.3-70b-versatile"),
+            model=conf.get("openai_model", "gpt-4.1-mini"),
+            api_key=conf.get("openai_api_key"),
+        )
+
+    if platform in ("llama4-scout", "llama-4-scout"):
+        return ChatOpenAI(
+            model=conf.get("llama4_scout_model", "meta-llama/llama-4-scout-17b-16e-instruct"),
             api_key=conf.get("groq_api_key"),
             base_url="https://api.groq.com/openai/v1",
         )
-    return ChatOpenAI(
-        model=conf.get("ollama_model", "llama3.2"),
-        api_key="ollama",
-        base_url=conf.get("ollama_base_url", "http://localhost:11434/v1"),
-    )
+
+    raise ValueError(f"Manager Agent 不支援的 model_type：{model_type}")
 
 
 def build_manager_agent(chat_model):
