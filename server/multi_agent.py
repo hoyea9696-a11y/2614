@@ -234,7 +234,15 @@ def _build_sub_agent(chat_model, tools, system_prompt):
         messages = state["messages"]
         if not any(isinstance(m, SystemMessage) for m in messages):
             messages = [SystemMessage(content=system_prompt)] + list(messages)
-        response = model_with_tools.invoke(messages)
+        try:
+            response = _invoke_with_retry(lambda: model_with_tools.invoke(messages))
+        except Exception as e:
+            # 重試後仍失敗：回一則沒有 tool_calls 的訊息讓這個子 Agent 自然結束
+            # （should_continue 判斷沒有 tool_calls 就是 "end"），_extract_agent_report
+            # 找不到 report_to_manager 時本來就會退化成 status="partial"，讓 Observer/
+            # Decision Engine 走既有的「未知失敗」流程決定下一步，而不是讓例外往上
+            # 一路炸穿 graph.stream()，中斷整段對話。
+            response = AIMessage(content=f"（LLM 呼叫失敗，這一輪任務中止：{e}）")
         return {"messages": [response]}
 
     def should_continue(state) -> str:
@@ -284,6 +292,21 @@ def _usage_from_message(m) -> Optional[dict]:
         "output_tokens": usage.get("output_tokens", 0) or 0,
         "total_tokens": usage.get("total_tokens", 0) or 0,
     }
+
+
+def _invoke_with_retry(invoke_fn, retries: int = 1):
+    """呼叫底層 LLM 時，Reasoning 模型（例如 Groq 的 gpt-oss-120b）偶爾會把推理過程
+    誤當成最終輸出，導致 tool-calling／structured output 解析失敗，provider 直接
+    回 400 拋例外——這種通常換一次生成就會恢復正常，不是每次都會發生。這裡固定重試
+    一次，兩次都失敗才真的往上拋，讓呼叫端自己決定怎麼優雅降級，而不是讓整個
+    graph.stream() 直接崩潰、中斷整段對話。"""
+    last_err = None
+    for _ in range(retries + 1):
+        try:
+            return invoke_fn()
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 
 def _parse_tool_content(content) -> dict:
@@ -372,7 +395,13 @@ def build_multi_agent(chat_model):
 
     def planner_node(state: SupervisorState) -> dict:
         context = [SystemMessage(content=PLANNER_SYSTEM_PROMPT)] + list(state["messages"])
-        result = planner_model.invoke(context)
+        try:
+            result = _invoke_with_retry(lambda: planner_model.invoke(context))
+        except Exception:
+            # 規劃失敗就不擋流程——Plan 本來就只是輔助脈絡，不是硬性合約（見
+            # _mark_step_in_progress 的說明），沒有 Plan，Manager 一樣能只靠對話
+            # 紀錄做決策，好過整段對話直接因為例外中斷。
+            return {"plan": None, "stall_count": 0, "evaluation": None}
         plan = result["parsed"]
         # 重新規劃後一定要把舊的 evaluation 清掉，不然 decision_engine 下一輪還是會讀到
         # 舊的 verdict="plan_invalid"，繞回 planner -> manager -> planner 一直重複，
@@ -494,7 +523,17 @@ def build_multi_agent(chat_model):
         if plan_summary:
             context.append(SystemMessage(content=f"目前的計畫進度：\n{plan_summary}"))
         context += list(state["messages"])
-        result = decision_model.invoke(context)
+        try:
+            result = _invoke_with_retry(lambda: decision_model.invoke(context))
+        except Exception as e:
+            # 重試後仍失敗：直接結束這輪並誠實告知使用者，好過讓例外炸穿
+            # graph.stream()、讓整段對話（包含前面已經跑完的步驟）都消失。
+            return {
+                "next": "FINISH",
+                "rounds": rounds,
+                "retry_counters": retry_counters,
+                "messages": [AIMessage(content=f"決策時發生錯誤，請稍後再試一次：{e}")],
+            }
         decision = result["parsed"]
         usage = _usage_from_message(result["raw"])
 
