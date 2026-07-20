@@ -1,7 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 import shutil
 import os
 import json
@@ -749,13 +749,14 @@ def _get_manager_agent_graph(model_type: str = "gemini"):
 
 @app.post("/api/agent/chat")
 async def agent_chat(request: ManagerAgentChatRequest):
-    from multi_agent import run_with_trace
-    try:
-        graph = _get_manager_agent_graph(request.model_type)
-        reply, trace = run_with_trace(graph, request.message)
-        return {"status": "success", "reply": reply, "trace": trace}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    from multi_agent import stream_trace
+    graph = _get_manager_agent_graph(request.model_type)
+
+    def event_stream():
+        for entry in stream_trace(graph, request.message):
+            yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.get("/api/agent/graph")
 async def agent_graph(model_type: str = "gemini"):
