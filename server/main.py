@@ -736,6 +736,7 @@ async def get_auto_label_status():
 class ManagerAgentChatRequest(BaseModel):
     message: str
     model_type: str = "gemini"
+    thread_id: str
 
 # 依 model_type 各自快取一份 Graph，換模型（gemini/groq/gemma/local）不用重啟服務
 _manager_agent_graphs = {}
@@ -753,7 +754,7 @@ async def agent_chat(request: ManagerAgentChatRequest):
     graph = _get_manager_agent_graph(request.model_type)
 
     def event_stream():
-        for entry in stream_trace(graph, request.message):
+        for entry in stream_trace(graph, request.message, request.thread_id):
             yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

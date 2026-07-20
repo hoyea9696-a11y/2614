@@ -45,6 +45,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.tools import tool
 
 SERVER_DIR = Path(__file__).resolve().parent
@@ -511,21 +512,39 @@ def build_multi_agent(chat_model):
     graph.add_edge("model_agent", "observer")
     graph.add_edge("evaluation_agent", "observer")
     graph.add_edge("observer", "manager")
-    return graph.compile()
+    # checkpointer 讓同一個 thread_id 的多輪對話記得住 messages（歷史對話內容），
+    # 是 /api/agent/chat 做 session 記憶的前提——stream_trace 呼叫時另外會重置
+    # rounds/retry_counters/plan 等「單次任務用的計數器」，不讓它們跨任務累積。
+    return graph.compile(checkpointer=MemorySaver())
 
 
-def stream_trace(graph, user_message: str):
+def stream_trace(graph, user_message: str, thread_id: str):
     """觀測層：用 graph.stream() 逐步 yield 每個節點做了什麼（Planner 的計畫、
     Manager 的路由決策、子 Agent 呼叫了哪些 Tool、回報了什麼結果、Observer
     的判讀），給 /api/agent/chat 邊跑邊往前端推，這樣使用者才「看得到」Agent
     跑到哪一步，而不是等全部跑完才一次性看到決策過程。
 
     中途任何 node 拋例外都會被攔下來、yield 一個 error entry 再結束——這樣
-    已經跑出來的步驟不會因為後面失敗就整包消失。"""
+    已經跑出來的步驟不會因為後面失敗就整包消失。
+
+    thread_id 對應同一個 checkpointer 裡的一份記憶——同一個 thread_id 的
+    messages 會跟之前的對話合併，但 rounds/retry_counters/stall_count/
+    plan/evaluation/last_report 每次新訊息都明確重置，這些欄位是「這一次
+    任務」用的保險絲，不該延續到下一次使用者發的新任務。"""
     all_messages = [HumanMessage(content=user_message)]
+    config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        for step in graph.stream({"messages": list(all_messages)}, stream_mode="updates"):
+        initial_input = {
+            "messages": list(all_messages),
+            "rounds": 0,
+            "retry_counters": {},
+            "stall_count": 0,
+            "plan": None,
+            "evaluation": None,
+            "last_report": None,
+        }
+        for step in graph.stream(initial_input, config=config, stream_mode="updates"):
             for node_name, node_output in step.items():
                 entry = {"type": "step", "node": node_name}
                 if "next" in node_output:

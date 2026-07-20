@@ -362,6 +362,10 @@
                 <option value="groq">Groq (Llama 3.3)</option>
                 <option value="local">Local (Ollama)</option>
             </select>
+            <button onclick="resetManagerAgentThread()" title="清空目前的對話記憶，開始一段新對話"
+                style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 10px; border-radius: 8px; font-size: 0.72rem; cursor: pointer; white-space: nowrap;">
+                🔄 開新對話
+            </button>
         </div>
         <div id="ai-chat-history"
             style="flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; font-size: 0.9rem;">

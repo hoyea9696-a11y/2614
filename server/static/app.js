@@ -526,11 +526,36 @@ async function sendChatMessage() {
     }
 }
 
+// Manager Agent 的對話記憶（LangGraph checkpointer）用 thread_id 對應到同一份
+// state——存在 sessionStorage 而不是 localStorage，分頁關閉就清除，符合「這次
+// 用著有記憶、下次進站重置」；重新整理頁面不會清（瀏覽器對 sessionStorage 的
+// 行為本來就是這樣），要真的開新對話請按「開新對話」按鈕。
+const MANAGER_AGENT_THREAD_KEY = 'manager_agent_thread_id';
+
+function getOrCreateThreadId() {
+    let threadId = sessionStorage.getItem(MANAGER_AGENT_THREAD_KEY);
+    if (!threadId) {
+        threadId = crypto.randomUUID();
+        sessionStorage.setItem(MANAGER_AGENT_THREAD_KEY, threadId);
+    }
+    return threadId;
+}
+
+function resetManagerAgentThread() {
+    sessionStorage.setItem(MANAGER_AGENT_THREAD_KEY, crypto.randomUUID());
+    chatMessages.length = 0;
+    document.getElementById('ai-chat-history').innerHTML = '';
+}
+
 // /api/agent/chat 回應是 SSE 串流（text/event-stream），逐個 trace step 邊跑邊塞進
 // 決策過程卡片（createTraceCard/appendTraceStep），不用等整個 Plan→Act→Observe→
 // Decide 迴圈跑完才看到東西；中途失敗也能看到已經跑出來的步驟跟錯誤原因。
 async function sendManagerAgentMessage(text, loadingId) {
-    const requestBody = { message: text, model_type: document.getElementById('manager-agent-engine-select').value };
+    const requestBody = {
+        message: text,
+        model_type: document.getElementById('manager-agent-engine-select').value,
+        thread_id: getOrCreateThreadId()
+    };
     let traceRefs = null;
     let finalReply = null;
     let sawError = false;
