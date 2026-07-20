@@ -514,45 +514,51 @@ def build_multi_agent(chat_model):
     return graph.compile()
 
 
-def run_with_trace(graph, user_message: str):
-    """觀測層：用 graph.stream() 逐步收集每個節點做了什麼（Planner 的計畫、
+def stream_trace(graph, user_message: str):
+    """觀測層：用 graph.stream() 逐步 yield 每個節點做了什麼（Planner 的計畫、
     Manager 的路由決策、子 Agent 呼叫了哪些 Tool、回報了什麼結果、Observer
-    的判讀），給 /api/agent/chat 一起回傳給前端，這樣才「看得到」Agent 實際
-    怎麼跑，而不是只拿到最後一句話。"""
+    的判讀），給 /api/agent/chat 邊跑邊往前端推，這樣使用者才「看得到」Agent
+    跑到哪一步，而不是等全部跑完才一次性看到決策過程。
+
+    中途任何 node 拋例外都會被攔下來、yield 一個 error entry 再結束——這樣
+    已經跑出來的步驟不會因為後面失敗就整包消失。"""
     all_messages = [HumanMessage(content=user_message)]
-    trace = []
 
-    for step in graph.stream({"messages": list(all_messages)}, stream_mode="updates"):
-        for node_name, node_output in step.items():
-            entry = {"node": node_name}
-            if "next" in node_output:
-                entry["decision"] = node_output["next"]
-            if "last_report" in node_output:
-                entry["report"] = node_output["last_report"]
-            if "evaluation" in node_output:
-                entry["evaluation"] = node_output["evaluation"]
-            if "plan" in node_output and node_output["plan"]:
-                entry["plan"] = node_output["plan"]
+    try:
+        for step in graph.stream({"messages": list(all_messages)}, stream_mode="updates"):
+            for node_name, node_output in step.items():
+                entry = {"type": "step", "node": node_name}
+                if "next" in node_output:
+                    entry["decision"] = node_output["next"]
+                if "last_report" in node_output:
+                    entry["report"] = node_output["last_report"]
+                if "evaluation" in node_output:
+                    entry["evaluation"] = node_output["evaluation"]
+                if "plan" in node_output and node_output["plan"]:
+                    entry["plan"] = node_output["plan"]
 
-            new_messages = node_output.get("messages") or []
-            all_messages.extend(new_messages)
+                new_messages = node_output.get("messages") or []
+                all_messages.extend(new_messages)
 
-            tool_calls = []
-            last_text = None
-            for m in new_messages:
-                calls = getattr(m, "tool_calls", None)
-                if calls:
-                    tool_calls.extend([{"tool": c["name"], "args": c["args"]} for c in calls])
-                elif isinstance(m, ToolMessage):
-                    tool_calls.append({"tool_result": m.name, "output": m.content})
-                elif getattr(m, "content", None):
-                    last_text = _extract_text(m.content)
+                tool_calls = []
+                last_text = None
+                for m in new_messages:
+                    calls = getattr(m, "tool_calls", None)
+                    if calls:
+                        tool_calls.extend([{"tool": c["name"], "args": c["args"]} for c in calls])
+                    elif isinstance(m, ToolMessage):
+                        tool_calls.append({"tool_result": m.name, "output": m.content})
+                    elif getattr(m, "content", None):
+                        last_text = _extract_text(m.content)
 
-            if tool_calls:
-                entry["tool_calls"] = tool_calls
-            if last_text:
-                entry["text"] = last_text
-            trace.append(entry)
+                if tool_calls:
+                    entry["tool_calls"] = tool_calls
+                if last_text:
+                    entry["text"] = last_text
+                yield entry
+    except Exception as e:
+        yield {"type": "error", "message": str(e)}
+        return
 
     reply = _extract_text(all_messages[-1].content) if len(all_messages) > 1 else ""
-    return reply, trace
+    yield {"type": "final", "reply": reply}

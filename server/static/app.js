@@ -445,8 +445,8 @@ function onAiModelSelectChange() {
     // Manager Agent 底層要用哪個 LLM，用第二個下拉選單另外選——切到別的選項時就隱藏，
     // 避免使用者以為一般聊天視窗也能選 Manager Agent 的引擎
     const modelType = document.getElementById('ai-model-select').value;
-    const engineSelect = document.getElementById('manager-agent-engine-select');
-    engineSelect.style.display = modelType === 'manager-agent' ? 'inline-block' : 'none';
+    const engineBar = document.getElementById('manager-agent-engine-bar');
+    engineBar.style.display = modelType === 'manager-agent' ? 'flex' : 'none';
 }
 
 function toggleChat() {
@@ -481,33 +481,29 @@ async function sendChatMessage() {
 
     const loadingId = appendMessage(`[${modelType.toUpperCase()}] 思考中...`, 'ai', true);
 
-    // Manager Agent 走獨立的 /api/agent/chat（LangGraph + Tool），跟原本的
-    // /api/ai/chat（Gemini/Groq/Local 的一般對話）分開，互不影響。Manager Agent
-    // 底層要用哪個 LLM 是另一個下拉選單決定的（manager-agent-engine-select），
+    // Manager Agent 走獨立的 /api/agent/chat（LangGraph + Tool，SSE 串流），跟原本的
+    // /api/ai/chat（Gemini/Groq/Local 的一般對話，整包 JSON）分開，互不影響。Manager
+    // Agent 底層要用哪個 LLM 是另一個下拉選單決定的（manager-agent-engine-select），
     // 跟一般聊天視窗的 modelType 是兩件事，不要混在一起。
-    const isManagerAgent = modelType === 'manager-agent';
-    const requestUrl = isManagerAgent ? '/api/agent/chat' : '/api/ai/chat';
-    const requestBody = isManagerAgent
-        ? { message: text, model_type: document.getElementById('manager-agent-engine-select').value }
-        : { messages: chatMessages, context_data: contextData, model_type: modelType };
+    if (modelType === 'manager-agent') {
+        await sendManagerAgentMessage(text, loadingId);
+        return;
+    }
+
+    const requestBody = { messages: chatMessages, context_data: contextData, model_type: modelType };
 
     try {
-        const res = await fetch(requestUrl, {
+        const res = await fetch('/api/ai/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(requestBody)
         });
         const data = await res.json();
-        
+
         removeMessage(loadingId);
-        
+
         if (data.status === 'success') {
             let reply = data.reply;
-
-            // 決策過程是答案的成因，先顯示過程再顯示結論，符合實際發生的順序。
-            if (isManagerAgent && data.trace) {
-                appendTraceCard(data.trace);
-            }
 
             // 檢查是否有健康度數據標籤 [HEALTH_DATA: {json}]
             const healthMatch = reply.match(/\[HEALTH_DATA: ({.*?})\]/);
@@ -523,6 +519,74 @@ async function sendChatMessage() {
             chatMessages.push({ role: 'assistant', content: reply });
         } else {
             appendMessage("發生錯誤: " + data.message, 'error');
+        }
+    } catch (e) {
+        removeMessage(loadingId);
+        appendMessage("連線失敗", 'error');
+    }
+}
+
+// /api/agent/chat 回應是 SSE 串流（text/event-stream），逐個 trace step 邊跑邊塞進
+// 決策過程卡片（createTraceCard/appendTraceStep），不用等整個 Plan→Act→Observe→
+// Decide 迴圈跑完才看到東西；中途失敗也能看到已經跑出來的步驟跟錯誤原因。
+async function sendManagerAgentMessage(text, loadingId) {
+    const requestBody = { message: text, model_type: document.getElementById('manager-agent-engine-select').value };
+    let traceRefs = null;
+    let finalReply = null;
+    let sawError = false;
+
+    try {
+        const res = await fetch('/api/agent/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+        });
+
+        removeMessage(loadingId);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            let idx;
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+                const rawEvent = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 2);
+                if (!rawEvent.startsWith('data: ')) continue;
+
+                const payload = JSON.parse(rawEvent.slice(6));
+                if (payload.type === 'step') {
+                    if (!traceRefs) traceRefs = createTraceCard();
+                    appendTraceStep(traceRefs, payload);
+                } else if (payload.type === 'final') {
+                    finalReply = payload.reply;
+                } else if (payload.type === 'error') {
+                    sawError = true;
+                    if (!traceRefs) traceRefs = createTraceCard();
+                    appendTraceError(traceRefs, payload.message);
+                }
+            }
+        }
+
+        if (finalReply !== null) {
+            let reply = finalReply;
+            const healthMatch = reply.match(/\[HEALTH_DATA: ({.*?})\]/);
+            if (healthMatch) {
+                const healthJson = JSON.parse(healthMatch[1]);
+                reply = reply.replace(healthMatch[0], "");
+                appendMessage(reply, 'ai');
+                appendHealthCard(healthJson);
+            } else {
+                appendMessage(reply, 'ai');
+            }
+            chatMessages.push({ role: 'assistant', content: reply });
+        } else if (sawError) {
+            appendMessage("執行中發生錯誤，詳情請展開上方決策過程", 'error');
         }
     } catch (e) {
         removeMessage(loadingId);
@@ -597,71 +661,94 @@ function escapeHtml(value) {
     return div.innerHTML;
 }
 
-// 把 /api/agent/chat 回傳的 trace（Planner 的計畫、Manager 的路由決策、
-// Observer 的判讀、各子 Agent 呼叫的工具）視覺化成可展開的決策過程卡片，
-// 不然使用者只看得到最終一句回覆，看不出三個 Agent 實際怎麼協作。
-function appendTraceCard(trace) {
-    if (!trace || trace.length === 0) return;
+// 把 /api/agent/chat 串流回來的單個 trace step（Planner 的計畫、Manager 的
+// 路由決策、Observer 的判讀、子 Agent 呼叫的工具）轉成一段 HTML，給
+// appendTraceStep 逐步塞進卡片——不然使用者只看得到最終一句回覆，看不出
+// 三個 Agent 實際怎麼協作。
+function renderTraceStepHtml(step, index) {
+    const label = MANAGER_AGENT_NODE_LABELS[step.node] || step.node;
+    let inner = `<div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(148,163,184,0.15);">`;
+    inner += `<div style="color:#e2e8f0; font-weight:600;">#${index} ${escapeHtml(label)}</div>`;
+
+    if (step.decision) {
+        inner += `<div>→ 交給：<b>${escapeHtml(step.decision)}</b></div>`;
+    }
+    if (step.plan && step.plan.goal) {
+        inner += `<div>🎯 目標：${escapeHtml(step.plan.goal)}</div>`;
+        if (step.plan.steps && step.plan.steps.length) {
+            inner += '<ul style="margin:4px 0 0 16px; padding:0;">' +
+                step.plan.steps.map(s => `<li>[${escapeHtml(s.status)}] ${escapeHtml(s.description)}（${escapeHtml(s.agent)}）</li>`).join('') +
+                '</ul>';
+        }
+    }
+    if (step.tool_calls && step.tool_calls.length) {
+        inner += step.tool_calls.map(tc => {
+            if (tc.tool) {
+                return `<div>🔧 呼叫工具：<b>${escapeHtml(tc.tool)}</b>（${escapeHtml(JSON.stringify(tc.args))}）</div>`;
+            }
+            return `<div>📥 工具回傳（${escapeHtml(tc.tool_result)}）：${escapeHtml(typeof tc.output === 'string' ? tc.output : JSON.stringify(tc.output))}</div>`;
+        }).join('');
+    }
+    if (step.report) {
+        inner += `<div>📝 回報：status=<b>${escapeHtml(step.report.status)}</b>` +
+            (step.report.reason_code ? ` reason_code=${escapeHtml(step.report.reason_code)}` : '') +
+            `<br>理由：${escapeHtml(step.report.reason)}` +
+            (step.report.suggestion ? `<br>建議：${escapeHtml(step.report.suggestion)}` : '') +
+            `</div>`;
+    }
+    if (step.evaluation) {
+        inner += `<div>🔍 判讀：verdict=<b>${escapeHtml(step.evaluation.verdict)}</b>` +
+            `，有進展=${step.evaluation.progress_since_last_round ? '是' : '否'}` +
+            (step.evaluation.contradiction ? '，⚠️ 偵測到矛盾' : '') +
+            `</div>`;
+    }
+    if (step.text) {
+        inner += `<div>💬 ${escapeHtml(step.text)}</div>`;
+    }
+    inner += `</div>`;
+    return inner;
+}
+
+// 建立空的決策過程卡片，跑到哪一步就用 appendTraceStep 補進去，不用等全部
+// 跑完才一次性渲染——預設展開（open），因為需求就是「跑到哪就看到哪」。
+function createTraceCard() {
     const container = document.getElementById('ai-chat-history');
 
     const wrapper = document.createElement('details');
+    wrapper.open = true;
     wrapper.style.cssText = "align-self: flex-start; width: 92%; margin-top: 6px; background: #0f172a; border: 1px solid rgba(59,130,246,0.3); border-radius: 10px; padding: 8px 12px; font-size: 0.72rem; color: #94a3b8; overflow-wrap: anywhere; word-break: break-word;";
 
     const summary = document.createElement('summary');
     summary.style.cssText = "cursor: pointer; color: #60a5fa; font-weight: 600; outline: none;";
-    summary.textContent = `🔬 決策過程（共 ${trace.length} 步，點開查看）`;
+    summary.textContent = '🔬 決策過程（執行中…）';
     wrapper.appendChild(summary);
 
-    const stepsHtml = trace.map((step, i) => {
-        const label = MANAGER_AGENT_NODE_LABELS[step.node] || step.node;
-        let inner = `<div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(148,163,184,0.15);">`;
-        inner += `<div style="color:#e2e8f0; font-weight:600;">#${i + 1} ${escapeHtml(label)}</div>`;
-
-        if (step.decision) {
-            inner += `<div>→ 交給：<b>${escapeHtml(step.decision)}</b></div>`;
-        }
-        if (step.plan && step.plan.goal) {
-            inner += `<div>🎯 目標：${escapeHtml(step.plan.goal)}</div>`;
-            if (step.plan.steps && step.plan.steps.length) {
-                inner += '<ul style="margin:4px 0 0 16px; padding:0;">' +
-                    step.plan.steps.map(s => `<li>[${escapeHtml(s.status)}] ${escapeHtml(s.description)}（${escapeHtml(s.agent)}）</li>`).join('') +
-                    '</ul>';
-            }
-        }
-        if (step.tool_calls && step.tool_calls.length) {
-            inner += step.tool_calls.map(tc => {
-                if (tc.tool) {
-                    return `<div>🔧 呼叫工具：<b>${escapeHtml(tc.tool)}</b>（${escapeHtml(JSON.stringify(tc.args))}）</div>`;
-                }
-                return `<div>📥 工具回傳（${escapeHtml(tc.tool_result)}）：${escapeHtml(typeof tc.output === 'string' ? tc.output : JSON.stringify(tc.output))}</div>`;
-            }).join('');
-        }
-        if (step.report) {
-            inner += `<div>📝 回報：status=<b>${escapeHtml(step.report.status)}</b>` +
-                (step.report.reason_code ? ` reason_code=${escapeHtml(step.report.reason_code)}` : '') +
-                `<br>理由：${escapeHtml(step.report.reason)}` +
-                (step.report.suggestion ? `<br>建議：${escapeHtml(step.report.suggestion)}` : '') +
-                `</div>`;
-        }
-        if (step.evaluation) {
-            inner += `<div>🔍 判讀：verdict=<b>${escapeHtml(step.evaluation.verdict)}</b>` +
-                `，有進展=${step.evaluation.progress_since_last_round ? '是' : '否'}` +
-                (step.evaluation.contradiction ? '，⚠️ 偵測到矛盾' : '') +
-                `</div>`;
-        }
-        if (step.text) {
-            inner += `<div>💬 ${escapeHtml(step.text)}</div>`;
-        }
-        inner += `</div>`;
-        return inner;
-    }).join('');
-
     const stepsContainer = document.createElement('div');
-    stepsContainer.innerHTML = stepsHtml;
     wrapper.appendChild(stepsContainer);
 
     container.appendChild(wrapper);
     container.scrollTop = container.scrollHeight;
+
+    return { wrapper, summary, stepsContainer, stepCount: 0 };
+}
+
+function appendTraceStep(refs, step) {
+    refs.stepCount += 1;
+    const stepDiv = document.createElement('div');
+    stepDiv.innerHTML = renderTraceStepHtml(step, refs.stepCount);
+    refs.stepsContainer.appendChild(stepDiv);
+    refs.summary.textContent = `🔬 決策過程（共 ${refs.stepCount} 步，點開查看）`;
+
+    const container = document.getElementById('ai-chat-history');
+    container.scrollTop = container.scrollHeight;
+}
+
+function appendTraceError(refs, message) {
+    const errDiv = document.createElement('div');
+    errDiv.style.cssText = "margin-top:8px; padding-top:8px; border-top:1px solid rgba(239,68,68,0.3); color:#f87171;";
+    errDiv.textContent = `⚠️ 執行中發生錯誤：${message}`;
+    refs.stepsContainer.appendChild(errDiv);
+    refs.summary.textContent = `🔬 決策過程（共 ${refs.stepCount} 步，中途失敗）`;
 }
 
 function appendMessage(text, sender, isLoading = false) {

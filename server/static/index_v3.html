@@ -343,14 +343,6 @@
                     <option value="local">Local (Ollama)</option>
                     <option value="manager-agent">Manager Agent（測試版）</option>
                 </select>
-                <select id="manager-agent-engine-select"
-                    title="Manager Agent 底層要用哪個 LLM 推理"
-                    style="display:none; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; outline: none;">
-                    <option value="gemini">Gemini 2.5 Flash</option>
-                    <option value="gemma">Gemma 4</option>
-                    <option value="groq">Groq (Llama 3.3)</option>
-                    <option value="local">Local (Ollama)</option>
-                </select>
                 <button onclick="toggleChat()" style="background: none; border: none; color: #94a3b8; cursor: pointer;">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -358,6 +350,18 @@
                     </svg>
                 </button>
             </div>
+        </div>
+        <div id="manager-agent-engine-bar"
+            style="display:none; align-items: center; gap: 8px; padding: 8px 16px; background: rgba(15, 23, 42, 0.6); border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 0.72rem; color: #94a3b8;">
+            <span style="white-space: nowrap;">推理引擎</span>
+            <select id="manager-agent-engine-select"
+                title="Manager Agent 底層要用哪個 LLM 推理"
+                style="flex: 1; min-width: 0; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; outline: none;">
+                <option value="gemini">Gemini 2.5 Flash</option>
+                <option value="gemma">Gemma 4</option>
+                <option value="groq">Groq (Llama 3.3)</option>
+                <option value="local">Local (Ollama)</option>
+            </select>
         </div>
         <div id="ai-chat-history"
             style="flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; font-size: 0.9rem;">
