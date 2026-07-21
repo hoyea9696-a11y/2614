@@ -37,6 +37,7 @@ Engine 的 LLM fallback 一直用同一份 Plan 瞎猜。
 跟 manager_agent.py（單一 Agent 版本）並存，不刪除舊版。
 """
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Annotated, Literal, Optional, TypedDict
@@ -46,10 +47,13 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import interrupt, Command
 from langchain_core.tools import tool
 
 SERVER_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SERVER_DIR.parent
+CHECKPOINT_DB_PATH = PROJECT_ROOT / "data" / "agent_checkpoints.sqlite"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
@@ -170,7 +174,18 @@ RETRY_LIMITS = {
 # 該重新規劃了，不要讓 Decision Engine 拿著同一份 Plan 一直瞎猜。
 STALL_ROUNDS_BEFORE_REPLAN = 2
 
+# 同一個使用者請求最多繞回 Planner 重新規劃幾次——沒有這層上限，replan 會跟真正
+# 執行 Agent 步驟共用同一個 MAX_ROUNDS 預算，卡住的請求可能把整個預算都耗在
+# 「重新規劃」上，一次真正的步驟都沒跑到就 FINISH。
+MAX_REPLANS = 2
+
 MAX_ROUNDS = 8
+
+# 訓練是高成本、耗時的操作，啟動前要讓使用者確認——但 Manager 只知道「這一步要
+# 交給 model_agent」，不知道 model_agent 內部要跑 skill_train 還是 skill_infer
+# （那是 model_agent 自己的 ReAct 迴圈決定的）。用 Plan 步驟描述做確定性判斷，
+# 不問 LLM：指派給 model_agent 的 Step 描述裡有沒有訓練相關字樣。
+TRAIN_KEYWORDS = ("訓練", "train")
 
 
 class Decision(BaseModel):
@@ -217,6 +232,7 @@ class SupervisorState(TypedDict):
     evaluation: Optional[dict]
     stall_count: int
     usage: Optional[dict]
+    replan_count: int
 
 
 def _build_sub_agent(chat_model, tools, system_prompt):
@@ -477,6 +493,30 @@ def build_multi_agent(chat_model):
 
         return {"evaluation": evaluation, "plan": {**plan, "steps": steps}, "stall_count": stall_count}
 
+    def train_confirm_gate(state: SupervisorState) -> dict:
+        """manager 決定路由到 model_agent 時，先經過這一關：不是訓練步驟就直接
+        放行；是訓練步驟就用 interrupt() 暫停，等待前端使用者確認後才真的進
+        model_agent（訓練耗時、耗運算資源，不該讓 Agent 自己說做就做）。"""
+        plan = state.get("plan") or {"steps": []}
+        step = next(
+            (s for s in plan.get("steps", []) if s.get("agent") == "model_agent" and s.get("status") == "in_progress"),
+            None,
+        )
+        description = (step or {}).get("description", "")
+        if not any(k in description for k in TRAIN_KEYWORDS):
+            return {"next": "model_agent"}
+
+        resume = interrupt({
+            "reason": "即將啟動模型訓練，這是高成本、耗時的操作，請確認是否繼續。",
+            "step_description": description,
+        })
+        if isinstance(resume, dict) and resume.get("approved"):
+            return {"next": "model_agent"}
+        return {
+            "next": "FINISH",
+            "messages": [AIMessage(content="使用者取消了這次訓練，已停止。")],
+        }
+
     def decision_engine(state: SupervisorState) -> dict:
         rounds = state.get("rounds", 0) + 1
         retry_counters = dict(state.get("retry_counters", {}))
@@ -491,8 +531,26 @@ def build_multi_agent(chat_model):
         evaluation = state.get("evaluation") or {}
         if evaluation.get("verdict") == "plan_invalid":
             # Observer 判定目前的 Plan 已經卡住、沒有進展，繞回 Planner 重新規劃，
-            # 不要讓 LLM fallback 拿著同一份失效的 Plan 一直瞎猜。
-            return {"next": "planner", "rounds": rounds, "retry_counters": retry_counters}
+            # 不要讓 LLM fallback 拿著同一份失效的 Plan 一直瞎猜。連續重新規劃太多次
+            # 還是卡在同樣的問題，代表不是「換個計畫就能解決」，直接停下來讓使用者
+            # 知道，不要把 MAX_ROUNDS 的預算都耗在一直重新規劃上。
+            replan_count = state.get("replan_count", 0)
+            if replan_count >= MAX_REPLANS:
+                return {
+                    "next": "FINISH",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "messages": [AIMessage(
+                        content=f"已經重新規劃 {replan_count} 次仍卡在同樣的問題，"
+                                f"需要你確認需求或提供更多資訊後再試一次。"
+                    )],
+                }
+            return {
+                "next": "planner",
+                "rounds": rounds,
+                "retry_counters": retry_counters,
+                "replan_count": replan_count + 1,
+            }
 
         last_report = state.get("last_report") or {}
         reason_code = last_report.get("reason_code") or ""
@@ -570,6 +628,7 @@ def build_multi_agent(chat_model):
     graph.add_node("planner", planner_node)
     graph.add_node("manager", decision_engine)
     graph.add_node("observer", observer_node)
+    graph.add_node("train_confirm_gate", train_confirm_gate)
     graph.add_node("data_agent", run_data_agent)
     graph.add_node("model_agent", run_model_agent)
     graph.add_node("evaluation_agent", run_evaluation_agent)
@@ -581,11 +640,16 @@ def build_multi_agent(chat_model):
         lambda s: s["next"],
         {
             "data_agent": "data_agent",
-            "model_agent": "model_agent",
+            "model_agent": "train_confirm_gate",
             "evaluation_agent": "evaluation_agent",
             "planner": "planner",
             "FINISH": END,
         },
+    )
+    graph.add_conditional_edges(
+        "train_confirm_gate",
+        lambda s: s["next"],
+        {"model_agent": "model_agent", "FINISH": END},
     )
     graph.add_edge("data_agent", "observer")
     graph.add_edge("model_agent", "observer")
@@ -594,14 +658,30 @@ def build_multi_agent(chat_model):
     # checkpointer 讓同一個 thread_id 的多輪對話記得住 messages（歷史對話內容），
     # 是 /api/agent/chat 做 session 記憶的前提——stream_trace 呼叫時另外會重置
     # rounds/retry_counters/plan 等「單次任務用的計數器」，不讓它們跨任務累積。
-    return graph.compile(checkpointer=MemorySaver())
+    #
+    # 用 SqliteSaver 而不是 MemorySaver：訓練前的 interrupt() 可能暫停好幾分鐘
+    # 才等到使用者確認，伺服器重啟（重新部署、當機）不該讓這份對話記憶直接消失。
+    # SqliteSaver 建構子要求傳入 sqlite3.Connection（SqliteSaver.from_conn_string
+    # 回的是 context manager，不適合這種要活整個 process 生命週期的用法）；
+    # check_same_thread=False 是因為 FastAPI 的 StreamingResponse 可能在不同
+    # worker thread 呼叫，同一個連線要能跨 thread 使用。
+    CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(CHECKPOINT_DB_PATH), check_same_thread=False)
+    return graph.compile(checkpointer=SqliteSaver(conn))
 
 
-def stream_trace(graph, user_message: str, thread_id: str):
+def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resume_value: Optional[dict] = None):
     """觀測層：用 graph.stream() 逐步 yield 每個節點做了什麼（Planner 的計畫、
     Manager 的路由決策、子 Agent 呼叫了哪些 Tool、回報了什麼結果、Observer
     的判讀），給 /api/agent/chat 邊跑邊往前端推，這樣使用者才「看得到」Agent
     跑到哪一步，而不是等全部跑完才一次性看到決策過程。
+
+    user_message／resume_value 兩者互斥：user_message 是使用者發的新訊息，走
+    一般流程；resume_value 是 train_confirm_gate 這類 interrupt() 暫停後，
+    使用者確認/取消的回應（例如 {"approved": True}），改用 Command(resume=...)
+    從暫停處接著跑，不會重新建構 initial_input。圖跑到 interrupt() 時會 yield
+    一個 type="interrupt" 的 entry 然後直接結束（不會再多送一個 final entry），
+    等呼叫端帶著 resume_value 再呼叫一次這個函式才會繼續。
 
     中途任何 node 拋例外都會被攔下來、yield 一個 error entry 再結束——這樣
     已經跑出來的步驟不會因為後面失敗就整包消失。
@@ -609,20 +689,27 @@ def stream_trace(graph, user_message: str, thread_id: str):
     thread_id 對應同一個 checkpointer 裡的一份記憶——同一個 thread_id 的
     messages 會跟之前的對話合併，但 rounds/retry_counters/stall_count/
     plan/evaluation/last_report 每次新訊息都明確重置，這些欄位是「這一次
-    任務」用的保險絲，不該延續到下一次使用者發的新任務。"""
-    all_messages = [HumanMessage(content=user_message)]
+    任務」用的保險絲，不該延續到下一次使用者發的新任務（resume 不算新任務，
+    不會重置這些欄位，接著用暫停當下的狀態繼續）。"""
+    all_messages = [HumanMessage(content=user_message)] if user_message is not None else []
+    seed_len = len(all_messages)
     config = {"configurable": {"thread_id": thread_id}}
+    interrupted = False
 
     try:
-        initial_input = {
-            "messages": list(all_messages),
-            "rounds": 0,
-            "retry_counters": {},
-            "stall_count": 0,
-            "plan": None,
-            "evaluation": None,
-            "last_report": None,
-        }
+        if resume_value is not None:
+            stream_input = Command(resume=resume_value)
+        else:
+            stream_input = {
+                "messages": list(all_messages),
+                "rounds": 0,
+                "retry_counters": {},
+                "stall_count": 0,
+                "plan": None,
+                "evaluation": None,
+                "last_report": None,
+                "replan_count": 0,
+            }
         total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         llm_calls = 0
 
@@ -634,7 +721,15 @@ def stream_trace(graph, user_message: str, thread_id: str):
                 total_usage[k] += usage[k]
             llm_calls += 1
 
-        for step in graph.stream(initial_input, config=config, stream_mode="updates"):
+        for step in graph.stream(stream_input, config=config, stream_mode="updates"):
+            if "__interrupt__" in step:
+                # interrupt() 暫停時這一個 chunk 的形狀跟平常的 {node_name: node_output}
+                # 不一樣，是 {"__interrupt__": (Interrupt(value=...),)}——這裡是暫停點，
+                # 之後不會再有新 chunk，呼叫端要帶著使用者的回應再呼叫一次才會繼續。
+                interrupt_obj = step["__interrupt__"][0]
+                yield {"type": "interrupt", "payload": interrupt_obj.value}
+                interrupted = True
+                continue
             for node_name, node_output in step.items():
                 entry = {"type": "step", "node": node_name}
                 if "next" in node_output:
@@ -685,5 +780,8 @@ def stream_trace(graph, user_message: str, thread_id: str):
         yield {"type": "error", "message": str(e)}
         return
 
-    reply = _extract_text(all_messages[-1].content) if len(all_messages) > 1 else ""
+    if interrupted:
+        return
+
+    reply = _extract_text(all_messages[-1].content) if len(all_messages) > seed_len else ""
     yield {"type": "final", "reply": reply, "usage": total_usage, "llm_calls": llm_calls}
