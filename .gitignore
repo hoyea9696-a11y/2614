@@ -1,5 +1,6 @@
 .env
 data/datasets/
+data/agent_checkpoints.sqlite*
 models/
 runs/
 .cache/
