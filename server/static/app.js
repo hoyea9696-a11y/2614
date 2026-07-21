@@ -547,18 +547,93 @@ function resetManagerAgentThread() {
     document.getElementById('ai-chat-history').innerHTML = '';
 }
 
-// /api/agent/chat 回應是 SSE 串流（text/event-stream），逐個 trace step 邊跑邊塞進
-// 決策過程卡片（createTraceCard/appendTraceStep），不用等整個 Plan→Act→Observe→
-// Decide 迴圈跑完才看到東西；中途失敗也能看到已經跑出來的步驟跟錯誤原因。
-async function sendManagerAgentMessage(text, loadingId) {
-    const requestBody = {
-        message: text,
-        model_type: document.getElementById('manager-agent-engine-select').value,
-        thread_id: getOrCreateThreadId()
-    };
-    let traceRefs = null;
+// /api/agent/chat、/api/agent/resume 回應都是 SSE 串流（text/event-stream），逐個
+// trace step 邊跑邊塞進決策過程卡片（createTraceCard/appendTraceStep），不用等整個
+// Plan→Act→Observe→Decide 迴圈跑完才看到東西；中途失敗也能看到已經跑出來的步驟跟
+// 錯誤原因。兩個端點的 SSE frame 格式一樣，解析邏輯抽成這個共用函式，resume 時
+// 沿用同一張決策過程卡片（傳入既有的 traceRefs）繼續往下疊，不會另開一張新卡片。
+async function consumeAgentStream(res, traceRefs) {
     let finalReply = null;
     let sawError = false;
+    let interruptPayload = null;
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) >= 0) {
+            const rawEvent = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            if (!rawEvent.startsWith('data: ')) continue;
+
+            const payload = JSON.parse(rawEvent.slice(6));
+            if (payload.type === 'step') {
+                if (!traceRefs) traceRefs = createTraceCard();
+                appendTraceStep(traceRefs, payload);
+            } else if (payload.type === 'final') {
+                finalReply = payload.reply;
+                if (traceRefs) finishTraceCard(traceRefs, payload.usage, payload.llm_calls);
+            } else if (payload.type === 'error') {
+                sawError = true;
+                if (!traceRefs) traceRefs = createTraceCard();
+                appendTraceError(traceRefs, payload.message);
+            } else if (payload.type === 'interrupt') {
+                interruptPayload = payload.payload;
+            }
+        }
+    }
+
+    return { traceRefs, finalReply, sawError, interruptPayload };
+}
+
+// 卡在 interrupt()（目前只有訓練前確認會觸發）時，用專案裡既有的瀏覽器原生
+// confirm() 慣例（跟「終止訓練」「清空快取」同一套模式，不另外做卡片式按鈕 UI）
+// 問使用者要不要繼續，答案立刻送去 /api/agent/resume 接著跑；用迴圈是為了以後
+// 如果同一輪內有不只一個 interrupt 點，也能一樣接住，不用另外改這段邏輯。
+async function finishOrResumeAgentTurn(result, threadId, modelType) {
+    let { traceRefs, finalReply, sawError, interruptPayload } = result;
+
+    while (interruptPayload) {
+        const approved = confirm(interruptPayload.reason || "確認要繼續嗎？");
+        const res = await fetch('/api/agent/resume', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ thread_id: threadId, model_type: modelType, approved })
+        });
+        const next = await consumeAgentStream(res, traceRefs);
+        traceRefs = next.traceRefs;
+        finalReply = next.finalReply;
+        sawError = next.sawError;
+        interruptPayload = next.interruptPayload;
+    }
+
+    if (finalReply !== null) {
+        let reply = finalReply;
+        const healthMatch = reply.match(/\[HEALTH_DATA: ({.*?})\]/);
+        if (healthMatch) {
+            const healthJson = JSON.parse(healthMatch[1]);
+            reply = reply.replace(healthMatch[0], "");
+            appendMessage(reply, 'ai');
+            appendHealthCard(healthJson);
+        } else {
+            appendMessage(reply, 'ai');
+        }
+        chatMessages.push({ role: 'assistant', content: reply });
+    } else if (sawError) {
+        appendMessage("執行中發生錯誤，詳情請展開上方決策過程", 'error');
+    }
+}
+
+async function sendManagerAgentMessage(text, loadingId) {
+    const modelType = document.getElementById('manager-agent-engine-select').value;
+    const threadId = getOrCreateThreadId();
+    const requestBody = { message: text, model_type: modelType, thread_id: threadId };
 
     try {
         const res = await fetch('/api/agent/chat', {
@@ -569,51 +644,8 @@ async function sendManagerAgentMessage(text, loadingId) {
 
         removeMessage(loadingId);
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-
-            let idx;
-            while ((idx = buffer.indexOf('\n\n')) >= 0) {
-                const rawEvent = buffer.slice(0, idx);
-                buffer = buffer.slice(idx + 2);
-                if (!rawEvent.startsWith('data: ')) continue;
-
-                const payload = JSON.parse(rawEvent.slice(6));
-                if (payload.type === 'step') {
-                    if (!traceRefs) traceRefs = createTraceCard();
-                    appendTraceStep(traceRefs, payload);
-                } else if (payload.type === 'final') {
-                    finalReply = payload.reply;
-                    if (traceRefs) finishTraceCard(traceRefs, payload.usage, payload.llm_calls);
-                } else if (payload.type === 'error') {
-                    sawError = true;
-                    if (!traceRefs) traceRefs = createTraceCard();
-                    appendTraceError(traceRefs, payload.message);
-                }
-            }
-        }
-
-        if (finalReply !== null) {
-            let reply = finalReply;
-            const healthMatch = reply.match(/\[HEALTH_DATA: ({.*?})\]/);
-            if (healthMatch) {
-                const healthJson = JSON.parse(healthMatch[1]);
-                reply = reply.replace(healthMatch[0], "");
-                appendMessage(reply, 'ai');
-                appendHealthCard(healthJson);
-            } else {
-                appendMessage(reply, 'ai');
-            }
-            chatMessages.push({ role: 'assistant', content: reply });
-        } else if (sawError) {
-            appendMessage("執行中發生錯誤，詳情請展開上方決策過程", 'error');
-        }
+        const result = await consumeAgentStream(res, null);
+        await finishOrResumeAgentTurn(result, threadId, modelType);
     } catch (e) {
         removeMessage(loadingId);
         appendMessage("連線失敗", 'error');

@@ -738,6 +738,11 @@ class ManagerAgentChatRequest(BaseModel):
     model_type: str = "gemini"
     thread_id: str
 
+class ManagerAgentResumeRequest(BaseModel):
+    thread_id: str
+    model_type: str = "gemini"
+    approved: bool
+
 # 依 model_type 各自快取一份 Graph，換模型（gemini/groq/gemma/local）不用重啟服務
 _manager_agent_graphs = {}
 
@@ -754,7 +759,21 @@ async def agent_chat(request: ManagerAgentChatRequest):
     graph = _get_manager_agent_graph(request.model_type)
 
     def event_stream():
-        for entry in stream_trace(graph, request.message, request.thread_id):
+        for entry in stream_trace(graph, request.thread_id, user_message=request.message):
+            yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.post("/api/agent/resume")
+async def agent_resume(request: ManagerAgentResumeRequest):
+    """訓練前 interrupt() 暫停後，使用者按確認/取消時呼叫這個端點接著跑，
+    跟 /api/agent/chat 一樣是 SSE 串流，差別只在不是送新訊息、是帶著使用者的
+    決定（approved）從暫停處恢復（見 multi_agent.stream_trace 的 resume_value）。"""
+    from multi_agent import stream_trace
+    graph = _get_manager_agent_graph(request.model_type)
+
+    def event_stream():
+        for entry in stream_trace(graph, request.thread_id, resume_value={"approved": request.approved}):
             yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
