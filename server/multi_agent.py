@@ -57,7 +57,7 @@ CHECKPOINT_DB_PATH = PROJECT_ROOT / "data" / "agent_checkpoints.sqlite"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from agent_tools import check_dataset_health, import_images_to_dataset, download_roboflow_dataset
+from agent_tools import check_dataset_health, import_images_to_dataset, download_roboflow_dataset, DATASET_DIR, _count_images
 from skills import skill_train, skill_infer, skill_eval
 
 DATA_TOOLS = [check_dataset_health, import_images_to_dataset, download_roboflow_dataset]
@@ -107,6 +107,11 @@ MODEL_AGENT_PROMPT = """你是 Model Agent，只負責模型的訓練與推論�
 - skill_train 回傳 status="dataset_not_found" → status="blocked", reason_code="dataset_not_found"
 - skill_train 回傳 status="health_gate_failed" → status="blocked", reason_code="health_gate_failed"，
   reason 附上健康度報告
+- skill_train 回傳 status="stopped" → 這是使用者主動要求終止訓練，不是失敗，
+  status="blocked", reason_code 留空，reason 寫「使用者已取消這次訓練」，
+  不要自己再重試或建議繼續訓練
+- skill_train 回傳 status="already_training" → 已經有另一個訓練在跑，
+  status="blocked", reason_code 留空，reason 說明目前已有訓練在進行中
 - 訓練/推論成功 → status="success", reason_code 留空
 不要自己猜要交給誰處理，誠實回報狀態跟原因就好，路由是 Manager 的事。
 
@@ -154,6 +159,13 @@ Agent 時，直接呼叫那個子 Agent 讓它自己想辦法，不要因為使�
 dataset_not_found 重試上限用完），且需要使用者提供只有人類才知道的資訊
 （例如使用者自己要驗證的圖片檔案本身）時才用。
 
+訓練資料集的選擇例外：如果要指派給 model_agent 的步驟是訓練，使用者訊息裡沒有
+明確指名要用哪一個本機資料集，且下面列出的「目前本機已有的資料集」不只一個，
+不要自己隨便挑一個或叫 model_agent 自己猜——用 action="ask_user"，final_reply
+列出這些資料集名稱請使用者選一個。如果目前本機剛好只有一個資料集，直接指派給
+model_agent 使用它即可，不用多問。訓練參數（epochs/imgsz/batch size 等）使用者
+沒特別要求就用預設值，不用主動詢問。
+
 子 Agent 的 suggestion 只是參考意見，不代表你一定要照做，你可以選擇別的 Agent 或直接結束。"""
 
 # 已知的 Gate 失敗類型，直接用固定規則決定下一步找誰，不問 LLM——
@@ -186,6 +198,15 @@ MAX_ROUNDS = 8
 # （那是 model_agent 自己的 ReAct 迴圈決定的）。用 Plan 步驟描述做確定性判斷，
 # 不問 LLM：指派給 model_agent 的 Step 描述裡有沒有訓練相關字樣。
 TRAIN_KEYWORDS = ("訓練", "train")
+
+
+def _existing_dataset_names() -> list:
+    """列出本機真正「有圖片」的資料集名稱（跟 skill_train 的 Dataset Gate 用同一個
+    判斷條件），給 Manager 在決定要不要問使用者「要用哪個資料集」時參考——這裡只是
+    列清單，要不要因此問使用者是 Manager 的 LLM 判斷，不在這裡用規則寫死。"""
+    if not DATASET_DIR.exists():
+        return []
+    return sorted(d.name for d in DATASET_DIR.iterdir() if d.is_dir() and _count_images(d) > 0)
 
 
 class Decision(BaseModel):
@@ -233,6 +254,7 @@ class SupervisorState(TypedDict):
     stall_count: int
     usage: Optional[dict]
     replan_count: int
+    train_confirmed: bool
 
 
 def _build_sub_agent(chat_model, tools, system_prompt):
@@ -496,7 +518,13 @@ def build_multi_agent(chat_model):
     def train_confirm_gate(state: SupervisorState) -> dict:
         """manager 決定路由到 model_agent 時，先經過這一關：不是訓練步驟就直接
         放行；是訓練步驟就用 interrupt() 暫停，等待前端使用者確認後才真的進
-        model_agent（訓練耗時、耗運算資源，不該讓 Agent 自己說做就做）。"""
+        model_agent（訓練耗時、耗運算資源，不該讓 Agent 自己說做就做）。
+
+        train_confirmed 記錄「這個任務裡使用者已經確認過一次」——同一個任務裡
+        Gate 失敗（dataset_not_found/health_gate_failed）重試、或 Observer 判定
+        plan_invalid 繞回 Planner 後再度指派 model_agent，都不該讓使用者對同一次
+        訓練意圖重複按確認；只有使用者發送新的一則訊息（stream_trace 會重置這個
+        欄位）才要重新問一次。"""
         plan = state.get("plan") or {"steps": []}
         step = next(
             (s for s in plan.get("steps", []) if s.get("agent") == "model_agent" and s.get("status") == "in_progress"),
@@ -506,12 +534,15 @@ def build_multi_agent(chat_model):
         if not any(k in description for k in TRAIN_KEYWORDS):
             return {"next": "model_agent"}
 
+        if state.get("train_confirmed"):
+            return {"next": "model_agent"}
+
         resume = interrupt({
             "reason": "即將啟動模型訓練，這是高成本、耗時的操作，請確認是否繼續。",
             "step_description": description,
         })
         if isinstance(resume, dict) and resume.get("approved"):
-            return {"next": "model_agent"}
+            return {"next": "model_agent", "train_confirmed": True}
         return {
             "next": "FINISH",
             "messages": [AIMessage(content="使用者取消了這次訓練，已停止。")],
@@ -580,6 +611,10 @@ def build_multi_agent(chat_model):
         plan_summary = _summarize_plan(state.get("plan"))
         if plan_summary:
             context.append(SystemMessage(content=f"目前的計畫進度：\n{plan_summary}"))
+        dataset_names = _existing_dataset_names()
+        context.append(SystemMessage(
+            content=f"目前本機已有的資料集：{', '.join(dataset_names) if dataset_names else '（無）'}"
+        ))
         context += list(state["messages"])
         try:
             result = _invoke_with_retry(lambda: decision_model.invoke(context))
@@ -688,9 +723,10 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
 
     thread_id 對應同一個 checkpointer 裡的一份記憶——同一個 thread_id 的
     messages 會跟之前的對話合併，但 rounds/retry_counters/stall_count/
-    plan/evaluation/last_report 每次新訊息都明確重置，這些欄位是「這一次
-    任務」用的保險絲，不該延續到下一次使用者發的新任務（resume 不算新任務，
-    不會重置這些欄位，接著用暫停當下的狀態繼續）。"""
+    plan/evaluation/last_report/train_confirmed 每次新訊息都明確重置，這些欄位
+    是「這一次任務」用的保險絲，不該延續到下一次使用者發的新任務（resume 不算
+    新任務，不會重置這些欄位，接著用暫停當下的狀態繼續——train_confirmed 也是
+    因為這樣才能在同一個任務裡重試訓練時不用重複跳出確認畫面）。"""
     all_messages = [HumanMessage(content=user_message)] if user_message is not None else []
     seed_len = len(all_messages)
     config = {"configurable": {"thread_id": thread_id}}
@@ -709,6 +745,7 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                 "evaluation": None,
                 "last_report": None,
                 "replan_count": 0,
+                "train_confirmed": False,
             }
         total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         llm_calls = 0

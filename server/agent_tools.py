@@ -34,6 +34,37 @@ OUTPUT_DIR = PROJECT_ROOT / "data" / "outputs"
 
 ROBOFLOW_EXPORT_FORMAT = "yolov5pytorch"  # Roboflow 沒有獨立的 yolov9 匯出格式，但輸出的 YOLO txt 格式跟 ultralytics 相容
 
+# 全系統唯一一個 YOLOTrainer 實例——train_yolo_model（Agent 用）跟 main.py 的
+# /api/train/start /api/train/stop（網頁表單用）都共用這一個物件，兩邊的
+# 「終止」才能真的作用在同一份 _stop_event 上。改之前 train_yolo_model 每次呼叫
+# 都自己 new 一個 YOLOTrainer()，導致從網頁按「終止」呼叫的是 main.py 自己那個
+# 從沒訓練過的 trainer，跟 Agent 真正在跑訓練的那個是兩個不同物件，設 stop_event
+# 完全打不到正在跑的那個，看起來就像「按了終止但 CMD 還是繼續跑」。
+shared_trainer = YOLOTrainer(data_root=str(DATASET_DIR))
+
+# 訓練是同步、會跑好幾分鐘的呼叫，使用者想中途取消時沒辦法真的插進同一個
+# graph.stream() 裡面（Agent 正卡在 skill_train.invoke() 裡）。因此中止指令不透過
+# Agent 的推理迴圈，而是在 API 層（main.py 的 /api/agent/chat）用關鍵字比對直接
+# 短路掉，跳過 LLM／Graph，直接呼叫 shared_trainer.stop()——這樣才能在訓練還在
+# 跑的那個請求卡住時，另一個請求依然能立刻送出終止訊號。
+STOP_TRAINING_KEYWORDS = (
+    "停止訓練", "終止訓練", "取消訓練", "別訓練了", "stop training", "cancel training",
+    # 呼叫端已經先確認「目前真的有訓練在跑」才會拿這份清單來比對，這個前提下使用者
+    # 打「終止」「停止」「取消」單獨一個詞，指的幾乎一定是眼前這個訓練，不用擔心
+    # 跟其他情境的取消/停止搞混。
+    "終止", "停止", "取消", "stop", "cancel",
+)
+
+
+def is_stop_training_message(text: str) -> bool:
+    """判斷這句話是不是在要求終止訓練——只在真的有訓練在跑的時候才會被拿來判斷
+    （呼叫端要自己先確認 shared_trainer.progress['status'] == 'training'），
+    所以這裡的關鍵字可以放寬，不用擔心跟其他情境的「取消」「停止」搞混。"""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(k in text or k in lowered for k in STOP_TRAINING_KEYWORDS)
+
 
 def _count_images(path: Path) -> int:
     if not path.exists():
@@ -162,9 +193,15 @@ def train_yolo_model(
                        f"請呼叫 download_roboflow_dataset 從 Roboflow Universe 下載後再重試",
         }
 
-    trainer = YOLOTrainer(data_root=str(DATASET_DIR))
-    data_yaml = trainer.prepare_dataset(str(ds_path))
-    trainer.train(
+    if shared_trainer.progress.get("status") == "training":
+        return {
+            "status": "already_training",
+            "message": "已有一個訓練正在進行中（可能是網頁表單或前一輪 Agent 啟動的），"
+                       "請等它結束或先要求終止，不要同時啟動第二個訓練",
+        }
+
+    data_yaml = shared_trainer.prepare_dataset(str(ds_path))
+    shared_trainer.train(
         variant=variant,
         data_yaml=data_yaml,
         epochs=epochs,
@@ -173,10 +210,10 @@ def train_yolo_model(
         model_name=model_name,
     )
     return {
-        "status": trainer.progress.get("status"),
-        "message": trainer.progress.get("message"),
+        "status": shared_trainer.progress.get("status"),
+        "message": shared_trainer.progress.get("message"),
         "model_name": model_name,
-        "epochs_run": trainer.progress.get("current_epoch"),
+        "epochs_run": shared_trainer.progress.get("current_epoch"),
     }
 
 

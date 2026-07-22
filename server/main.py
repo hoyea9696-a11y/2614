@@ -14,7 +14,6 @@ from typing import List, Optional
 from pathlib import Path
 from pydantic import BaseModel
 from inferencer import YOLOInferencer
-from trainer import YOLOTrainer
 from ai_service import ai_engine
 from optimization_api import router as optimization_router
 from ai_analyzer import ai_analyzer
@@ -60,7 +59,10 @@ for d in [UPLOAD_DIR, OUTPUT_DIR, MODEL_DIR, DATASET_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 inferencer = YOLOInferencer()
-trainer = YOLOTrainer(data_root=str(DATASET_DIR))
+# 跟 agent_tools.train_yolo_model 共用同一個 YOLOTrainer 實例（見 agent_tools.py
+# 的 shared_trainer 說明）——不能各自 new 一個，否則網頁表單按「終止」設的
+# stop_event，跟 Agent 真正在跑訓練用的那個 trainer 是兩個不同物件，永遠打不到。
+from agent_tools import shared_trainer as trainer
 
 # 全域自動標記狀態
 auto_label_status = {
@@ -756,6 +758,23 @@ def _get_manager_agent_graph(model_type: str = "gemini"):
 @app.post("/api/agent/chat")
 async def agent_chat(request: ManagerAgentChatRequest):
     from multi_agent import stream_trace
+    from agent_tools import shared_trainer, is_stop_training_message
+
+    # 訓練中途要終止時，不能走一般流程：Agent 這時卡在前一輪 skill_train.invoke()
+    # 裡（同步呼叫，要等訓練真的結束/停止才會回傳），同一個 thread_id 的
+    # graph.stream() 沒辦法插進去處理這一則新訊息。所以終止指令在這裡直接用關鍵字
+    # 短路掉，跳過 LLM／Graph，直接對 shared_trainer 呼叫 stop()——這樣才能在
+    # 前一個請求還卡著的情況下，立刻送出終止訊號讓訓練迴圈在下一個 batch/epoch
+    # 邊界真的停下來。
+    if shared_trainer.progress.get("status") == "training" and is_stop_training_message(request.message):
+        shared_trainer.stop()
+
+        def stop_stream():
+            reply = "已送出終止指令，訓練會在目前批次結束後停止（不是立即中斷，請稍候幾秒）。"
+            yield f"data: {json.dumps({'type': 'final', 'reply': reply, 'usage': {}, 'llm_calls': 0}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(stop_stream(), media_type="text/event-stream")
+
     graph = _get_manager_agent_graph(request.model_type)
 
     def event_stream():
