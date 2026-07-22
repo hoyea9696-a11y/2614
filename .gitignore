@@ -1,7 +1,14 @@
 .env
 data/datasets/
 data/agent_checkpoints.sqlite*
+data/outputs/
 models/
 runs/
 .cache/
 venv/
+__pycache__/
+*.pyc
+server/dataset_*.yaml
+server/*.pt
+.claude/settings.local.json
+.claude/worktrees/

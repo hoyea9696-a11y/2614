@@ -25,8 +25,10 @@
 執行方式：python multi_agent_smoke_test.py
 """
 import shutil
+import uuid
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.types import Command
 
 from agent_tools import DATASET_DIR
 from multi_agent import (
@@ -48,19 +50,42 @@ class FakeMultiAgentModel:
     Planner／Manager 的結構化輸出（with_structured_output）跟子 Agent 的一般
     ReAct 呼叫（bind_tools）共用同一個腳本佇列，依實際呼叫順序依序取用——這樣
     才能同時驗證「該問 LLM 的時候有問」跟「不該問的時候完全沒問」（腳本項目
-    不夠就會直接因為 pop 到空 list 或型別不對而讓測試失敗）。"""
+    不夠就會直接因為 pop 到空 list 或型別不對而讓測試失敗）。
+
+    bind_tools／with_structured_output 回傳的包裝物件不同：production code
+    對 decision_model/planner_model 用 include_raw=True，取的是
+    result["parsed"]/result["raw"]；對子 Agent 的 model_with_tools 則直接用
+    invoke() 回傳值當 AIMessage。腳本裡放的都是裸的 Plan/Decision/AIMessage，
+    由包裝物件依角色決定要不要包成 {"parsed", "raw"}，不用每個測試案例自己包。"""
 
     def __init__(self, script):
         self._script = list(script)
 
     def bind_tools(self, tools):
-        return self
+        return _FakeBoundModel(self._script)
 
-    def with_structured_output(self, schema, method=None):
-        return self
+    def with_structured_output(self, schema, method=None, include_raw=False):
+        return _FakeStructuredModel(self._script, include_raw)
+
+
+class _FakeBoundModel:
+    def __init__(self, script):
+        self._script = script
 
     def invoke(self, messages):
         return self._script.pop(0)
+
+
+class _FakeStructuredModel:
+    def __init__(self, script, include_raw):
+        self._script = script
+        self._include_raw = include_raw
+
+    def invoke(self, messages):
+        item = self._script.pop(0)
+        if self._include_raw:
+            return {"parsed": item, "raw": AIMessage(content="")}
+        return item
 
 
 def _make_fake_dataset(name: str):
@@ -84,6 +109,23 @@ def _report_call(status: str, reason: str, suggestion: str = "", reason_code: st
 
 def _tool_call(name: str, args: dict, call_id: str = "call"):
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
+
+
+def _thread(name: str) -> str:
+    """build_multi_agent 用真的 SqliteSaver（跟 production 共用同一個 data/agent_checkpoints.sqlite），
+    固定字串當 thread_id 會讓這次執行讀到上一次跑測試留下的舊訊息，導致斷言誤判——每次跑都
+    加一段隨機字尾，確保每個測試案例、每次執行都是全新的一份記憶。"""
+    return f"{name}_{uuid.uuid4().hex[:8]}"
+
+
+def _invoke_confirming_training(graph, initial_input, config):
+    """跟 stream_trace() 對 interrupt 的處理邏輯一樣：Plan 裡有訓練字樣的步驟第一次
+    派給 model_agent 時，train_confirm_gate 會 interrupt() 暫停——這裡直接模擬使用者
+    按下確認（approved=True）讓流程恢復，測試才能繼續往下走到 model_agent/skill_train。"""
+    result = graph.invoke(initial_input, config=config)
+    if "__interrupt__" in result:
+        result = graph.invoke(Command(resume={"approved": True}), config=config)
+    return result
 
 
 def case_extract_text_handles_gemini_content_blocks():
@@ -117,7 +159,10 @@ def case_manager_routes_to_data_agent_then_finish():
 
     _make_fake_dataset("__multi_smoke_ds__")
     try:
-        result = graph.invoke({"messages": [HumanMessage(content="幫我看一下資料集健康度")]})
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="幫我看一下資料集健康度")]},
+            config={"configurable": {"thread_id": _thread("smoke_data_agent")}},
+        )
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_ds__", ignore_errors=True)
 
@@ -179,7 +224,11 @@ def case_manager_hands_off_data_agent_to_model_agent_to_evaluation_agent():
              patch("agent_tools.YOLOTrainer.prepare_dataset", return_value="fake.yaml"), \
              patch("agent_tools.YOLOTrainer.train", return_value=None), \
              patch("skills.evaluate_yolo_model", fake_eval):
-            result = graph.invoke({"messages": [HumanMessage(content="幫我用 __multi_smoke_train__ 訓練並評估一個模型")]})
+            result = _invoke_confirming_training(
+                graph,
+                {"messages": [HumanMessage(content="幫我用 __multi_smoke_train__ 訓練並評估一個模型")]},
+                config={"configurable": {"thread_id": _thread("smoke_full_pipeline")}},
+            )
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_train__", ignore_errors=True)
         if state_backup is not None:
@@ -218,20 +267,23 @@ def case_manager_auto_retries_known_gate_without_llm():
 
     _make_fake_dataset("__multi_smoke_retry__")
     try:
-        result = graph.invoke({
-            "messages": [HumanMessage(content="模型評估沒過，麻煩處理")],
-            "last_report": {
-                "agent": "evaluation_agent",
-                "status": "blocked",
-                "reason": "mAP50 0.3 未達標",
-                "suggestion": "增加訓練資料",
-                "reason_code": "eval_gate_failed",
+        result = graph.invoke(
+            {
+                "messages": [HumanMessage(content="模型評估沒過，麻煩處理")],
+                "last_report": {
+                    "agent": "evaluation_agent",
+                    "status": "blocked",
+                    "reason": "mAP50 0.3 未達標",
+                    "suggestion": "增加訓練資料",
+                    "reason_code": "eval_gate_failed",
+                },
+                # 跟 last_report 對應的 Evaluation 也要一起 seed，不然 Manager 第一輪會看到
+                # evaluation 是空的、reason_code 判斷也還是照走，這裡主要是避免不小心被
+                # 誤判成 plan_invalid（見 case_manager_replans_after_repeated_stall）。
+                "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": True},
             },
-            # 跟 last_report 對應的 Evaluation 也要一起 seed，不然 Manager 第一輪會看到
-            # evaluation 是空的、reason_code 判斷也還是照走，這裡主要是避免不小心被
-            # 誤判成 plan_invalid（見 case_manager_replans_after_repeated_stall）。
-            "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": True},
-        })
+            config={"configurable": {"thread_id": _thread("smoke_auto_retry")}},
+        )
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_retry__", ignore_errors=True)
 
@@ -251,18 +303,21 @@ def case_manager_gives_up_after_retry_limit():
     graph = build_multi_agent(FakeMultiAgentModel([Plan(goal="重新評估模型", steps=[])]))
     limit = RETRY_LIMITS["eval_gate_failed"]
 
-    result = graph.invoke({
-        "messages": [HumanMessage(content="模型還是沒過")],
-        "last_report": {
-            "agent": "evaluation_agent",
-            "status": "blocked",
-            "reason": "mAP50 仍未達標",
-            "suggestion": "",
-            "reason_code": "eval_gate_failed",
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="模型還是沒過")],
+            "last_report": {
+                "agent": "evaluation_agent",
+                "status": "blocked",
+                "reason": "mAP50 仍未達標",
+                "suggestion": "",
+                "reason_code": "eval_gate_failed",
+            },
+            "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": False},
+            "retry_counters": {"eval_gate_failed": limit},
         },
-        "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": False},
-        "retry_counters": {"eval_gate_failed": limit},
-    })
+        config={"configurable": {"thread_id": _thread("smoke_retry_limit")}},
+    )
 
     assert not any(isinstance(m, ToolMessage) for m in result["messages"]), "不該再呼叫任何子 Agent"
     assert "重試" in result["messages"][-1].content
@@ -299,7 +354,11 @@ def case_manager_replans_after_repeated_stall():
 
     _make_fake_dataset("__multi_smoke_stall__")
     try:
-        result = graph.invoke({"messages": [HumanMessage(content="幫我訓練模型")]})
+        result = _invoke_confirming_training(
+            graph,
+            {"messages": [HumanMessage(content="幫我訓練模型")]},
+            config={"configurable": {"thread_id": _thread("smoke_replan_stall")}},
+        )
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_stall__", ignore_errors=True)
 
@@ -318,7 +377,10 @@ def case_manager_answers_directly_without_sub_agent():
         Decision(action="finish", rationale="使用者只是打招呼", final_reply="你好，我可以幫你訓練、推論或評估模型。"),
     ]
     graph = build_multi_agent(FakeMultiAgentModel(script))
-    result = graph.invoke({"messages": [HumanMessage(content="你好")]})
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="你好")]},
+        config={"configurable": {"thread_id": _thread("smoke_greeting")}},
+    )
     assert len(result["messages"]) == 2, "不需要任何子 Agent 時，不該多繞一圈，但也不能沒有回覆內容"
     assert result["messages"][-1].content == "你好，我可以幫你訓練、推論或評估模型。"
     print("[OK] 不需要子 Agent 時，Planner 給空計畫、Manager 直接回答，不會回傳空白內容給使用者")
