@@ -171,7 +171,12 @@ class YOLOTrainer:
                 name=model_name,
                 exist_ok=True,
                 verbose=True,
-                device=device
+                device=device,
+                # train() 永遠是從背景執行緒呼叫（網頁表單走 threading.Thread，
+                # Agent 對話走 Starlette 的 threadpool），不是主執行緒。workers>0
+                # 會讓 DataLoader 在 Windows 上用 spawn 開子進程，從背景執行緒
+                # spawn 很容易直接把整個 uvicorn 行程弄死，所以固定關掉多進程。
+                workers=0
             )
             self.progress["status"] = "completed"
         except Exception as e:
