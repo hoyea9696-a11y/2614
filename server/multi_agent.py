@@ -854,6 +854,13 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                 interrupted = True
                 continue
             for node_name, node_output in step.items():
+                if node_output is None:
+                    # 節點回傳 {}（沒有實際要更新的欄位，例如 save_offer_gate
+                    # 判定這次沒有新訓練出的模型可問）時，LangGraph 在
+                    # stream_mode="updates" 這一格會給 None 而不是 {}，直接對
+                    # None 做 "in" 判斷會整段對話都炸掉，所以先跳過這個節點，
+                    # 不產生任何 trace entry（反正它本來就沒有東西要回報）。
+                    continue
                 entry = {"type": "step", "node": node_name}
                 if "next" in node_output:
                     entry["decision"] = node_output["next"]
@@ -900,6 +907,8 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                     entry["usage"] = node_usage or sub_agent_usage
                 yield entry
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         yield {"type": "error", "message": str(e)}
         return
 
