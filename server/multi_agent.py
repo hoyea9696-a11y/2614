@@ -137,6 +137,12 @@ PLANNER_SYSTEM_PROMPT = """你是 Manager Agent 的規劃模組。看使用者�
 不用寫技術細節，只要列出「做什麼、交給誰」，依實際執行順序排列。如果使用者的請求
 不需要任何子 Agent（例如打招呼、問一般問題），steps 留空清單即可。
 
+指派給 model_agent 的步驟要標 is_training：這個步驟本身要不要啟動一次新的訓練
+流程。使用者要求「用剛剛訓練好的模型做推論/驗證」是 is_training=False——句子裡
+出現「訓練」兩個字只是在描述要用哪個模型，動作本身是推論/驗證，不是訓練；只有
+真的要開始訓練一個新模型時才是 is_training=True。這個欄位會直接決定要不要跳出
+「確認是否訓練」的畫面，標錯會讓使用者在做推論時被誤問一次訓練確認。
+
 如果對話裡已經有失敗紀錄，代表原本的計畫卡住了，這次要參考失敗原因重新規劃，
 不要原封不動照抄同一份計畫。"""
 
@@ -203,9 +209,10 @@ MAX_ROUNDS = 8
 
 # 訓練是高成本、耗時的操作，啟動前要讓使用者確認——但 Manager 只知道「這一步要
 # 交給 model_agent」，不知道 model_agent 內部要跑 skill_train 還是 skill_infer
-# （那是 model_agent 自己的 ReAct 迴圈決定的）。用 Plan 步驟描述做確定性判斷，
-# 不問 LLM：指派給 model_agent 的 Step 描述裡有沒有訓練相關字樣。
-TRAIN_KEYWORDS = ("訓練", "train")
+# （那是 model_agent 自己的 ReAct 迴圈決定的）。原本用 Step 描述裡有沒有「訓練」
+# 字樣做關鍵字判斷，但使用者要求「用剛剛訓練好的模型做推論」這種描述一樣會包含
+# 「訓練」兩個字，關鍵字比對會誤判成要開新訓練，跳出不該出現的確認畫面。改成用
+# Step.is_training 這個由 Planner 直接判斷、結構化的欄位，不做字串比對。
 
 
 def _existing_dataset_names() -> list:
@@ -239,6 +246,12 @@ class Step(BaseModel):
     id: str = Field(description="步驟編號，字串，例如 '1'")
     description: str = Field(description="這個步驟要做什麼，簡短描述")
     agent: AgentName = Field(description="這個步驟由哪個子 Agent 負責")
+    is_training: bool = Field(
+        default=False,
+        description="這個步驟指派給 model_agent 時，是不是要啟動一次新的訓練流程"
+                     "（不是推論、不是評估，也不是單純提到「剛剛訓練好的模型」）。"
+                     "指派給 data_agent／evaluation_agent 的步驟一律 False。",
+    )
 
 
 class Plan(BaseModel):
@@ -394,7 +407,10 @@ def _extract_agent_report(agent_name: str, new_messages: list) -> dict:
 
 
 def _plan_to_state(plan: Plan) -> dict:
-    steps = [{"id": s.id, "description": s.description, "agent": s.agent, "status": "pending"} for s in plan.steps]
+    steps = [
+        {"id": s.id, "description": s.description, "agent": s.agent, "is_training": s.is_training, "status": "pending"}
+        for s in plan.steps
+    ]
     return {"goal": plan.goal, "steps": steps}
 
 
@@ -538,8 +554,7 @@ def build_multi_agent(chat_model):
             (s for s in plan.get("steps", []) if s.get("agent") == "model_agent" and s.get("status") == "in_progress"),
             None,
         )
-        description = (step or {}).get("description", "")
-        if not any(k in description for k in TRAIN_KEYWORDS):
+        if not (step or {}).get("is_training"):
             return {"next": "model_agent"}
 
         if state.get("train_confirmed"):
@@ -547,7 +562,7 @@ def build_multi_agent(chat_model):
 
         resume = interrupt({
             "reason": "即將啟動模型訓練，這是高成本、耗時的操作，請確認是否繼續。",
-            "step_description": description,
+            "step_description": step.get("description", ""),
         })
         if isinstance(resume, dict) and resume.get("approved"):
             return {"next": "model_agent", "train_confirmed": True}
