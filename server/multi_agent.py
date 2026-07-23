@@ -163,8 +163,16 @@ dataset_not_found 重試上限用完），且需要使用者提供只有人類�
 明確指名要用哪一個本機資料集，且下面列出的「目前本機已有的資料集」不只一個，
 不要自己隨便挑一個或叫 model_agent 自己猜——用 action="ask_user"，final_reply
 列出這些資料集名稱請使用者選一個。如果目前本機剛好只有一個資料集，直接指派給
-model_agent 使用它即可，不用多問。訓練參數（epochs/imgsz/batch size 等）使用者
-沒特別要求就用預設值，不用主動詢問。
+model_agent 使用它即可，不用多問。
+
+訓練參數的選擇例外：這台機器是 CPU-only、記憶體有限，訓練很吃資源，直接套用
+預設參數（yolov9m.pt/epochs=50/imgsz=640/batch=16）容易讓整台機器當機。如果
+要指派給 model_agent 的步驟是訓練，且使用者訊息裡（包含之前的對話）沒有明確
+指定 epochs/imgsz/batch/模型權重這些訓練參數，不要直接放行——用 action=
+"ask_user"，final_reply 列出建議的低資源預設值（例如 yolov9s.pt、epochs=20、
+imgsz=320、batch=4），請使用者確認要不要用這組，或自己指定別的數值。使用者已經
+明確講清楚要用的參數（不管是這輪還是對話中前面已經指定過），就直接照做，不用
+重複問。
 
 子 Agent 的 suggestion 只是參考意見，不代表你一定要照做，你可以選擇別的 Agent 或直接結束。"""
 
