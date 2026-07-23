@@ -37,6 +37,7 @@ Engine 的 LLM fallback 一直用同一份 Plan 瞎猜。
 跟 manager_agent.py（單一 Agent 版本）並存，不刪除舊版。
 """
 import json
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -54,6 +55,7 @@ from langchain_core.tools import tool
 SERVER_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SERVER_DIR.parent
 CHECKPOINT_DB_PATH = PROJECT_ROOT / "data" / "agent_checkpoints.sqlite"
+MODELS_DIR = PROJECT_ROOT / "models"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
@@ -276,6 +278,8 @@ class SupervisorState(TypedDict):
     usage: Optional[dict]
     replan_count: int
     train_confirmed: bool
+    last_trained_model: Optional[str]
+    model_save_offered: bool
 
 
 def _build_sub_agent(chat_model, tools, system_prompt):
@@ -379,6 +383,32 @@ def _parse_tool_content(content) -> dict:
         except (ValueError, TypeError):
             return {"raw": content}
     return {"raw": str(content)}
+
+
+def _extract_trained_model_name(new_messages: list) -> Optional[str]:
+    """model_agent 這一輪如果成功呼叫 skill_train 訓練出一個新模型，回傳它的
+    model_name，讓任務結束時可以問使用者要不要存進模型庫。Gate 沒過、使用者
+    取消、或這輪其實只是推論而沒有真的呼叫 skill_train，都回 None，不會誤問。"""
+    for m in new_messages:
+        if isinstance(m, ToolMessage) and m.name == "skill_train":
+            data = _parse_tool_content(m.content)
+            if data.get("status") == "completed":
+                return data.get("model_name")
+    return None
+
+
+def _add_model_to_library(model_name: str) -> dict:
+    """把 runs/train/<model_name>/weights/best.pt 複製一份到 models/ 資料夾，
+    命名規則跟現有手動搬過去的檔案一致（<model_name>_best.pt）——「AI 影像驗證
+    中心」的模型下拉選單（/api/models，掃 models/*.pt）只看這個資料夾，訓練
+    輸出本身不會自動出現在那裡，要手動搬過去才能被選到。"""
+    src = PROJECT_ROOT / "runs" / "train" / model_name / "weights" / "best.pt"
+    if not src.exists():
+        return {"status": "error", "message": f"找不到訓練產出的權重檔：{src}"}
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = MODELS_DIR / f"{model_name}_best.pt"
+    shutil.copy2(src, dest)
+    return {"status": "success", "path": str(dest)}
 
 
 def _extract_agent_report(agent_name: str, new_messages: list) -> dict:
@@ -677,7 +707,35 @@ def build_multi_agent(chat_model):
         return _run_sub_agent("data_agent", data_agent, state)
 
     def run_model_agent(state: SupervisorState) -> dict:
-        return _run_sub_agent("model_agent", model_agent, state)
+        result = _run_sub_agent("model_agent", model_agent, state)
+        trained_model = _extract_trained_model_name(result["messages"])
+        if trained_model:
+            result["last_trained_model"] = trained_model
+        return result
+
+    def save_offer_gate(state: SupervisorState) -> dict:
+        """任務結束前的最後一關：這一次任務裡如果有成功訓練出新模型，不要自動
+        存進模型庫——先讓 Manager 剛剛的分析（mAP/loss/有無過擬合）講給使用者
+        聽，再用 interrupt() 問使用者要不要真的存，不是每次隨手測試訓練都塞進
+        驗證中心的下拉選單。同一個任務裡已經問過就不再問第二次（例如任務結束
+        前 Manager 又多繞了一輪）。"""
+        model_name = state.get("last_trained_model")
+        if not model_name or state.get("model_save_offered"):
+            return {}
+
+        resume = interrupt({
+            "reason": f"模型「{model_name}」已訓練完成，要把它加入模型庫（驗證中心下拉選單可選）嗎？",
+            "model_name": model_name,
+        })
+        if isinstance(resume, dict) and resume.get("approved"):
+            result = _add_model_to_library(model_name)
+            if result.get("status") == "success":
+                note = f"已將模型「{model_name}」加入模型庫，可以在 AI 影像驗證中心的下拉選單選到它了。"
+            else:
+                note = f"存入模型庫失敗：{result.get('message')}"
+        else:
+            note = f"好的，模型「{model_name}」先不存入模型庫，訓練結果仍留在 runs/train/{model_name} 底下。"
+        return {"model_save_offered": True, "messages": [AIMessage(content=note)]}
 
     def run_evaluation_agent(state: SupervisorState) -> dict:
         return _run_sub_agent("evaluation_agent", evaluation_agent, state)
@@ -687,6 +745,7 @@ def build_multi_agent(chat_model):
     graph.add_node("manager", decision_engine)
     graph.add_node("observer", observer_node)
     graph.add_node("train_confirm_gate", train_confirm_gate)
+    graph.add_node("save_offer_gate", save_offer_gate)
     graph.add_node("data_agent", run_data_agent)
     graph.add_node("model_agent", run_model_agent)
     graph.add_node("evaluation_agent", run_evaluation_agent)
@@ -701,14 +760,15 @@ def build_multi_agent(chat_model):
             "model_agent": "train_confirm_gate",
             "evaluation_agent": "evaluation_agent",
             "planner": "planner",
-            "FINISH": END,
+            "FINISH": "save_offer_gate",
         },
     )
     graph.add_conditional_edges(
         "train_confirm_gate",
         lambda s: s["next"],
-        {"model_agent": "model_agent", "FINISH": END},
+        {"model_agent": "model_agent", "FINISH": "save_offer_gate"},
     )
+    graph.add_edge("save_offer_gate", END)
     graph.add_edge("data_agent", "observer")
     graph.add_edge("model_agent", "observer")
     graph.add_edge("evaluation_agent", "observer")
@@ -746,7 +806,8 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
 
     thread_id 對應同一個 checkpointer 裡的一份記憶——同一個 thread_id 的
     messages 會跟之前的對話合併，但 rounds/retry_counters/stall_count/
-    plan/evaluation/last_report/train_confirmed 每次新訊息都明確重置，這些欄位
+    plan/evaluation/last_report/train_confirmed/last_trained_model/
+    model_save_offered 每次新訊息都明確重置，這些欄位
     是「這一次任務」用的保險絲，不該延續到下一次使用者發的新任務（resume 不算
     新任務，不會重置這些欄位，接著用暫停當下的狀態繼續——train_confirmed 也是
     因為這樣才能在同一個任務裡重試訓練時不用重複跳出確認畫面）。"""
@@ -769,6 +830,8 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                 "last_report": None,
                 "replan_count": 0,
                 "train_confirmed": False,
+                "last_trained_model": None,
+                "model_save_offered": False,
             }
         total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         llm_calls = 0
