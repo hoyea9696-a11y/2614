@@ -57,7 +57,37 @@ document.addEventListener('DOMContentLoaded', () => {
     // 恢復上次瀏覽的頁面
     const lastPage = localStorage.getItem('ai_detector_active_page') || 'datasets';
     switchPage(lastPage);
+
+    checkPendingAgentInterrupt();
 });
+
+// 使用者在 confirm() 彈窗跳出來、還沒按下去之前關掉終端機／重新整理頁面，
+// SSE 連線會直接斷掉、彈窗也隨之消失，但 SqliteSaver 其實還留著暫停在
+// interrupt() 的 checkpoint（見 server/multi_agent.py 的 train_confirm_gate／
+// save_offer_gate）。頁面重新載入時打 /api/agent/pending 用同一個 thread_id
+// 查一次，卡著的話直接重新問一次、接著送 /api/agent/resume 繼續跑，不用
+// 讓使用者自己發現「怎麼訓練確認就這樣消失了」。
+async function checkPendingAgentInterrupt() {
+    const threadId = sessionStorage.getItem(MANAGER_AGENT_THREAD_KEY);
+    if (!threadId) return;
+
+    const modelTypeEl = document.getElementById('manager-agent-engine-select');
+    const modelType = modelTypeEl ? modelTypeEl.value : 'gemini';
+
+    try {
+        const res = await fetch(`/api/agent/pending?thread_id=${encodeURIComponent(threadId)}&model_type=${encodeURIComponent(modelType)}`);
+        const data = await res.json();
+        if (data.pending) {
+            await finishOrResumeAgentTurn(
+                { traceRefs: null, finalReply: null, sawError: false, interruptPayload: data.payload },
+                threadId,
+                modelType
+            );
+        }
+    } catch (e) {
+        console.error('檢查未完成的 Agent 確認狀態失敗:', e);
+    }
+}
 
 let lastAutoLabelStatus = "idle";
 async function checkAutoLabelStatus() {

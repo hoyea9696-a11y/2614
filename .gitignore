@@ -12,3 +12,4 @@ server/dataset_*.yaml
 server/*.pt
 .claude/settings.local.json
 .claude/worktrees/
+logs/

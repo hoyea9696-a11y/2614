@@ -797,6 +797,20 @@ async def agent_resume(request: ManagerAgentResumeRequest):
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+@app.get("/api/agent/pending")
+async def agent_pending(thread_id: str, model_type: str = "gemini"):
+    """終端機關閉／伺服器重啟會讓前端 SSE 連線中斷，使用者當下彈出的
+    confirm() 也會隨之消失，但 SqliteSaver 其實還留著暫停在 interrupt() 的
+    checkpoint。前端重新載入頁面時打這個端點，帶著同一個 thread_id 檢查
+    是否還卡在某個 interrupt 上，卡著的話把當時的 payload 原樣吐回去，
+    讓前端能重新問一次使用者、再送 /api/agent/resume 接續下去。"""
+    graph = _get_manager_agent_graph(model_type)
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = graph.get_state(config)
+    if snapshot.interrupts:
+        return {"status": "success", "pending": True, "payload": snapshot.interrupts[0].value}
+    return {"status": "success", "pending": False}
+
 @app.get("/api/agent/graph")
 async def agent_graph(model_type: str = "gemini"):
     """觀測層：回傳 Multi-Agent 的靜態拓樸（Mermaid 語法），可以貼到
