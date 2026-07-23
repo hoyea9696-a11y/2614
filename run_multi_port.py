@@ -3,18 +3,39 @@ import time
 import sys
 import os
 
-def kill_port_process(port):
-    """強行殺掉佔用特定埠口的進程"""
+def _listening_pids(port):
+    """回傳目前正在 LISTENING 這個埠口的 PID 清單，沒有就回空清單。"""
     try:
-        if sys.platform == "win32":
-            output = subprocess.check_output(f"netstat -ano | findstr :{port}", shell=True).decode()
-            for line in output.splitlines():
-                if "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True)
-                    print(f"已清理埠口 {port} (PID: {pid})")
-    except:
-        pass
+        output = subprocess.check_output(f"netstat -ano | findstr :{port}", shell=True).decode(errors="ignore")
+    except subprocess.CalledProcessError:
+        return []
+    pids = set()
+    for line in output.splitlines():
+        if "LISTENING" in line:
+            pids.add(line.strip().split()[-1])
+    return list(pids)
+
+def kill_port_process(port, wait_timeout=10):
+    """強行殺掉佔用特定埠口的進程，並且真的等到埠口釋放才回傳。
+
+    taskkill 送出去不代表程序馬上死透、socket 馬上釋放——舊版本砍完立刻讓
+    uvicorn 綁定，若釋放得比預期慢就會撞上 WinError 10048（埠口仍被佔用），
+    導致這個埠口的新伺服器反而啟動失敗，比原本殘留的舊行程還麻煩。"""
+    if sys.platform != "win32":
+        return
+    pids = _listening_pids(port)
+    if not pids:
+        return
+    for pid in pids:
+        subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True)
+        print(f"已清理埠口 {port} (PID: {pid})")
+
+    deadline = time.time() + wait_timeout
+    while time.time() < deadline:
+        if not _listening_pids(port):
+            return
+        time.sleep(0.5)
+    print(f"警告：埠口 {port} 在 {wait_timeout} 秒後仍被佔用，接下來啟動伺服器可能會失敗")
 
 def start_server(port):
     kill_port_process(port)
