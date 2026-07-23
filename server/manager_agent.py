@@ -56,6 +56,12 @@ def _load_env():
                     os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+# LLM 呼叫（Planner/Decision Engine/子 Agent 的 ReAct 迴圈）沒有這層上限的話，
+# provider 端網路卡頓或無回應時 .invoke() 會不斷等下去，_invoke_with_retry 的
+# 重試也只是再等一次同樣沒上限的呼叫，使用者只能整個關掉伺服器才能脫困。
+LLM_REQUEST_TIMEOUT_SECONDS = 60
+
+
 def get_default_chat_model(model_type: str = "gemini"):
     """依 model_type 選擇 Manager Agent 底層的 LLM。設定（API Key、模型名稱）直接
     沿用 ai_service.py 的 _get_config()，不重複定義一次同樣的 .env 讀取邏輯。
@@ -83,7 +89,11 @@ def get_default_chat_model(model_type: str = "gemini"):
         from langchain_google_genai import ChatGoogleGenerativeAI
 
         model_name = conf.get("gemini_pro_model") if platform == "gemini-pro" else conf.get("gemini_flash_model", "gemini-2.5-flash")
-        return ChatGoogleGenerativeAI(model=model_name, google_api_key=conf.get("gemini_api_key"))
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=conf.get("gemini_api_key"),
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        )
 
     from langchain_openai import ChatOpenAI
 
@@ -91,6 +101,7 @@ def get_default_chat_model(model_type: str = "gemini"):
         return ChatOpenAI(
             model=conf.get("openai_model", "gpt-4.1-mini"),
             api_key=conf.get("openai_api_key"),
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     if platform in ("gpt-oss", "llama4-scout", "llama-4-scout"):
@@ -98,6 +109,7 @@ def get_default_chat_model(model_type: str = "gemini"):
             model=conf.get("gpt_oss_model", "openai/gpt-oss-120b"),
             api_key=conf.get("groq_api_key"),
             base_url="https://api.groq.com/openai/v1",
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     raise ValueError(f"Manager Agent 不支援的 model_type：{model_type}")
