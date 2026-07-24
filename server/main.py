@@ -7,6 +7,7 @@ import os
 import json
 import sys
 import threading
+import uuid
 import platform
 import psutil
 import torch
@@ -745,8 +746,18 @@ class ManagerAgentResumeRequest(BaseModel):
     model_type: str = "gemini"
     approved: bool
 
+# 這個伺服器行程啟動時產生一次的識別碼——重開終端機（重啟 server）會換一組新的，
+# 同一個行程一直活著（前端重新整理頁面）則不變。前端拿它來區分「重新整理」跟
+# 「重開終端」：boot_id 沒變就沿用同一個 thread_id、把對話畫回來；變了就開新對話。
+SERVER_BOOT_ID = uuid.uuid4().hex
+
 # 依 model_type 各自快取一份 Graph，換模型（gemini/groq/gemma/local）不用重啟服務
 _manager_agent_graphs = {}
+
+@app.get("/api/agent/boot")
+async def agent_boot():
+    """回傳這個伺服器行程的啟動識別碼，讓前端判斷是「重新整理」還是「重開終端」。"""
+    return {"status": "success", "boot_id": SERVER_BOOT_ID}
 
 def _get_manager_agent_graph(model_type: str = "gemini"):
     if model_type not in _manager_agent_graphs:

@@ -58,7 +58,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const lastPage = localStorage.getItem('ai_detector_active_page') || 'datasets';
     switchPage(lastPage);
 
-    checkPendingAgentInterrupt();
+    initManagerAgentSession();
 });
 
 // 使用者在 confirm() 彈窗跳出來、還沒按下去之前關掉終端機／重新整理頁面，
@@ -508,6 +508,7 @@ async function sendChatMessage() {
     };
 
     chatMessages.push({ role: 'user', content: text });
+    persistChatHistory();
 
     const loadingId = appendMessage(`[${modelType.toUpperCase()}] 思考中...`, 'ai', true);
 
@@ -547,6 +548,7 @@ async function sendChatMessage() {
             }
 
             chatMessages.push({ role: 'assistant', content: reply });
+            persistChatHistory();
         } else {
             appendMessage("發生錯誤: " + data.message, 'error');
         }
@@ -557,10 +559,16 @@ async function sendChatMessage() {
 }
 
 // Manager Agent 的對話記憶（LangGraph checkpointer）用 thread_id 對應到同一份
-// state——存在 sessionStorage 而不是 localStorage，分頁關閉就清除，符合「這次
-// 用著有記憶、下次進站重置」；重新整理頁面不會清（瀏覽器對 sessionStorage 的
-// 行為本來就是這樣），要真的開新對話請按「開新對話」按鈕。
+// state。thread_id／對話畫面／伺服器啟動識別碼都存在 sessionStorage：
+//   - 重新整理頁面：sessionStorage 不會清，boot_id 也沒變 → 沿用同一個
+//     thread_id、把之前的對話畫回來（見 initManagerAgentSession/renderChatHistory）。
+//   - 重開終端機（重啟 server）：後端的 boot_id 會換一組新的，跟存著的不一樣
+//     → 自動開一個新的 thread_id、清空對話，符合「重開終端就是新的一次」。
+//   - 分頁關閉：sessionStorage 本來就會清，下次進站是全新對話。
+// 也可以隨時按「開新對話」按鈕手動重置。
 const MANAGER_AGENT_THREAD_KEY = 'manager_agent_thread_id';
+const MANAGER_AGENT_BOOT_KEY = 'manager_agent_server_boot';
+const MANAGER_AGENT_HISTORY_KEY = 'manager_agent_chat_history';
 
 function getOrCreateThreadId() {
     let threadId = sessionStorage.getItem(MANAGER_AGENT_THREAD_KEY);
@@ -571,10 +579,71 @@ function getOrCreateThreadId() {
     return threadId;
 }
 
+// 每次對話有進展（送出訊息、收到回覆）就把 chatMessages 存進 sessionStorage，
+// 這樣重新整理後 renderChatHistory 才能原封不動把對話泡泡畫回來。決策過程卡片
+// （trace）跟健康度圖卡屬於過場用的即時資訊，不在還原範圍內。
+function persistChatHistory() {
+    try {
+        sessionStorage.setItem(MANAGER_AGENT_HISTORY_KEY, JSON.stringify(chatMessages));
+    } catch (e) {
+        console.warn('儲存對話紀錄失敗:', e);
+    }
+}
+
+function renderChatHistory() {
+    const container = document.getElementById('ai-chat-history');
+    if (!container) return;
+    container.innerHTML = '';
+    for (const m of chatMessages) {
+        appendMessage(m.content, m.role === 'user' ? 'user' : 'ai');
+    }
+}
+
 function resetManagerAgentThread() {
     sessionStorage.setItem(MANAGER_AGENT_THREAD_KEY, crypto.randomUUID());
+    sessionStorage.removeItem(MANAGER_AGENT_HISTORY_KEY);
     chatMessages.length = 0;
     document.getElementById('ai-chat-history').innerHTML = '';
+}
+
+// 進頁面時初始化 Manager Agent 對話：先問後端 boot_id 判斷這是「重新整理」還是
+// 「重開終端」，決定要還原舊對話還是開新的；還原的情況再順便檢查有沒有卡住的
+// 訓練/存模型確認（interrupt）要接續。
+async function initManagerAgentSession() {
+    let currentBoot = null;
+    try {
+        const res = await fetch('/api/agent/boot');
+        const data = await res.json();
+        currentBoot = data.boot_id || null;
+    } catch (e) {
+        // 後端還沒起來或連不上：不要因為一次暫時性錯誤就把使用者的對話清掉，
+        // 保守地沿用 sessionStorage 裡既有的內容還原。
+        console.warn('取得伺服器啟動識別碼失敗，沿用既有對話:', e);
+    }
+
+    const storedBoot = sessionStorage.getItem(MANAGER_AGENT_BOOT_KEY);
+
+    if (currentBoot && storedBoot && storedBoot !== currentBoot) {
+        // boot_id 變了 = 重開過終端機（server 重啟）→ 開全新對話
+        resetManagerAgentThread();
+        sessionStorage.setItem(MANAGER_AGENT_BOOT_KEY, currentBoot);
+        return;
+    }
+
+    if (currentBoot) sessionStorage.setItem(MANAGER_AGENT_BOOT_KEY, currentBoot);
+
+    // 同一個 server（重新整理）或抓不到 boot_id：把上次的對話畫回來
+    const saved = sessionStorage.getItem(MANAGER_AGENT_HISTORY_KEY);
+    if (saved) {
+        try {
+            chatMessages = JSON.parse(saved);
+            renderChatHistory();
+        } catch (e) {
+            console.warn('還原對話紀錄失敗:', e);
+        }
+    }
+
+    checkPendingAgentInterrupt();
 }
 
 // /api/agent/chat、/api/agent/resume 回應都是 SSE 串流（text/event-stream），逐個
@@ -655,9 +724,103 @@ async function finishOrResumeAgentTurn(result, threadId, modelType) {
             appendMessage(reply, 'ai');
         }
         chatMessages.push({ role: 'assistant', content: reply });
+        persistChatHistory();
     } else if (sawError) {
         appendMessage("執行中發生錯誤，詳情請展開上方決策過程", 'error');
     }
+}
+
+// ───────────────────────────────────────────────────────────
+// 訓練是同步卡在 model_agent 的 tool 裡跑的（見 agent_tools.train_yolo_model），
+// 那段期間 /api/agent/chat 的 SSE 串流整個被卡住、推不出任何 step，LLM 視窗會
+// 「看起來當掉」。但 trainer 每個 epoch 都即時更新 shared_trainer.progress，而
+// /api/train/status 是另一條執行緒在服務、不受卡住的 SSE 影響。所以對話回合期間
+// 獨立輪詢這個端點，把進度即時畫成卡片塞進 LLM 視窗，使用者才看得到訓練跑到哪、
+// 要不要按終止（終止鈕沿用網頁表單那顆的 /api/train/stop，對同一個 shared_trainer 生效）。
+let agentTrainWatchInterval = null;
+let agentTrainCardRefs = null;
+
+function startAgentTrainingWatch() {
+    if (agentTrainWatchInterval) return;
+    agentTrainCardRefs = null;
+    agentTrainWatchInterval = setInterval(async () => {
+        try {
+            const r = await fetch('/api/train/status');
+            const d = await r.json();
+            if (d.status === 'training') {
+                renderAgentTrainingCard(d);
+            } else if (agentTrainCardRefs) {
+                finishAgentTrainingCard(d);
+                agentTrainCardRefs = null;
+            }
+        } catch (e) { /* 輪詢失敗忽略，下一輪再試 */ }
+    }, 2000);
+}
+
+function stopAgentTrainingWatch() {
+    if (agentTrainWatchInterval) {
+        clearInterval(agentTrainWatchInterval);
+        agentTrainWatchInterval = null;
+    }
+    // 卡片保留在最後一次畫面（完成／終止／錯誤）不清掉，只放掉 refs，下一輪訓練會開新卡片
+    agentTrainCardRefs = null;
+}
+
+function renderAgentTrainingCard(d) {
+    const container = document.getElementById('ai-chat-history');
+    if (!agentTrainCardRefs) {
+        const wrapper = document.createElement('div');
+        wrapper.style.cssText = "align-self: flex-start; width: 92%; margin-top: 6px; background: #0f172a; border: 1px solid rgba(34,197,94,0.4); border-radius: 10px; padding: 12px 14px; font-size: 0.78rem; color: #cbd5e1;";
+        wrapper.innerHTML = `
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                <span class="atc-title" style="color:#4ade80; font-weight:600;">🚀 訓練進行中</span>
+                <button type="button" class="atc-stop" style="background:#ef4444; color:#fff; border:none; border-radius:6px; padding:3px 10px; font-size:0.72rem; cursor:pointer;">終止訓練</button>
+            </div>
+            <div style="background:#1e293b; border-radius:6px; height:8px; overflow:hidden; margin-bottom:6px;">
+                <div class="atc-bar" style="background:#4ade80; height:100%; width:0%; transition:width .3s;"></div>
+            </div>
+            <div class="atc-text" style="color:#94a3b8;">準備中…</div>
+            <div class="atc-metric" style="color:#64748b; margin-top:4px;"></div>`;
+        const stopBtn = wrapper.querySelector('.atc-stop');
+        stopBtn.addEventListener('click', async () => {
+            stopBtn.disabled = true;
+            stopBtn.textContent = '終止中…';
+            try { await fetch('/api/train/stop', { method: 'POST' }); } catch (e) {}
+        });
+        container.appendChild(wrapper);
+        agentTrainCardRefs = {
+            wrapper,
+            title: wrapper.querySelector('.atc-title'),
+            stop: stopBtn,
+            bar: wrapper.querySelector('.atc-bar'),
+            text: wrapper.querySelector('.atc-text'),
+            metric: wrapper.querySelector('.atc-metric'),
+        };
+    }
+    const refs = agentTrainCardRefs;
+    const cur = d.current_epoch || 0;
+    const total = d.total_epochs || 0;
+    const pct = total ? Math.round((cur / total) * 100) : 0;
+    refs.bar.style.width = `${pct}%`;
+    refs.text.textContent = `第 ${cur} / ${total} 輪（${pct}%）`;
+    const last = (d.metrics && d.metrics.length) ? d.metrics[d.metrics.length - 1] : null;
+    refs.metric.textContent = last ? `最新：mAP50 ${last.map}% ・ loss ${last.loss}` : '';
+    container.scrollTop = container.scrollHeight;
+}
+
+function finishAgentTrainingCard(d) {
+    const refs = agentTrainCardRefs;
+    if (!refs) return;
+    const [label, color] = ({
+        completed: ['✅ 訓練完成', '#4ade80'],
+        stopped: ['🛑 訓練已終止', '#f87171'],
+        error: ['⚠️ 訓練發生錯誤', '#f87171'],
+    })[d.status] || ['訓練結束', '#94a3b8'];
+    refs.title.textContent = label;
+    refs.title.style.color = color;
+    if (refs.stop) refs.stop.remove();
+    if (d.status === 'completed') refs.bar.style.width = '100%';
+    if (d.message) refs.metric.textContent = d.message;
 }
 
 async function sendManagerAgentMessage(text, loadingId) {
@@ -665,6 +828,7 @@ async function sendManagerAgentMessage(text, loadingId) {
     const threadId = getOrCreateThreadId();
     const requestBody = { message: text, model_type: modelType, thread_id: threadId };
 
+    startAgentTrainingWatch();
     try {
         const res = await fetch('/api/agent/chat', {
             method: 'POST',
@@ -679,6 +843,8 @@ async function sendManagerAgentMessage(text, loadingId) {
     } catch (e) {
         removeMessage(loadingId);
         appendMessage("連線失敗", 'error');
+    } finally {
+        stopAgentTrainingWatch();
     }
 }
 

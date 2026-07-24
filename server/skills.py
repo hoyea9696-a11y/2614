@@ -35,7 +35,13 @@ from agent_tools import (
 )
 
 WORKSPACE_STATE_PATH = PROJECT_ROOT / "workspace_state.json"
-HEALTH_SCORE_GATE = 70
+# 標記覆蓋率門檻（%）：低於此代表還有圖片沒標記，硬訓會學到錯的東西，這才是真正該
+# 擋下來的問題。類別平不平衡刻意不在這裡擋——物件偵測本來就容許不平衡（YOLO 照樣
+# 訓，只是稀有類表現差），把「不平衡」當成硬性 Gate 會誤殺正常、可訓練的資料集
+# （例如 car/truck/person 這種天生就一類特別多的資料）。
+COVERAGE_GATE = 70
+# 類別平衡度低於此只提出警告、不擋訓練，讓使用者自己決定要不要為稀有類別補資料。
+BALANCE_WARN_THRESHOLD = 40
 EVAL_MAP50_GATE = 0.5
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "yolov9m.pt"
 
@@ -73,12 +79,13 @@ def skill_train(
     model_name: Annotated[str, Field(description="輸出的實驗名稱，會存在 runs/train/<model_name> 底下")] = "exp",
 ) -> dict:
     """完整的模型訓練流程（Skill，不是單純的 Tool）：依序跑過 Dataset Gate（資料集
-    是否存在）、Health Gate（健康度是否 >= 70 分），兩個 Gate 都過了才真的呼叫
-    train_yolo_model 開始訓練。這些 Gate 判斷是寫死的規則，不是 LLM 決定，
-    確保同一個資料集每次呼叫的行為都一致。
+    是否存在）、Health Gate（標記覆蓋率是否 >= 70%；類別不平衡只附警告、不擋訓練），
+    兩個 Gate 都過了才真的呼叫 train_yolo_model 開始訓練。這些 Gate 判斷是寫死的
+    規則，不是 LLM 決定，確保同一個資料集每次呼叫的行為都一致。
 
     若 Dataset Gate 沒過，回傳 status="dataset_not_found"；
-    若 Health Gate 沒過，回傳 status="health_gate_failed" 並附上健康度報告。"""
+    若 Health Gate 沒過（標記覆蓋率不足），回傳 status="health_gate_failed" 並附上
+    健康度報告。類別分佈不平衡不會擋訓練，只會在回傳結果裡多帶一個 balance_warning。"""
     try:
         dataset_name = _sanitize_name(dataset_name)
         model_name = _sanitize_name(model_name)
@@ -97,6 +104,17 @@ def skill_train(
     if health.get("status") != "success":
         return {"status": "error", "message": f"Health Gate 檢查失敗：{health.get('message')}"}
 
+    coverage = health.get("coverage") or 0
+    balance = health.get("balance") or 0
+    # 類別不平衡只警告、不擋訓練：樣本數過少的類別訓練後可能幾乎偵測不到，但這是
+    # 「要不要補資料」的判斷題，交給使用者決定，不該讓自動 Gate 直接擋死整個訓練。
+    balance_warning = None
+    if balance < BALANCE_WARN_THRESHOLD:
+        balance_warning = (
+            f"類別分佈不平衡（平衡度 {balance} 分）：樣本數過少的類別訓練後可能幾乎偵測"
+            f"不到，建議補齊這些類別的圖片、或減少類別數。這次仍照常訓練。"
+        )
+
     state = _read_state()
     state.setdefault("dataset", {})
     state["dataset"].update({
@@ -106,21 +124,24 @@ def skill_train(
         "image_count": health.get("total_images"),
         "label_count": health.get("labeled_images"),
         "health_analysis": {
-            "passed": health["score"] >= HEALTH_SCORE_GATE,
+            "passed": coverage >= COVERAGE_GATE,
             "score": health["score"],
-            "coverage": health.get("coverage"),
-            "balance": health.get("balance"),
+            "coverage": coverage,
+            "balance": balance,
+            "balance_warning": balance_warning,
             "last_checked": _now_iso(),
         },
     })
     _write_state(state)
 
-    if health["score"] < HEALTH_SCORE_GATE:
+    # 只在「標記覆蓋率不足」時擋下來——有圖片還沒標記，硬訓會學到錯的東西。
+    if coverage < COVERAGE_GATE:
         return {
             "status": "health_gate_failed",
             "score": health["score"],
-            "message": f"Health Gate 沒過：健康度 {health['score']} 分 < {HEALTH_SCORE_GATE} 分門檻，"
-                       f"請補齊標記或平衡類別分佈後再重新訓練",
+            "coverage": coverage,
+            "message": f"Health Gate 沒過：標記覆蓋率只有 {coverage}%（< {COVERAGE_GATE}% 門檻），"
+                       f"代表還有圖片沒標記，請補齊標記後再重新訓練",
         }
 
     train_result = train_yolo_model.invoke({
@@ -142,7 +163,10 @@ def skill_train(
         })
         _write_state(state)
 
-    return {"gates_passed": ["dataset_exists", "health_score"], **train_result}
+    result = {"gates_passed": ["dataset_exists", "label_coverage"], **train_result}
+    if balance_warning:
+        result["balance_warning"] = balance_warning
+    return result
 
 
 @tool

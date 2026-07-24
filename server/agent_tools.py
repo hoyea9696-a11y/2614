@@ -311,4 +311,121 @@ def download_roboflow_dataset(
     }
 
 
-ALL_TOOLS = [check_dataset_health, import_images_to_dataset, train_yolo_model, evaluate_yolo_model, run_yolo_inference, download_roboflow_dataset]
+@tool
+def augment_dataset_from_roboflow(
+    dataset_name: Annotated[str, Field(description="要擴充（合併進去）的現有資料集名稱，對應 data/datasets/ 底下的資料夾")],
+    workspace: Annotated[str, Field(description="Roboflow workspace slug，來自 universe.roboflow.com/<workspace>/<project> 網址")],
+    project: Annotated[str, Field(description="Roboflow project slug，同樣來自該網址；挑一個跟現有資料集『同類主題』的公開專案")],
+    version: Annotated[int, Field(description="要下載的資料集版本號，通常從 1 開始")] = 1,
+) -> dict:
+    """資料量不足／分數偏低時，從 Roboflow Universe 抓一個『同類主題』的公開資料集，
+    把它的已標記圖片『合併進』現有的 dataset_name，用來擴充樣本後再重新訓練。
+
+    重要限制：合併進來的標籤會被一律重新對應成單一類別（class 0）。這對「單一類別
+    偵測」是安全的；多類別資料集不要用這個工具自動合併，否則類別會對不上、標籤變無效。
+
+    跟 download_roboflow_dataset 的差別：那個是「建立一個全新的資料集」，這個是「把
+    新圖片疊加進已存在的資料集」。呼叫前一樣要自己猜 workspace/project slug，回傳
+    status="not_found" 就換一個猜測再試。"""
+    api_key = _load_roboflow_key()
+    if not api_key:
+        return {"status": "error", "message": "未設定 ROBOFLOW_API_KEY，無法下載"}
+
+    try:
+        dataset_name = _sanitize_name(dataset_name)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
+    ds_root = DATASET_DIR / dataset_name
+    if _count_images(ds_root) == 0:
+        return {
+            "status": "error",
+            "message": f"資料集 {dataset_name} 不存在或沒有圖片，無法擴充；"
+                       f"要從零建立請改用 download_roboflow_dataset",
+        }
+
+    export_url = (
+        f"https://api.roboflow.com/{workspace}/{project}/{version}/{ROBOFLOW_EXPORT_FORMAT}"
+        f"?api_key={api_key}"
+    )
+    try:
+        resp = requests.get(export_url, timeout=30)
+    except requests.RequestException as e:
+        return {"status": "error", "message": f"連線失敗：{e}"}
+    if resp.status_code == 404:
+        return {
+            "status": "not_found",
+            "message": f"找不到 {workspace}/{project} 第 {version} 版，換一個 workspace/project 猜測再試",
+        }
+    if not resp.ok:
+        return {"status": "error", "message": f"Roboflow 回應錯誤（HTTP {resp.status_code}）：{resp.text[:200]}"}
+    link = resp.json().get("export", {}).get("link")
+    if not link:
+        return {"status": "error", "message": "回應中沒有下載連結，可能該版本不支援匯出"}
+
+    # 解壓到暫存區（不放進 datasets/，避免半成品被 _count_images 或訓練誤讀），合併完就刪。
+    tmp_root = PROJECT_ROOT / "temp_training" / f"_augment_{_sanitize_name(project)}"
+    if tmp_root.exists():
+        shutil.rmtree(tmp_root, ignore_errors=True)
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    try:
+        zip_resp = requests.get(link, timeout=120)
+        zip_resp.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+            _safe_extract_zip(zf, tmp_root)
+
+        # 現有資料集有 train/images 就併進去，否則併進根目錄的 images/（兩種結構
+        # prepare_dataset 都吃得到）。
+        if (ds_root / "train" / "images").exists():
+            img_dst, lbl_dst = ds_root / "train" / "images", ds_root / "train" / "labels"
+        else:
+            img_dst, lbl_dst = ds_root / "images", ds_root / "labels"
+        img_dst.mkdir(parents=True, exist_ok=True)
+        lbl_dst.mkdir(parents=True, exist_ok=True)
+
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+        added = 0
+        for img in tmp_root.rglob("*"):
+            if not (img.is_file() and img.suffix.lower() in exts):
+                continue
+            # YOLO 匯出格式：圖片在 .../images/，標籤在同層的 .../labels/<stem>.txt
+            label_src = (img.parent.parent / "labels" / (img.stem + ".txt")) if "images" in img.parts else (img.parent / (img.stem + ".txt"))
+            if not (label_src.exists() and label_src.stat().st_size > 0):
+                continue  # 只併已標記的圖片，沒標籤的略過
+            base = f"{_sanitize_name(project)}_{img.name}"
+            dst_img = img_dst / base
+            if dst_img.exists():
+                base = f"{_sanitize_name(project)}_{added}_{img.name}"
+                dst_img = img_dst / base
+            shutil.copy2(img, dst_img)
+            # 標籤逐行把 class id（第一個 token）改寫成 0，其餘 bbox 座標原樣保留
+            remapped = []
+            for line in label_src.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = line.split()
+                if len(parts) >= 5:
+                    parts[0] = "0"
+                    remapped.append(" ".join(parts))
+            (lbl_dst / (dst_img.stem + ".txt")).write_text("\n".join(remapped) + "\n", encoding="utf-8")
+            added += 1
+    except (zipfile.BadZipFile, ValueError) as e:
+        return {"status": "error", "message": f"解壓/合併失敗：{e}"}
+    except requests.RequestException as e:
+        return {"status": "error", "message": f"下載失敗：{e}"}
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+    if added == 0:
+        return {
+            "status": "no_new_images",
+            "message": f"{workspace}/{project} 沒有可用的已標記圖片可以合併（可能格式不符或沒有標籤）",
+        }
+    return {
+        "status": "success",
+        "dataset_name": dataset_name,
+        "source": f"roboflow:{workspace}/{project}/v{version}",
+        "added_images": added,
+        "total_images_now": _count_images(ds_root),
+    }
+
+
+ALL_TOOLS = [check_dataset_health, import_images_to_dataset, train_yolo_model, evaluate_yolo_model, run_yolo_inference, download_roboflow_dataset, augment_dataset_from_roboflow]

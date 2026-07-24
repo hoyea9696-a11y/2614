@@ -56,13 +56,14 @@ SERVER_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SERVER_DIR.parent
 CHECKPOINT_DB_PATH = PROJECT_ROOT / "data" / "agent_checkpoints.sqlite"
 MODELS_DIR = PROJECT_ROOT / "models"
+WORKSPACE_STATE_PATH = PROJECT_ROOT / "workspace_state.json"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from agent_tools import check_dataset_health, import_images_to_dataset, download_roboflow_dataset, DATASET_DIR, _count_images
+from agent_tools import check_dataset_health, import_images_to_dataset, download_roboflow_dataset, augment_dataset_from_roboflow, DATASET_DIR, _count_images
 from skills import skill_train, skill_infer, skill_eval
 
-DATA_TOOLS = [check_dataset_health, import_images_to_dataset, download_roboflow_dataset]
+DATA_TOOLS = [check_dataset_health, import_images_to_dataset, download_roboflow_dataset, augment_dataset_from_roboflow]
 MODEL_TOOLS = [skill_train, skill_infer]
 EVAL_TOOLS = [skill_eval]
 
@@ -85,7 +86,9 @@ def report_to_manager(
 
 DATA_AGENT_PROMPT = """你是 Data Agent，只負責資料集相關的任務，依下面順序判斷該用哪個工具：
 1. 先呼叫 check_dataset_health 確認本機這個資料集是否已經有圖片——已經有就不用再匯入
-   或下載，直接回報現況即可。
+   或下載，直接回報現況即可。注意：健康分數低如果只是「類別不平衡（balance 低）」而
+   標記覆蓋率（coverage）夠，不算卡關，照常回報 status="success"，把不平衡當備註寫進
+   reason 即可；只有「覆蓋率低（很多圖沒標記）」或「根本沒有圖片」才算真正的問題。
 2. 使用者提到本機/已上傳有現成圖片路徑（例如推論頁面暫存上傳的 data/uploads/ 或
    temp_verify/），且本機資料集還沒有圖片時，呼叫 import_images_to_dataset 把這些
    圖片匯入。這個工具只搬圖片、不會產生標記檔，匯入後健康度是 0% 標記率是正常現象，
@@ -93,6 +96,13 @@ DATA_AGENT_PROMPT = """你是 Data Agent，只負責資料集相關的任務，�
 3. 本機、使用者提供的路徑都沒有圖片可用時，才呼叫 download_roboflow_dataset 從
    Roboflow Universe 下載補齊：自己猜最符合的 workspace/project slug，猜錯
    （status=not_found）就換一個再試，最多嘗試 3 次，全部失敗才回報無法補齊。
+4. 收到「資料集樣本不足、分數偏低，請合併更多圖片進去擴充」這類指示時（資料集已經
+   存在、只是不夠好），改呼叫 augment_dataset_from_roboflow：猜一個同類主題的公開
+   資料集 slug，把它的已標記圖片合併進指定的現有資料集，not_found 就換一個再試（最多
+   3 次）。這跟 download_roboflow_dataset 不同——那是建新資料集，這是往現有資料集疊加。
+   重要：這個工具會把合併進來的標籤全部改成單一類別（class 0），只適合「單一類別偵測」；
+   多類別資料集不要用它，否則類別會對不上、標籤變無效——多類別要補資料只能由使用者
+   自己標記或手動併入對得上類別的資料。
 
 完成後一定要呼叫 report_to_manager 回報結果：本機、上傳、Roboflow 都找不到資料就
 status="blocked"、reason_code="dataset_not_found"；其他情況成功就 status="success"，
@@ -101,8 +111,8 @@ reason_code 留空。
 你不負責訓練、推論、評估模型，這些請交給 Model Agent / Evaluation Agent。"""
 
 MODEL_AGENT_PROMPT = """你是 Model Agent，只負責模型的訓練與推論，用兩個 Skill 完成：
-- skill_train：完整訓練流程，內部已經自動檢查資料集是否存在、健康度是否 >= 70 分，
-  你不用自己再檢查一次。
+- skill_train：完整訓練流程，內部已經自動檢查資料集是否存在、標記覆蓋率是否足夠
+  （類別不平衡只會附一個 balance_warning、不會擋訓練），你不用自己再檢查一次。
 - skill_infer：完整推論流程，內部已經自動選好要用哪個模型權重。
 
 完成後一定要呼叫 report_to_manager 回報結果：
@@ -209,6 +219,37 @@ MAX_REPLANS = 2
 
 MAX_ROUNDS = 8
 
+# 分數不夠時可以嘗試「去 Roboflow 增強」的 Gate 類型：health（資料集健康度不足）
+# 與 eval（訓練後 mAP 太低），兩者的共同解法都是「補更多已標記的樣本」。
+AUGMENTABLE_GATES = {"health_gate_failed", "eval_gate_failed"}
+
+
+def _active_dataset_name() -> Optional[str]:
+    """讀 workspace_state.json 拿目前正在用的資料集名稱——skill_train 每次訓練
+    （含 health_gate_failed 提早返回前）都會把 dataset.name 寫進去，所以分數不夠
+    時可以據此知道該對哪個資料集做增強。"""
+    try:
+        with open(WORKSPACE_STATE_PATH, "r", encoding="utf-8") as f:
+            return (json.load(f).get("dataset") or {}).get("name")
+    except Exception:
+        return None
+
+
+def _active_dataset_is_single_class() -> bool:
+    """目前資料集『實際用到的類別』是不是只有一種。augment_dataset_from_roboflow 會把
+    合併進來的標籤全部改成 class 0，只有單一類別偵測用它才安全；多類別資料集用了會把
+    別的類別的框全污染成同一類。所以「去 Roboflow 增強」這條路只在單類別時才提議。"""
+    ds_name = _active_dataset_name()
+    if not ds_name:
+        return False
+    try:
+        health = check_dataset_health.invoke({"dataset_name": ds_name})
+        dist = health.get("class_distribution") or {}
+        used = [c for c in dist.values() if (c.get("count") or 0) > 0]
+        return len(used) == 1
+    except Exception:
+        return False
+
 # 訓練是高成本、耗時的操作，啟動前要讓使用者確認——但 Manager 只知道「這一步要
 # 交給 model_agent」，不知道 model_agent 內部要跑 skill_train 還是 skill_infer
 # （那是 model_agent 自己的 ReAct 迴圈決定的）。原本用 Step 描述裡有沒有「訓練」
@@ -280,6 +321,10 @@ class SupervisorState(TypedDict):
     train_confirmed: bool
     last_trained_model: Optional[str]
     model_save_offered: bool
+    # 分數不夠時只問一次「要不要去 Roboflow 增強」，避免反覆騷擾；baseline 記錄提議
+    # 增強當下的圖片數，用來判斷之後資料到底有沒有真的長大（有長大才值得再重訓）。
+    augment_offered: bool
+    augment_baseline_count: Optional[int]
 
 
 def _build_sub_agent(chat_model, tools, system_prompt):
@@ -639,6 +684,44 @@ def build_multi_agent(chat_model):
         last_report = state.get("last_report") or {}
         reason_code = last_report.get("reason_code") or ""
 
+        # 分數不夠（資料集健康度不足／訓練後 mAP 太低）時的止血 + 增強邏輯：
+        # 資料沒變的話，重訓／重查一定得到一樣的結果，別再空轉。第一次先問使用者要不要
+        # 從 Roboflow 抓同類資料合併進來（augment_gate）；使用者已經拒絕、或增強過但資料
+        # 沒真的長大，就誠實結束，不落到下面的 GATE_ROUTING 一直重試。
+        if reason_code in AUGMENTABLE_GATES:
+            ds_name = _active_dataset_name()
+            cur_count = _count_images(DATASET_DIR / ds_name) if ds_name else 0
+            baseline = state.get("augment_baseline_count")
+            grew = baseline is not None and cur_count > baseline
+            if not grew:
+                # 只有『單一類別偵測』才提議去 Roboflow 增強——augment 工具會把合併進來的
+                # 標籤全改成 class 0，多類別用了只會污染類別；而且盲猜 slug 幾乎猜不中，
+                # 繞下去只是空轉。多類別（或已經問過）就誠實停下來給對的建議，不再輪迴。
+                if not state.get("augment_offered") and _active_dataset_is_single_class():
+                    return {
+                        "next": "augment_gate",
+                        "rounds": rounds,
+                        "retry_counters": retry_counters,
+                        "augment_baseline_count": cur_count,
+                    }
+                if _active_dataset_is_single_class():
+                    advice = "建議補更多已標記的圖片、或改用別的資料集後再試。"
+                else:
+                    advice = ("這是多類別資料集，分數偏低通常是某些類別樣本太少。請針對『樣本"
+                              "數過少的類別』補齊已標記圖片，或減少類別數後再訓練；不建議用自動"
+                              "Roboflow 合併（那會把類別對不上）。")
+                return {
+                    "next": "FINISH",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "messages": [AIMessage(
+                        content="模型分數偏低，而且資料集沒有增加新的樣本，再訓練結果也會一樣。"
+                                f"{advice}（{last_report.get('reason', '')}）"
+                    )],
+                }
+            # grew == True：增強已經補進新樣本，落到下面既有的 GATE_ROUTING 邏輯，
+            # 讓它照常去重訓（model_agent）/重查（data_agent），這次是在更多資料上重訓。
+
         # 已知 Gate 失敗類型：固定規則直接決定，不問 LLM。
         if reason_code in GATE_ROUTING:
             attempts = retry_counters.get(reason_code, 0)
@@ -737,6 +820,33 @@ def build_multi_agent(chat_model):
             note = f"好的，模型「{model_name}」先不存入模型庫，訓練結果仍留在 runs/train/{model_name} 底下。"
         return {"model_save_offered": True, "messages": [AIMessage(content=note)]}
 
+    def augment_gate(state: SupervisorState) -> dict:
+        """分數不夠、且資料沒變時的增強確認關卡：用 interrupt() 問使用者要不要從
+        Roboflow 抓同類主題的公開資料集、合併更多已標記圖片進目前的資料集再訓練一次
+        （跟 train_confirm_gate 同一套確認模式，前端沿用既有的 interrupt→confirm→
+        resume 流程，不用改）。同意就丟一則指示給 data_agent 去執行合併；拒絕就結束。"""
+        ds_name = _active_dataset_name() or "目前的資料集"
+        resume = interrupt({
+            "reason": f"資料集「{ds_name}」的樣本可能不足，導致分數偏低。要不要從 Roboflow "
+                      f"抓一份同類主題的公開資料集，把更多已標記圖片合併進「{ds_name}」再訓練一次？"
+                      f"（僅適合單一類別偵測；合併進來的標籤會一律當成同一類）",
+            "dataset_name": ds_name,
+        })
+        if isinstance(resume, dict) and resume.get("approved"):
+            instruction = HumanMessage(content=(
+                f"資料集「{ds_name}」樣本不足、分數偏低。請呼叫 augment_dataset_from_roboflow，"
+                f"從 Roboflow Universe 猜一個『同類主題』的公開資料集（workspace/project slug），"
+                f"把它的已標記圖片合併進「{ds_name}」擴充樣本。回傳 not_found 就換一個猜測再試，"
+                f"最多 3 次；成功後回報新增了幾張圖片。"
+            ))
+            return {"next": "data_agent", "augment_offered": True, "messages": [instruction]}
+        return {
+            "next": "FINISH",
+            "augment_offered": True,
+            "messages": [AIMessage(content=f"好的，這次先不從 Roboflow 補資料。你可以自己補更多已標記圖片，"
+                                           f"或改用別的資料集，再重新訓練「{ds_name}」。")],
+        }
+
     def run_evaluation_agent(state: SupervisorState) -> dict:
         return _run_sub_agent("evaluation_agent", evaluation_agent, state)
 
@@ -746,6 +856,7 @@ def build_multi_agent(chat_model):
     graph.add_node("observer", observer_node)
     graph.add_node("train_confirm_gate", train_confirm_gate)
     graph.add_node("save_offer_gate", save_offer_gate)
+    graph.add_node("augment_gate", augment_gate)
     graph.add_node("data_agent", run_data_agent)
     graph.add_node("model_agent", run_model_agent)
     graph.add_node("evaluation_agent", run_evaluation_agent)
@@ -760,6 +871,7 @@ def build_multi_agent(chat_model):
             "model_agent": "train_confirm_gate",
             "evaluation_agent": "evaluation_agent",
             "planner": "planner",
+            "augment_gate": "augment_gate",
             "FINISH": "save_offer_gate",
         },
     )
@@ -767,6 +879,11 @@ def build_multi_agent(chat_model):
         "train_confirm_gate",
         lambda s: s["next"],
         {"model_agent": "model_agent", "FINISH": "save_offer_gate"},
+    )
+    graph.add_conditional_edges(
+        "augment_gate",
+        lambda s: s["next"],
+        {"data_agent": "data_agent", "FINISH": "save_offer_gate"},
     )
     graph.add_edge("save_offer_gate", END)
     graph.add_edge("data_agent", "observer")
@@ -832,6 +949,8 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                 "train_confirmed": False,
                 "last_trained_model": None,
                 "model_save_offered": False,
+                "augment_offered": False,
+                "augment_baseline_count": None,
             }
         total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         llm_calls = 0
