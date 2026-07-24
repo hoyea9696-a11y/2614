@@ -124,16 +124,56 @@ def start_server(port, attempts=2):
     return proc  # 回傳最後一次（已死）的行程，讓監控知道它沒起來
 
 
+def start_all(ports, timeout=45):
+    """一次把所有埠口的伺服器『同時』起來，回傳 {port: proc}。
+
+    加速關鍵：以前是 for 迴圈一個一個 start_server（起完一個才起下一個），每個都要
+    等它 import torch（好幾秒）才輪到下一個，四個加起來很久。這裡改成先一次清掉所有
+    埠口、再『同時』spawn 四個行程平行 import，等待時間從「四個相加」縮成「最慢那一個」。
+
+    啟動前會先清掉每個埠口的舊佔用（包含關掉終端機視窗後殘留的孤兒行程），所以每次
+    重開就是一個乾淨的新啟動，使用者不用自己去工作管理員手動刪那些佔位的行程。"""
+    print("清理舊行程並釋放埠口...")
+    for p in ports:
+        free_port(p)
+
+    print("同時啟動所有埠口的伺服器...")
+    procs = {p: _spawn(p) for p in ports}
+
+    deadline = time.time() + timeout
+    pending = set(ports)
+    retried = set()
+    while pending and time.time() < deadline:
+        for p in list(pending):
+            proc = procs[p]
+            if _pids_on_port(p):
+                pending.discard(p)
+                print(f"埠口 {p} 已就緒。")
+            elif proc.poll() is not None:
+                # 這個行程一起來就死了（例如短暫 bind 撞在一起）——補救重試一次就好，
+                # 重試過還是死就放棄，交給後面的監控迴圈回報，不要卡在這裡。
+                if p in retried:
+                    pending.discard(p)
+                    print(f"埠口 {p} 連續啟動失敗，跳過（詳見 logs/port_{p}.log）")
+                else:
+                    retried.add(p)
+                    print(f"埠口 {p} 啟動失敗，重試一次...")
+                    free_port(p)
+                    procs[p] = _spawn(p)
+        time.sleep(0.3)
+    return procs
+
+
 if __name__ == "__main__":
     processes = []
 
     try:
         print("\n" + "=" * 50)
-        print("啟動多埠混合動力伺服器中 (子系統優先)...")
+        print("啟動多埠混合動力伺服器中 (平行啟動)...")
         print("=" * 50)
 
-        for p in PORTS:
-            processes.append(start_server(p))
+        procs = start_all(PORTS)
+        processes = [procs[p] for p in PORTS]
 
         alive = [PORTS[i] for i, pr in enumerate(processes) if pr.poll() is None]
         print("\n" + "=" * 50)

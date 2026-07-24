@@ -14,8 +14,14 @@ class YOLOTrainer:
             "message": "",
             "current_epoch": 0,
             "total_epochs": 0,
+            "percent": 0,
             "metrics": []
         }
+        # epoch 內的 batch 進度計數：on_fit_epoch_end 只在每個 epoch『結束』才更新進度，
+        # CPU 上一個 epoch 很久，中間畫面會一直停在同一個百分比、看起來像當掉。靠這兩個
+        # 變數在 batch 層級推進細粒度百分比，讓進度條在 epoch 內就會動。
+        self._progress_epoch = -1
+        self._batch_in_epoch = 0
         self._stop_event = threading.Event()
         self.temp_root = Path("temp_training")
         self.temp_root.mkdir(parents=True, exist_ok=True)
@@ -111,7 +117,34 @@ class YOLOTrainer:
     def _check_stop(self, trainer):
         if self._stop_event.is_set():
             raise Exception("USER_STOPPED")
-            
+        # 順便在每個 batch 推進 epoch 內的細粒度百分比，讓使用者看得出訓練其實在跑，
+        # 不會整個 epoch 卡在同一個數字像當掉。
+        self._update_batch_progress(trainer)
+
+    def _update_batch_progress(self, trainer):
+        """每個 batch 結束時算一次整體百分比 =（已完成 epoch 數 + 這個 epoch 內的完成比例）
+        / 總 epoch 數。ultralytics 沒有穩定公開「目前第幾個 batch」，所以自己數 callback
+        次數、換 epoch 時歸零；一個 epoch 的 batch 數用 len(train_loader) 拿。"""
+        try:
+            total_epochs = self.progress.get("total_epochs") or getattr(trainer, "epochs", 0) or 1
+            cur_epoch0 = int(getattr(trainer, "epoch", 0))  # 0-based，正在跑第 cur_epoch0+1 輪
+            if self._progress_epoch != cur_epoch0:
+                self._progress_epoch = cur_epoch0
+                self._batch_in_epoch = 0
+            self._batch_in_epoch += 1
+            nb = 0
+            loader = getattr(trainer, "train_loader", None)
+            if loader is not None:
+                try:
+                    nb = len(loader)
+                except Exception:
+                    nb = 0
+            frac = min(self._batch_in_epoch / nb, 1.0) if nb else 0.0
+            self.progress["percent"] = round((cur_epoch0 + frac) / total_epochs * 100, 1)
+            self.progress["current_epoch"] = cur_epoch0 + 1  # 顯示「正在跑第幾輪」(1-based)
+        except Exception:
+            pass  # 進度顯示是次要的，算錯絕不能影響訓練本身
+
     def _update_progress(self, trainer):
         if self._stop_event.is_set():
             raise Exception("USER_STOPPED")
@@ -130,6 +163,10 @@ class YOLOTrainer:
                 loss_val = float(trainer.loss_items[0]) if hasattr(trainer.loss_items, '__getitem__') else 0
 
             self.progress["current_epoch"] = epoch
+            # epoch 收尾時把百分比校準成「已完成 epoch 數 / 總數」，之後下一個 epoch 的
+            # batch 進度會再從這裡往上疊。
+            total_epochs = self.progress.get("total_epochs") or epoch
+            self.progress["percent"] = round(epoch / total_epochs * 100, 1)
             self.progress["metrics"].append({
                 "epoch": epoch,
                 "map": round(float(map_val), 2),
@@ -142,7 +179,9 @@ class YOLOTrainer:
 
     def train(self, variant="yolov9m.pt", data_yaml="dataset.yaml", epochs=50, imgsz=640, batch=16, patience=50, model_name="exp"):
         print(f"\n🚀 WEB 訓練任務啟動: {variant}")
-        self.progress.update({"status": "training", "total_epochs": epochs, "metrics": [], "current_epoch": 0})
+        self.progress.update({"status": "training", "total_epochs": epochs, "metrics": [], "current_epoch": 0, "percent": 0})
+        self._progress_epoch = -1
+        self._batch_in_epoch = 0
         
         try:
             project_root = Path(__file__).resolve().parent.parent
@@ -179,6 +218,7 @@ class YOLOTrainer:
                 workers=0
             )
             self.progress["status"] = "completed"
+            self.progress["percent"] = 100
         except Exception as e:
             if "USER_STOPPED" in str(e):
                 self.progress["status"] = "stopped"

@@ -326,7 +326,8 @@ async function startTraining() {
                 const statusText = document.getElementById('train-status-text');
                 
                 if (d.status === "training") {
-                    const p = Math.round((d.current_epoch / d.total_epochs) * 100);
+                    // 優先用後端算好的細粒度 percent（epoch 內就會動）；舊資料沒有才退回用 epoch 比例
+                    const p = (d.percent != null) ? Math.round(d.percent) : Math.round((d.current_epoch / d.total_epochs) * 100);
                     progressBar.style.width = `${p}%`;
                     statusText.innerText = `訓練進行中: 第 ${d.current_epoch} / ${d.total_epochs} 輪 (${p}%)`;
                     
@@ -678,6 +679,10 @@ async function consumeAgentStream(res, traceRefs) {
             } else if (payload.type === 'final') {
                 finalReply = payload.reply;
                 if (traceRefs) finishTraceCard(traceRefs, payload.usage, payload.llm_calls);
+                // 這回合 agent 可能把新訓練的模型存進了模型庫（save_offer_gate），重載一次
+                // 下拉選單，剛存的模型不用手動重整頁面就會出現。loadModels 內含 null 防護，
+                // 不在驗證中心頁面時會直接跳過。
+                loadModels();
             } else if (payload.type === 'error') {
                 sawError = true;
                 if (!traceRefs) traceRefs = createTraceCard();
@@ -800,7 +805,9 @@ function renderAgentTrainingCard(d) {
     const refs = agentTrainCardRefs;
     const cur = d.current_epoch || 0;
     const total = d.total_epochs || 0;
-    const pct = total ? Math.round((cur / total) * 100) : 0;
+    // 優先用後端 percent（epoch 內就會動），沒有才退回 epoch 比例——這是修掉「整個 epoch
+    // 卡在 0% 像當掉」的關鍵。
+    const pct = (d.percent != null) ? Math.round(d.percent) : (total ? Math.round((cur / total) * 100) : 0);
     refs.bar.style.width = `${pct}%`;
     refs.text.textContent = `第 ${cur} / ${total} 輪（${pct}%）`;
     const last = (d.metrics && d.metrics.length) ? d.metrics[d.metrics.length - 1] : null;
@@ -1157,12 +1164,13 @@ function renderVerifyResults(results) {
     `).join('');
 }
 async function loadModels() {
+    const select = document.getElementById('verify-model-select');
+    if (!select) return;  // 助手在別的頁面時沒有這個下拉，直接跳過，避免存取 null 出錯
     try {
         const res = await fetch('/api/models');
         const data = await res.json();
-        const select = document.getElementById('verify-model-select');
         const diagSelect = document.getElementById('diagnosis-model-select');
-        
+
         const current = select.value;
         const currentDiag = diagSelect ? diagSelect.value : '';
         
