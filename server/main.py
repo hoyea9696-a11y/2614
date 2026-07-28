@@ -759,6 +759,70 @@ async def agent_boot():
     """回傳這個伺服器行程的啟動識別碼，讓前端判斷是「重新整理」還是「重開終端」。"""
     return {"status": "success", "boot_id": SERVER_BOOT_ID}
 
+
+@app.get("/api/agent/roboflow/readiness")
+async def roboflow_readiness():
+    """回傳 Roboflow 補資料功能的目前資格與原因。
+
+    這是純讀取的診斷 API：不會呼叫 Roboflow、建立 Agent graph 或修改資料集，
+    讓 UI 能在使用者真正觸發訓練前清楚呈現為何會／不會出現補資料提示。
+    """
+    from agent_tools import _count_images, _load_roboflow_key, check_dataset_health
+    from multi_agent import _active_dataset_is_single_class, _active_dataset_name
+    from skills import COVERAGE_GATE
+
+    dataset_name = _active_dataset_name()
+    if not dataset_name:
+        return {
+            "status": "success",
+            "eligible": False,
+            "reason_code": "no_active_dataset",
+            "reason": "尚未選擇目前資料集；Roboflow 下載只會在訓練流程找不到資料集時由 Data Agent 處理。",
+            "api_key_configured": bool(_load_roboflow_key()),
+        }
+
+    dataset_path = DATASET_DIR / dataset_name
+    image_count = _count_images(dataset_path)
+    health = check_dataset_health.invoke({"dataset_name": dataset_name})
+    health_ok = health.get("status") == "success" and (health.get("coverage") or 0) >= COVERAGE_GATE
+    single_class = _active_dataset_is_single_class()
+
+    state = {}
+    state_path = BASE_DIR / "workspace_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    evaluation = (state.get("model") or {}).get("evaluation") or {}
+
+    if not single_class:
+        eligible, reason_code = False, "multi_class_dataset"
+        reason = "目前資料集不是單類別；為避免外部標註被重映射成 class 0，已停用自動 Roboflow 合併。"
+    elif not health_ok:
+        eligible, reason_code = True, "health_gate_failed"
+        reason = "資料集健康檢查未通過；開始訓練後可詢問是否從 Roboflow 補充已標註資料。"
+    elif evaluation.get("passed") is False:
+        eligible, reason_code = True, "eval_gate_failed"
+        reason = "最近一次模型評估未通過；可詢問是否從 Roboflow 補充同類資料後再訓練。"
+    else:
+        eligible, reason_code = False, "gates_passed"
+        reason = "健康檢查與已記錄的評估皆通過，正常流程不會顯示 Roboflow 補資料提示。"
+
+    return {
+        "status": "success",
+        "dataset_name": dataset_name,
+        "image_count": image_count,
+        "health_score": health.get("score"),
+        "coverage": health.get("coverage"),
+        "single_class": single_class,
+        "evaluation_passed": evaluation.get("passed"),
+        "last_map50": ((state.get("model") or {}).get("last_training_metrics") or {}).get("mAP50"),
+        "api_key_configured": bool(_load_roboflow_key()),
+        "eligible": eligible,
+        "reason_code": reason_code,
+        "reason": reason,
+    }
+
 def _get_manager_agent_graph(model_type: str = "gemini"):
     if model_type not in _manager_agent_graphs:
         from manager_agent import get_default_chat_model

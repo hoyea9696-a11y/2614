@@ -366,6 +366,14 @@
                 🔄 開新對話
             </button>
         </div>
+        <details id="roboflow-status-panel" style="display:none; margin: 8px 12px 0; border: 1px solid rgba(56,189,248,0.25); border-radius: 8px; background: rgba(15,23,42,0.55); color: #cbd5e1; font-size: 0.72rem;">
+            <summary style="cursor:pointer; padding:8px 10px; color:#7dd3fc; font-weight:600;">Roboflow 狀態</summary>
+            <div id="roboflow-status-content" style="padding:0 10px 10px; line-height:1.55;">載入中…</div>
+            <div style="display:flex; gap:6px; padding:0 10px 10px;">
+                <button onclick="refreshRoboflowStatus()" style="background:rgba(56,189,248,.12); border:1px solid rgba(56,189,248,.35); color:#7dd3fc; border-radius:6px; padding:4px 8px; font-size:.7rem; cursor:pointer;">重新整理</button>
+                <button onclick="showRoboflowTestPrompt()" style="background:rgba(167,139,250,.12); border:1px solid rgba(167,139,250,.35); color:#c4b5fd; border-radius:6px; padding:4px 8px; font-size:.7rem; cursor:pointer;">模擬補資料提示</button>
+            </div>
+        </details>
         <div id="ai-chat-history"
             style="flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; font-size: 0.9rem;">
             <div
@@ -394,6 +402,18 @@
                     onkeypress="if(event.key === 'Enter') sendChatMessage()">
                 <button onclick="sendChatMessage()"
                     style="background: #3b82f6; border: none; color: white; padding: 0 16px; border-radius: 8px; cursor: pointer; font-weight: 600; height: 100%;">送出</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="agent-confirm-modal" style="display:none; position:fixed; inset:0; z-index:2000; align-items:center; justify-content:center; background:rgba(2,6,23,.72); padding:20px;">
+        <div style="width:min(420px,100%); border:1px solid rgba(96,165,250,.4); border-radius:14px; background:#0f172a; box-shadow:0 20px 55px rgba(0,0,0,.45); padding:18px; color:#e2e8f0;">
+            <div id="agent-confirm-title" style="font-weight:700; font-size:1rem; color:#f8fafc;"></div>
+            <div id="agent-confirm-reason" style="margin-top:10px; color:#cbd5e1; line-height:1.55; font-size:.86rem;"></div>
+            <div id="agent-confirm-meta" style="display:none; margin-top:10px; padding:8px; border-radius:7px; background:rgba(30,41,59,.8); color:#94a3b8; font-size:.74rem; line-height:1.5;"></div>
+            <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:16px;">
+                <button id="agent-confirm-cancel" style="background:rgba(148,163,184,.12); border:1px solid rgba(148,163,184,.3); color:#cbd5e1; border-radius:7px; padding:7px 12px; cursor:pointer;">取消</button>
+                <button id="agent-confirm-approve" style="background:#2563eb; border:1px solid #3b82f6; color:white; border-radius:7px; padding:7px 12px; cursor:pointer;">繼續</button>
             </div>
         </div>
     </div>

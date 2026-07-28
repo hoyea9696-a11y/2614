@@ -471,13 +471,103 @@ window.onload = () => {
 // AI Chat Assistant Logic
 // ------------------------------
 let chatMessages = [];
+let roboflowReadiness = null;
+
+function renderRoboflowStatus(data) {
+    const content = document.getElementById('roboflow-status-content');
+    if (!content) return;
+    if (!data || data.status !== 'success') {
+        content.textContent = '無法讀取 Roboflow 狀態。';
+        return;
+    }
+    const rows = [
+        ['資料集', data.dataset_name || '未選擇'],
+        ['圖片數', data.image_count ?? '—'],
+        ['健康度', data.health_score ?? '—'],
+        ['標註覆蓋率', data.coverage === undefined || data.coverage === null ? '—' : `${data.coverage}%`],
+        ['單類別', data.single_class ? '是' : '否'],
+        ['最近 mAP50', data.last_map50 ?? '—'],
+        ['Roboflow API Key', data.api_key_configured ? '已設定' : '未設定'],
+        ['目前判斷', data.reason || '—'],
+    ];
+    content.innerHTML = rows.map(([label, value]) =>
+        `<div><span style="color:#94a3b8;">${escapeHtml(label)}：</span>${escapeHtml(value)}</div>`
+    ).join('');
+}
+
+async function refreshRoboflowStatus() {
+    const content = document.getElementById('roboflow-status-content');
+    if (content) content.textContent = '讀取中…';
+    try {
+        const res = await fetch('/api/agent/roboflow/readiness');
+        const data = await res.json();
+        roboflowReadiness = data;
+        renderRoboflowStatus(data);
+        return data;
+    } catch (e) {
+        roboflowReadiness = null;
+        if (content) content.textContent = '讀取狀態失敗，請確認伺服器是否啟動。';
+        return null;
+    }
+}
+
+function agentConfirmationTitle(payload) {
+    if (payload && payload.dataset_name) return '要從 Roboflow 補充資料嗎？';
+    if (payload && payload.model_name) return '要將模型加入模型庫嗎？';
+    return '要開始模型訓練嗎？';
+}
+
+function showAgentConfirmation(payload) {
+    return new Promise(resolve => {
+        const modal = document.getElementById('agent-confirm-modal');
+        const title = document.getElementById('agent-confirm-title');
+        const reason = document.getElementById('agent-confirm-reason');
+        const meta = document.getElementById('agent-confirm-meta');
+        const approve = document.getElementById('agent-confirm-approve');
+        const cancel = document.getElementById('agent-confirm-cancel');
+        title.textContent = agentConfirmationTitle(payload);
+        reason.textContent = (payload && payload.reason) || '此操作需要你的確認。';
+        const isRoboflow = Boolean(payload && payload.dataset_name);
+        if (isRoboflow && roboflowReadiness) {
+            meta.style.display = 'block';
+            meta.textContent = `資料集：${roboflowReadiness.dataset_name || payload.dataset_name}\n` +
+                `圖片數：${roboflowReadiness.image_count ?? '—'}；健康度：${roboflowReadiness.health_score ?? '—'}\n` +
+                `條件：${roboflowReadiness.reason || '—'}\n` +
+                '僅會在你確認後才繼續後續流程。';
+        } else {
+            meta.style.display = 'none';
+            meta.textContent = '';
+        }
+        approve.textContent = isRoboflow ? '開始補充' : '繼續';
+        modal.style.display = 'flex';
+        const finish = approved => {
+            modal.style.display = 'none';
+            approve.onclick = null;
+            cancel.onclick = null;
+            resolve(approved);
+        };
+        approve.onclick = () => finish(true);
+        cancel.onclick = () => finish(false);
+    });
+}
+
+async function showRoboflowTestPrompt() {
+    if (!roboflowReadiness) await refreshRoboflowStatus();
+    await showAgentConfirmation({
+        dataset_name: (roboflowReadiness && roboflowReadiness.dataset_name) || '範例資料集',
+        reason: '這是測試提示，不會呼叫 Roboflow、下載資料或恢復 Agent 流程。'
+    });
+}
 
 function onAiModelSelectChange() {
     // Manager Agent 底層要用哪個 LLM，用第二個下拉選單另外選——切到別的選項時就隱藏，
     // 避免使用者以為一般聊天視窗也能選 Manager Agent 的引擎
     const modelType = document.getElementById('ai-model-select').value;
     const engineBar = document.getElementById('manager-agent-engine-bar');
+    const roboflowPanel = document.getElementById('roboflow-status-panel');
     engineBar.style.display = modelType === 'manager-agent' ? 'flex' : 'none';
+    roboflowPanel.style.display = modelType === 'manager-agent' ? 'block' : 'none';
+    if (modelType === 'manager-agent') refreshRoboflowStatus();
 }
 
 function toggleChat() {
@@ -700,11 +790,11 @@ async function consumeAgentStream(res, traceRefs) {
 // confirm() 慣例（跟「終止訓練」「清空快取」同一套模式，不另外做卡片式按鈕 UI）
 // 問使用者要不要繼續，答案立刻送去 /api/agent/resume 接著跑；用迴圈是為了以後
 // 如果同一輪內有不只一個 interrupt 點，也能一樣接住，不用另外改這段邏輯。
-async function finishOrResumeAgentTurn(result, threadId, modelType) {
+async function resumeAgentInterruptsWithModal(result, threadId, modelType) {
     let { traceRefs, finalReply, sawError, interruptPayload } = result;
-
     while (interruptPayload) {
-        const approved = confirm(interruptPayload.reason || "確認要繼續嗎？");
+        if (interruptPayload.dataset_name) await refreshRoboflowStatus();
+        const approved = await showAgentConfirmation(interruptPayload);
         const res = await fetch('/api/agent/resume', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -716,6 +806,12 @@ async function finishOrResumeAgentTurn(result, threadId, modelType) {
         sawError = next.sawError;
         interruptPayload = next.interruptPayload;
     }
+    return { traceRefs, finalReply, sawError, interruptPayload };
+}
+
+async function finishOrResumeAgentTurn(result, threadId, modelType) {
+    result = await resumeAgentInterruptsWithModal(result, threadId, modelType);
+    let { traceRefs, finalReply, sawError, interruptPayload } = result;
 
     if (finalReply !== null) {
         let reply = finalReply;
