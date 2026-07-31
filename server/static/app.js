@@ -485,14 +485,23 @@ function renderRoboflowStatus(data) {
         ['圖片數', data.image_count ?? '—'],
         ['健康度', data.health_score ?? '—'],
         ['標註覆蓋率', data.coverage === undefined || data.coverage === null ? '—' : `${data.coverage}%`],
-        ['單類別', data.single_class ? '是' : '否'],
+        ['類別模式', data.single_class ? '單類別' : '多類別（支援明確名稱對應）'],
         ['最近 mAP50', data.last_map50 ?? '—'],
         ['Roboflow API Key', data.api_key_configured ? '已設定' : '未設定'],
         ['目前判斷', data.reason || '—'],
     ];
-    content.innerHTML = rows.map(([label, value]) =>
+    let html = rows.map(([label, value]) =>
         `<div><span style="color:#94a3b8;">${escapeHtml(label)}：</span>${escapeHtml(value)}</div>`
     ).join('');
+    if (data.latest_operation) {
+        const op = data.latest_operation;
+        html += `<div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(148,163,184,.18);">` +
+            `<div style="color:#7dd3fc; font-weight:600;">最近一次正式合併</div>` +
+            `<div>${escapeHtml(op.source || op.source_url || 'Roboflow')} ・ 新增 ${escapeHtml(op.added_images ?? 0)} 張</div>` +
+            `<div>${escapeHtml(op.before_images ?? '—')} → ${escapeHtml(op.total_images_now ?? '—')} 張</div>` +
+            `</div>`;
+    }
+    content.innerHTML = html;
 }
 
 async function refreshRoboflowStatus() {
@@ -512,9 +521,39 @@ async function refreshRoboflowStatus() {
 }
 
 function agentConfirmationTitle(payload) {
-    if (payload && payload.dataset_name) return '要從 Roboflow 補充資料嗎？';
+    if (payload && payload.action_type === 'roboflow_proposal') return 'Agent 的 Roboflow 評估結果';
     if (payload && payload.model_name) return '要將模型加入模型庫嗎？';
     return '要開始模型訓練嗎？';
+}
+
+function renderRoboflowProposalMeta(proposal) {
+    const candidate = proposal.candidate || {};
+    const mappings = (proposal.class_mapping || []).map(item =>
+        `${escapeHtml(item.source_name)} → ${escapeHtml(item.target_name)}`
+    ).join('<br>');
+    const risks = (proposal.risks || []).length
+        ? (proposal.risks || []).map(item => `• ${escapeHtml(item)}`).join('<br>')
+        : '未發現額外風險';
+    return `
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:7px 12px;">
+            <div><span style="color:#64748b;">目標資料集</span><br><b>${escapeHtml(proposal.dataset_name)}</b></div>
+            <div><span style="color:#64748b;">比較候選</span><br><b>${escapeHtml(proposal.candidate_count || 0)} 個</b></div>
+            <div><span style="color:#64748b;">建議來源</span><br><b>${escapeHtml(candidate.name || candidate.project)}</b></div>
+            <div><span style="color:#64748b;">版本／授權</span><br><b>v${escapeHtml(candidate.version)} ・ ${escapeHtml(candidate.license || '未標示')}</b></div>
+            <div><span style="color:#64748b;">可安全加入</span><br><b style="color:#4ade80;">${escapeHtml(proposal.usable_images)} 張</b></div>
+            <div><span style="color:#64748b;">加入後預估</span><br><b>${escapeHtml(proposal.baseline_images)} → ${escapeHtml(proposal.estimated_total_images)} 張</b></div>
+        </div>
+        <div style="margin-top:10px; padding-top:9px; border-top:1px solid rgba(148,163,184,.18);">
+            <div style="color:#7dd3fc; font-weight:600; margin-bottom:4px;">類別對應</div>
+            ${mappings || '沒有可用的類別對應'}
+        </div>
+        <div style="margin-top:9px;">
+            <div style="color:#fbbf24; font-weight:600; margin-bottom:4px;">跳過與風險</div>
+            <div>無標註 ${escapeHtml(proposal.unlabeled_images || 0)} 張 ・ 無對應 ${escapeHtml(proposal.unmapped_images || 0)} 張 ・ 重複 ${escapeHtml(proposal.duplicate_images || 0)} 張</div>
+            <div style="margin-top:4px;">${risks}</div>
+        </div>
+        ${candidate.url ? `<a href="${escapeHtml(candidate.url)}" target="_blank" rel="noopener" style="display:inline-block; margin-top:9px; color:#60a5fa;">查看 Roboflow 來源 ↗</a>` : ''}
+    `;
 }
 
 function showAgentConfirmation(payload) {
@@ -527,18 +566,15 @@ function showAgentConfirmation(payload) {
         const cancel = document.getElementById('agent-confirm-cancel');
         title.textContent = agentConfirmationTitle(payload);
         reason.textContent = (payload && payload.reason) || '此操作需要你的確認。';
-        const isRoboflow = Boolean(payload && payload.dataset_name);
-        if (isRoboflow && roboflowReadiness) {
+        const isRoboflow = Boolean(payload && payload.action_type === 'roboflow_proposal');
+        if (isRoboflow && payload.proposal) {
             meta.style.display = 'block';
-            meta.textContent = `資料集：${roboflowReadiness.dataset_name || payload.dataset_name}\n` +
-                `圖片數：${roboflowReadiness.image_count ?? '—'}；健康度：${roboflowReadiness.health_score ?? '—'}\n` +
-                `條件：${roboflowReadiness.reason || '—'}\n` +
-                '僅會在你確認後才繼續後續流程。';
+            meta.innerHTML = renderRoboflowProposalMeta(payload.proposal);
         } else {
             meta.style.display = 'none';
-            meta.textContent = '';
+            meta.innerHTML = '';
         }
-        approve.textContent = isRoboflow ? '開始補充' : '繼續';
+        approve.textContent = isRoboflow ? '接受並合併' : '繼續';
         modal.style.display = 'flex';
         const finish = approved => {
             modal.style.display = 'none';
@@ -554,8 +590,22 @@ function showAgentConfirmation(payload) {
 async function showRoboflowTestPrompt() {
     if (!roboflowReadiness) await refreshRoboflowStatus();
     await showAgentConfirmation({
+        action_type: 'roboflow_proposal',
         dataset_name: (roboflowReadiness && roboflowReadiness.dataset_name) || '範例資料集',
-        reason: '這是測試提示，不會呼叫 Roboflow、下載資料或恢復 Agent 流程。'
+        reason: '這是介面預覽，不會呼叫 Roboflow、下載資料或修改正式資料集。',
+        proposal: {
+            dataset_name: (roboflowReadiness && roboflowReadiness.dataset_name) || 'bear',
+            candidate_count: 3,
+            candidate: { name: 'Bear Detection', project: 'bear-demo', version: 3, license: 'CC BY 4.0', url: 'https://universe.roboflow.com/' },
+            usable_images: 110,
+            baseline_images: (roboflowReadiness && roboflowReadiness.image_count) || 234,
+            estimated_total_images: ((roboflowReadiness && roboflowReadiness.image_count) || 234) + 110,
+            class_mapping: [{ source_name: 'Bear', target_name: 'Bear' }],
+            unlabeled_images: 4,
+            unmapped_images: 8,
+            duplicate_images: 12,
+            risks: ['未對應類別將跳過：Polar-bear', '12 張重複圖片將跳過']
+        }
     });
 }
 
@@ -1041,7 +1091,26 @@ function renderTraceStepHtml(step, index) {
     if (step.tool_calls && step.tool_calls.length) {
         inner += step.tool_calls.map(tc => {
             if (tc.tool) {
+                if (tc.tool === 'prepare_roboflow_augmentation') {
+                    return `<div style="color:#7dd3fc;">🔎 Data Agent 正在搜尋 Roboflow 候選並下載到暫存區評估…</div>`;
+                }
+                if (tc.tool === 'search_roboflow_universe') {
+                    return `<div style="color:#7dd3fc;">🌐 正在查詢 Roboflow Universe：${escapeHtml(tc.args.query || '')}</div>`;
+                }
                 return `<div>🔧 呼叫工具：<b>${escapeHtml(tc.tool)}</b>（${escapeHtml(JSON.stringify(tc.args))}）</div>`;
+            }
+            if (tc.tool_result === 'prepare_roboflow_augmentation') {
+                let result = tc.output;
+                if (typeof result === 'string') {
+                    try { result = JSON.parse(result); } catch (e) { result = null; }
+                }
+                if (result && result.status === 'proposal_ready') {
+                    const candidate = result.candidate || {};
+                    return `<div style="margin-top:5px; padding:7px; border-radius:6px; background:rgba(14,116,144,.13); color:#bae6fd;">` +
+                        `✅ 暫存評估完成：比較 ${escapeHtml(result.candidate_count || 0)} 個候選，建議 ` +
+                        `<b>${escapeHtml(candidate.name || candidate.project)}</b> v${escapeHtml(candidate.version)}；` +
+                        `可安全加入 ${escapeHtml(result.usable_images)} 張。等待最後確認，不會先修改正式資料集。</div>`;
+                }
             }
             return `<div>📥 工具回傳（${escapeHtml(tc.tool_result)}）：${escapeHtml(typeof tc.output === 'string' ? tc.output : JSON.stringify(tc.output))}</div>`;
         }).join('');

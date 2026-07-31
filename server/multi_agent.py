@@ -60,10 +60,26 @@ WORKSPACE_STATE_PATH = PROJECT_ROOT / "workspace_state.json"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from agent_tools import check_dataset_health, import_images_to_dataset, download_roboflow_dataset, augment_dataset_from_roboflow, DATASET_DIR, _count_images
+from agent_tools import (
+    DATASET_DIR,
+    _count_images,
+    apply_roboflow_proposal,
+    check_dataset_health,
+    discard_roboflow_proposal,
+    download_roboflow_dataset,
+    import_images_to_dataset,
+    prepare_roboflow_augmentation,
+    search_roboflow_universe,
+)
 from skills import skill_train, skill_infer, skill_eval
 
-DATA_TOOLS = [check_dataset_health, import_images_to_dataset, download_roboflow_dataset, augment_dataset_from_roboflow]
+DATA_TOOLS = [
+    check_dataset_health,
+    import_images_to_dataset,
+    download_roboflow_dataset,
+    search_roboflow_universe,
+    prepare_roboflow_augmentation,
+]
 MODEL_TOOLS = [skill_train, skill_infer]
 EVAL_TOOLS = [skill_eval]
 
@@ -93,16 +109,17 @@ DATA_AGENT_PROMPT = """你是 Data Agent，只負責資料集相關的任務，�
    temp_verify/），且本機資料集還沒有圖片時，呼叫 import_images_to_dataset 把這些
    圖片匯入。這個工具只搬圖片、不會產生標記檔，匯入後健康度是 0% 標記率是正常現象，
    不用因此判定失敗。
-3. 本機、使用者提供的路徑都沒有圖片可用時，才呼叫 download_roboflow_dataset 從
-   Roboflow Universe 下載補齊：自己猜最符合的 workspace/project slug，猜錯
-   （status=not_found）就換一個再試，最多嘗試 3 次，全部失敗才回報無法補齊。
-4. 收到「資料集樣本不足、分數偏低，請合併更多圖片進去擴充」這類指示時（資料集已經
-   存在、只是不夠好），改呼叫 augment_dataset_from_roboflow：猜一個同類主題的公開
-   資料集 slug，把它的已標記圖片合併進指定的現有資料集，not_found 就換一個再試（最多
-   3 次）。這跟 download_roboflow_dataset 不同——那是建新資料集，這是往現有資料集疊加。
-   重要：這個工具會把合併進來的標籤全部改成單一類別（class 0），只適合「單一類別偵測」；
-   多類別資料集不要用它，否則類別會對不上、標籤變無效——多類別要補資料只能由使用者
-   自己標記或手動併入對得上類別的資料。
+3. 本機、使用者提供的路徑都沒有圖片可用，而且使用者確實要建立全新資料集時，才呼叫
+   download_roboflow_dataset。先用 search_roboflow_universe 取得真實候選，不要猜
+   workspace/project slug。
+4. 收到「尋找 Roboflow 資料並評估」「資料集樣本不足」「分數偏低，找外部資料補強」
+   這類指示時，呼叫 prepare_roboflow_augmentation。它會自行搜尋候選、下載到暫存區，
+   檢查實際類別對應、重複圖片和可用標註，完全不會修改正式資料集。回傳
+   status="proposal_ready" 時，把 proposal_id、來源、可用圖片數、類別對應與風險完整
+   寫進 reason，然後 status="success" 回報 Manager。不要呼叫任何正式合併工具；
+   Manager 會把評估結果交給使用者，只有使用者最後確認後才套用。
+5. 多類別資料集可以準備 Roboflow 評估，但只能接受名稱能明確對應的類別；沒有對應的
+   外部類別必須跳過，不能把所有標籤硬改成 class 0。
 
 完成後一定要呼叫 report_to_manager 回報結果：本機、上傳、Roboflow 都找不到資料就
 status="blocked"、reason_code="dataset_not_found"；其他情況成功就 status="success"，
@@ -171,9 +188,9 @@ MANAGER_SYSTEM_PROMPT = """你是 Manager Agent，系統唯一的決策者。你
 - action="ask_user"：需要使用者提供更多資訊才能繼續，final_reply 填入要問使用者的問題
 
 Roboflow workspace/project slug、確切下載網址這類技術細節，是 data_agent 自己的職責
-（它會自己猜、猜錯再換一個試），不算「缺資訊」——Plan 已經把某個步驟指派給某個子
-Agent 時，直接呼叫那個子 Agent 讓它自己想辦法，不要因為使用者沒有提供這些技術細節
-就選 ask_user。action="ask_user" 只留給子 Agent 已經回報卡住（例如 blocked/
+（它會透過 Roboflow Universe Search API 搜尋並在暫存區評估），不算「缺資訊」——Plan
+已經把某個步驟指派給某個子 Agent 時，直接呼叫那個子 Agent，不要因為使用者沒有提供
+這些技術細節就選 ask_user。action="ask_user" 只留給子 Agent 已經回報卡住（例如 blocked/
 dataset_not_found 重試上限用完），且需要使用者提供只有人類才知道的資訊
 （例如使用者自己要驗證的圖片檔案本身）時才用。
 
@@ -325,6 +342,8 @@ class SupervisorState(TypedDict):
     # 增強當下的圖片數，用來判斷之後資料到底有沒有真的長大（有長大才值得再重訓）。
     augment_offered: bool
     augment_baseline_count: Optional[int]
+    roboflow_proposal: Optional[dict]
+    roboflow_proposal_handled: bool
 
 
 def _build_sub_agent(chat_model, tools, system_prompt):
@@ -439,6 +458,20 @@ def _extract_trained_model_name(new_messages: list) -> Optional[str]:
             data = _parse_tool_content(m.content)
             if data.get("status") == "completed":
                 return data.get("model_name")
+    return None
+
+
+def _extract_roboflow_proposal(new_messages: list) -> Optional[dict]:
+    """從 Data Agent 的工具結果取出已完成的暫存評估，交給確認 Gate 顯示。
+
+    不依賴 LLM 是否把 proposal_id 正確複述在 report_to_manager 裡；真正的工具回傳
+    才是結構化事實來源。
+    """
+    for message in new_messages:
+        if isinstance(message, ToolMessage) and message.name == "prepare_roboflow_augmentation":
+            data = _parse_tool_content(message.content)
+            if data.get("status") == "proposal_ready" and data.get("proposal_id"):
+                return data
     return None
 
 
@@ -684,43 +717,44 @@ def build_multi_agent(chat_model):
         last_report = state.get("last_report") or {}
         reason_code = last_report.get("reason_code") or ""
 
-        # 分數不夠（資料集健康度不足／訓練後 mAP 太低）時的止血 + 增強邏輯：
-        # 資料沒變的話，重訓／重查一定得到一樣的結果，別再空轉。第一次先問使用者要不要
-        # 從 Roboflow 抓同類資料合併進來（augment_gate）；使用者已經拒絕、或增強過但資料
-        # 沒真的長大，就誠實結束，不落到下面的 GATE_ROUTING 一直重試。
+        # Data Agent 已經完成 Roboflow 搜尋與暫存評估時，先呈現完整 proposal；
+        # 使用者確認前絕不修改正式資料集。
+        proposal = state.get("roboflow_proposal")
+        if proposal and not state.get("roboflow_proposal_handled"):
+            return {
+                "next": "augment_gate",
+                "rounds": rounds,
+                "retry_counters": retry_counters,
+            }
+
+        # 分數不夠時先讓 Data Agent 自動搜尋、下載到暫存區並評估，不先打擾使用者。
+        # 搜尋完成後會由上面的 proposal 分支進入最後確認；找不到相容候選才結束。
         if reason_code in AUGMENTABLE_GATES:
             ds_name = _active_dataset_name()
-            cur_count = _count_images(DATASET_DIR / ds_name) if ds_name else 0
-            baseline = state.get("augment_baseline_count")
-            grew = baseline is not None and cur_count > baseline
-            if not grew:
-                # 只有『單一類別偵測』才提議去 Roboflow 增強——augment 工具會把合併進來的
-                # 標籤全改成 class 0，多類別用了只會污染類別；而且盲猜 slug 幾乎猜不中，
-                # 繞下去只是空轉。多類別（或已經問過）就誠實停下來給對的建議，不再輪迴。
-                if not state.get("augment_offered") and _active_dataset_is_single_class():
-                    return {
-                        "next": "augment_gate",
-                        "rounds": rounds,
-                        "retry_counters": retry_counters,
-                        "augment_baseline_count": cur_count,
-                    }
-                if _active_dataset_is_single_class():
-                    advice = "建議補更多已標記的圖片、或改用別的資料集後再試。"
-                else:
-                    advice = ("這是多類別資料集，分數偏低通常是某些類別樣本太少。請針對『樣本"
-                              "數過少的類別』補齊已標記圖片，或減少類別數後再訓練；不建議用自動"
-                              "Roboflow 合併（那會把類別對不上）。")
+            if ds_name and not state.get("augment_offered"):
+                instruction = HumanMessage(content=(
+                    f"資料集「{ds_name}」因 {reason_code} 需要補強。請呼叫 "
+                    f"prepare_roboflow_augmentation 自動搜尋 Roboflow Universe 候選，下載到"
+                    f"暫存區並評估類別對應、重複圖片、可用標註與風險。不要修改正式資料集；"
+                    f"完成後把 proposal 結果回報給 Manager，等待使用者最後確認。"
+                ))
                 return {
-                    "next": "FINISH",
+                    "next": "data_agent",
                     "rounds": rounds,
                     "retry_counters": retry_counters,
-                    "messages": [AIMessage(
-                        content="模型分數偏低，而且資料集沒有增加新的樣本，再訓練結果也會一樣。"
-                                f"{advice}（{last_report.get('reason', '')}）"
-                    )],
+                    "augment_baseline_count": _count_images(DATASET_DIR / ds_name),
+                    "augment_offered": True,
+                    "messages": [instruction],
                 }
-            # grew == True：增強已經補進新樣本，落到下面既有的 GATE_ROUTING 邏輯，
-            # 讓它照常去重訓（model_agent）/重查（data_agent），這次是在更多資料上重訓。
+            return {
+                "next": "FINISH",
+                "rounds": rounds,
+                "retry_counters": retry_counters,
+                "messages": [AIMessage(
+                    content="Agent 已嘗試搜尋並評估 Roboflow 候選，但沒有找到能安全對應目前"
+                            f"類別的可用資料。原始原因：{last_report.get('reason', '')}"
+                )],
+            }
 
         # 已知 Gate 失敗類型：固定規則直接決定，不問 LLM。
         if reason_code in GATE_ROUTING:
@@ -787,7 +821,12 @@ def build_multi_agent(chat_model):
         return {"messages": new_messages, "last_report": report}
 
     def run_data_agent(state: SupervisorState) -> dict:
-        return _run_sub_agent("data_agent", data_agent, state)
+        result = _run_sub_agent("data_agent", data_agent, state)
+        proposal = _extract_roboflow_proposal(result["messages"])
+        if proposal:
+            result["roboflow_proposal"] = proposal
+            result["roboflow_proposal_handled"] = False
+        return result
 
     def run_model_agent(state: SupervisorState) -> dict:
         result = _run_sub_agent("model_agent", model_agent, state)
@@ -821,30 +860,52 @@ def build_multi_agent(chat_model):
         return {"model_save_offered": True, "messages": [AIMessage(content=note)]}
 
     def augment_gate(state: SupervisorState) -> dict:
-        """分數不夠、且資料沒變時的增強確認關卡：用 interrupt() 問使用者要不要從
-        Roboflow 抓同類主題的公開資料集、合併更多已標記圖片進目前的資料集再訓練一次
-        （跟 train_confirm_gate 同一套確認模式，前端沿用既有的 interrupt→confirm→
-        resume 流程，不用改）。同意就丟一則指示給 data_agent 去執行合併；拒絕就結束。"""
-        ds_name = _active_dataset_name() or "目前的資料集"
+        """Data Agent 搜尋與暫存評估完成後的唯一人工確認點。
+
+        interrupt payload 直接帶完整 proposal，使用者看得到來源、版本、授權、類別
+        對應、可用與跳過數量。確認後才套用；拒絕就刪除暫存資料。
+        """
+        proposal = state.get("roboflow_proposal") or {}
+        proposal_id = proposal.get("proposal_id")
+        if not proposal_id:
+            return {
+                "next": "FINISH",
+                "roboflow_proposal_handled": True,
+                "messages": [AIMessage(content="Roboflow 評估結果遺失，沒有修改正式資料集。")],
+            }
+        candidate = proposal.get("candidate") or {}
         resume = interrupt({
-            "reason": f"資料集「{ds_name}」的樣本可能不足，導致分數偏低。要不要從 Roboflow "
-                      f"抓一份同類主題的公開資料集，把更多已標記圖片合併進「{ds_name}」再訓練一次？"
-                      f"（僅適合單一類別偵測；合併進來的標籤會一律當成同一類）",
-            "dataset_name": ds_name,
+            "action_type": "roboflow_proposal",
+            "reason": (
+                f"Agent 已搜尋並實際檢查 {proposal.get('candidate_count', 0)} 個候選，"
+                f"建議使用「{candidate.get('name', candidate.get('project', 'Roboflow 資料集'))}」。"
+                "以下資料已在暫存區完成驗證；接受後才會寫入正式資料集。"
+            ),
+            "dataset_name": proposal.get("dataset_name"),
+            "proposal": proposal,
         })
         if isinstance(resume, dict) and resume.get("approved"):
-            instruction = HumanMessage(content=(
-                f"資料集「{ds_name}」樣本不足、分數偏低。請呼叫 augment_dataset_from_roboflow，"
-                f"從 Roboflow Universe 猜一個『同類主題』的公開資料集（workspace/project slug），"
-                f"把它的已標記圖片合併進「{ds_name}」擴充樣本。回傳 not_found 就換一個猜測再試，"
-                f"最多 3 次；成功後回報新增了幾張圖片。"
-            ))
-            return {"next": "data_agent", "augment_offered": True, "messages": [instruction]}
+            result = apply_roboflow_proposal.invoke({"proposal_id": proposal_id})
+            if result.get("status") == "success":
+                note = (
+                    f"已從 {result.get('source')} 合併 {result.get('added_images', 0)} 張圖片到"
+                    f"「{result.get('dataset_name')}」，圖片數由 {result.get('before_images')} 增加到"
+                    f" {result.get('total_images_now')}。未自動啟動訓練；你可以先檢查資料，再決定是否重訓。"
+                )
+            else:
+                note = f"Roboflow 合併沒有完成：{result.get('message') or result.get('status')}。"
+            return {
+                "next": "FINISH",
+                "augment_offered": True,
+                "roboflow_proposal_handled": True,
+                "messages": [AIMessage(content=note)],
+            }
+        discard_roboflow_proposal(proposal_id)
         return {
             "next": "FINISH",
             "augment_offered": True,
-            "messages": [AIMessage(content=f"好的，這次先不從 Roboflow 補資料。你可以自己補更多已標記圖片，"
-                                           f"或改用別的資料集，再重新訓練「{ds_name}」。")],
+            "roboflow_proposal_handled": True,
+            "messages": [AIMessage(content="已拒絕這份 Roboflow 建議並刪除暫存資料，正式資料集沒有變更。")],
         }
 
     def run_evaluation_agent(state: SupervisorState) -> dict:
@@ -951,6 +1012,8 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                 "model_save_offered": False,
                 "augment_offered": False,
                 "augment_baseline_count": None,
+                "roboflow_proposal": None,
+                "roboflow_proposal_handled": False,
             }
         total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         llm_calls = 0

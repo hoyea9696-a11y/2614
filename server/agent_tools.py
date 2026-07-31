@@ -7,16 +7,22 @@ ai_analyzer.py 的既有邏輯，也不涉及任何 LLM 呼叫。
 
 Manager Agent 本身（何時呼叫、要不要呼叫）留給 Step 3 的 PR。
 """
+import hashlib
 import io
+import json
 import os
+import re
 import shutil
 import sys
+import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 
 import cv2
 import requests
+import yaml
 from pydantic import Field
 from langchain_core.tools import tool
 
@@ -33,6 +39,9 @@ DATASET_DIR = PROJECT_ROOT / "data" / "datasets"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "outputs"
 
 ROBOFLOW_EXPORT_FORMAT = "yolov5pytorch"  # Roboflow 沒有獨立的 yolov9 匯出格式，但輸出的 YOLO txt 格式跟 ultralytics 相容
+ROBOFLOW_PROPOSAL_DIR = PROJECT_ROOT / "temp_training" / "roboflow_proposals"
+ROBOFLOW_HISTORY_PATH = PROJECT_ROOT / "data" / "roboflow_history.json"
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
 # 全系統唯一一個 YOLOTrainer 實例——train_yolo_model（Agent 用）跟 main.py 的
 # /api/train/start /api/train/stop（網頁表單用）都共用這一個物件，兩邊的
@@ -105,6 +114,218 @@ def _load_roboflow_key() -> Optional[str]:
                 if line.startswith("ROBOFLOW_API_KEY="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
     return None
+
+
+def _normalize_class_name(name: str) -> str:
+    """轉成可安全比對的類別名稱；只做明確比對，不用模糊猜測污染標籤。"""
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def _read_dataset_class_names(root: Path) -> list[str]:
+    """從 YOLO data.yaml 或常見 class name 檔案讀取類別名稱。"""
+    yaml_candidates = [root / "data.yaml", root / "dataset.yaml"]
+    yaml_candidates.extend(root.glob("*.yaml"))
+    yaml_candidates.extend(root.glob("*.yml"))
+    for path in yaml_candidates:
+        if not path.exists():
+            continue
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            names = data.get("names")
+            if isinstance(names, list):
+                return [str(name) for name in names]
+            if isinstance(names, dict):
+                return [str(names[key]) for key in sorted(names, key=lambda value: int(value))]
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            continue
+    for filename in ("classes.txt", "_classes.txt", "obj.names"):
+        for path in root.rglob(filename):
+            try:
+                names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                if names:
+                    return names
+            except OSError:
+                continue
+    return []
+
+
+def _label_path_for_image(image_path: Path) -> Path:
+    if image_path.parent.name == "images":
+        return image_path.parent.parent / "labels" / f"{image_path.stem}.txt"
+    return image_path.with_suffix(".txt")
+
+
+def _image_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _existing_image_hashes(root: Path) -> set[str]:
+    hashes = set()
+    if not root.exists():
+        return hashes
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            try:
+                hashes.add(_image_hash(path))
+            except OSError:
+                continue
+    return hashes
+
+
+def _parse_roboflow_candidate(raw: dict) -> Optional[dict]:
+    workspace = raw.get("workspace") or {}
+    workspace_slug = workspace.get("url") if isinstance(workspace, dict) else workspace
+    universe_url = str(raw.get("url") or "").rstrip("/")
+    project_slug = universe_url.rsplit("/", 1)[-1] if "/" in universe_url else ""
+    version = raw.get("latestVersion")
+    if not workspace_slug or not project_slug:
+        return None
+    try:
+        version = int(version) if version is not None else None
+    except (TypeError, ValueError):
+        version = None
+    return {
+        "name": raw.get("name") or project_slug,
+        "workspace": str(workspace_slug),
+        "project": project_slug,
+        "version": version,
+        "url": universe_url,
+        "type": raw.get("type"),
+        "classes": [str(name) for name in (raw.get("classes") or [])],
+        "images": int(raw.get("images") or 0),
+        "license": raw.get("license") or "未標示",
+        "stars": int(raw.get("stars") or 0),
+        "downloads": int(raw.get("downloads") or 0),
+    }
+
+
+def _search_roboflow_universe(query: str, max_results: int = 8) -> dict:
+    api_key = _load_roboflow_key()
+    if not api_key:
+        return {"status": "error", "message": "未設定 ROBOFLOW_API_KEY，無法搜尋 Roboflow Universe"}
+    try:
+        response = requests.get(
+            "https://api.roboflow.com/universe/search",
+            params={"q": query, "api_key": api_key, "page": 1},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        return {"status": "error", "message": f"Roboflow Universe 搜尋失敗：{exc}"}
+    if not response.ok:
+        return {
+            "status": "error",
+            "message": f"Roboflow Universe 搜尋失敗（HTTP {response.status_code}）：{response.text[:200]}",
+        }
+    candidates = []
+    for raw in (response.json().get("results") or []):
+        candidate = _parse_roboflow_candidate(raw)
+        if candidate:
+            candidates.append(candidate)
+        if len(candidates) >= max(1, min(max_results, 20)):
+            break
+    return {"status": "success", "query": query, "candidates": candidates}
+
+
+def _download_roboflow_export(workspace: str, project: str, version: int, destination: Path) -> dict:
+    api_key = _load_roboflow_key()
+    if not api_key:
+        return {"status": "error", "message": "未設定 ROBOFLOW_API_KEY，無法下載"}
+    export_url = (
+        f"https://api.roboflow.com/{workspace}/{project}/{version}/{ROBOFLOW_EXPORT_FORMAT}"
+        f"?api_key={api_key}"
+    )
+    try:
+        response = requests.get(export_url, timeout=30)
+    except requests.RequestException as exc:
+        return {"status": "error", "message": f"取得 Roboflow 匯出連結失敗：{exc}"}
+    if response.status_code == 404:
+        return {"status": "not_found", "message": f"找不到 {workspace}/{project} 第 {version} 版"}
+    if not response.ok:
+        return {
+            "status": "error",
+            "message": f"Roboflow 回應錯誤（HTTP {response.status_code}）：{response.text[:200]}",
+        }
+    link = response.json().get("export", {}).get("link")
+    if not link:
+        return {"status": "error", "message": "Roboflow 回應中沒有資料集下載連結"}
+    try:
+        archive = requests.get(link, timeout=120)
+        archive.raise_for_status()
+        destination.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(archive.content)) as zf:
+            _safe_extract_zip(zf, destination)
+    except (requests.RequestException, zipfile.BadZipFile, ValueError) as exc:
+        return {"status": "error", "message": f"Roboflow 資料下載或解壓失敗：{exc}"}
+    return {"status": "success"}
+
+
+def _proposal_path(proposal_id: str) -> Path:
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(proposal_id))
+    if not safe_id or safe_id != proposal_id:
+        raise ValueError("Roboflow proposal_id 格式不正確")
+    return ROBOFLOW_PROPOSAL_DIR / safe_id
+
+
+def _load_roboflow_proposal(proposal_id: str) -> dict:
+    proposal_file = _proposal_path(proposal_id) / "proposal.json"
+    if not proposal_file.exists():
+        return {"status": "error", "message": "找不到這份 Roboflow 評估結果，可能已過期"}
+    try:
+        return json.loads(proposal_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"status": "error", "message": "Roboflow 評估結果無法讀取"}
+
+
+def _save_roboflow_proposal(proposal: dict) -> None:
+    proposal_root = _proposal_path(proposal["proposal_id"])
+    proposal_root.mkdir(parents=True, exist_ok=True)
+    (proposal_root / "proposal.json").write_text(
+        json.dumps(proposal, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _append_roboflow_history(record: dict) -> None:
+    history = []
+    try:
+        history = json.loads(ROBOFLOW_HISTORY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(history, list):
+            history = []
+    except (OSError, json.JSONDecodeError):
+        pass
+    history.append(record)
+    ROBOFLOW_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ROBOFLOW_HISTORY_PATH.write_text(
+        json.dumps(history[-100:], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def get_latest_roboflow_operation(dataset_name: Optional[str] = None) -> Optional[dict]:
+    try:
+        history = json.loads(ROBOFLOW_HISTORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(history, list):
+        return None
+    for record in reversed(history):
+        if not dataset_name or record.get("dataset_name") == dataset_name:
+            return record
+    return None
+
+
+def discard_roboflow_proposal(proposal_id: str) -> dict:
+    try:
+        proposal_root = _proposal_path(proposal_id)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+    if proposal_root.exists():
+        shutil.rmtree(proposal_root, ignore_errors=True)
+    return {"status": "discarded", "proposal_id": proposal_id}
 
 
 @tool
@@ -248,6 +469,280 @@ def run_yolo_inference(
 
 
 @tool
+def search_roboflow_universe(
+    query: Annotated[str, Field(description="要在 Roboflow Universe 搜尋的主題，例如 bear object detection")],
+    max_results: Annotated[int, Field(description="最多回傳幾個候選資料集，範圍 1 到 20")] = 8,
+) -> dict:
+    """真正呼叫 Roboflow Universe Search API 搜尋公開資料集，不再猜 workspace/project slug。
+
+    只讀取候選資料集的公開摘要，不下載、不解壓，也不修改目前資料集。
+    """
+    return _search_roboflow_universe(query, max_results)
+
+
+@tool
+def prepare_roboflow_augmentation(
+    dataset_name: Annotated[str, Field(description="要補強的本機資料集名稱")],
+    query: Annotated[Optional[str], Field(description="搜尋主題；留空時使用資料集名稱加 object detection")] = None,
+    max_candidates: Annotated[int, Field(description="要比較的候選數量，範圍 1 到 10")] = 5,
+) -> dict:
+    """搜尋 Roboflow 候選、挑選相容者並下載到暫存區完成評估。
+
+    這個工具不會修改正式資料集。它會檢查實際匯出內容、類別對應、重複圖片與可用
+    標註，回傳一份 proposal；只有使用者之後確認 proposal，才會正式合併。
+    """
+    try:
+        dataset_name = _sanitize_name(dataset_name)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+    dataset_root = DATASET_DIR / dataset_name
+    if _count_images(dataset_root) == 0:
+        return {"status": "error", "message": f"資料集 {dataset_name} 不存在或沒有圖片"}
+    local_classes = _read_dataset_class_names(dataset_root)
+    if not local_classes:
+        return {"status": "error", "message": f"資料集 {dataset_name} 沒有可辨識的類別名稱，無法安全對應"}
+
+    search_query = (query or f"{dataset_name} object detection").strip()
+    search = _search_roboflow_universe(search_query, max(1, min(max_candidates, 10)))
+    if search.get("status") != "success":
+        return search
+    candidates = [
+        item for item in search.get("candidates", [])
+        if item.get("type") == "object-detection" and item.get("version")
+    ]
+    local_normalized = {_normalize_class_name(name): index for index, name in enumerate(local_classes)}
+
+    def candidate_score(item: dict) -> tuple:
+        overlaps = sum(1 for name in item.get("classes", []) if _normalize_class_name(name) in local_normalized)
+        has_license = item.get("license") not in (None, "", "未標示")
+        return (
+            overlaps > 0,
+            overlaps,
+            has_license,
+            min(item.get("images", 0), 2000),
+            item.get("stars", 0),
+        )
+
+    candidates.sort(key=candidate_score, reverse=True)
+    candidate_summaries = candidates[:]
+    existing_hashes = _existing_image_hashes(dataset_root)
+
+    for candidate in candidates:
+        proposal_id = uuid.uuid4().hex
+        proposal_root = _proposal_path(proposal_id)
+        staged_root = proposal_root / "dataset"
+        download = _download_roboflow_export(
+            candidate["workspace"],
+            candidate["project"],
+            candidate["version"],
+            staged_root,
+        )
+        if download.get("status") != "success":
+            shutil.rmtree(proposal_root, ignore_errors=True)
+            continue
+
+        source_classes = _read_dataset_class_names(staged_root)
+        class_mapping = []
+        mapping_by_id = {}
+        for source_id, source_name in enumerate(source_classes):
+            target_id = local_normalized.get(_normalize_class_name(source_name))
+            if target_id is None:
+                continue
+            mapping_by_id[source_id] = target_id
+            class_mapping.append({
+                "source_id": source_id,
+                "source_name": source_name,
+                "target_id": target_id,
+                "target_name": local_classes[target_id],
+            })
+        if not class_mapping:
+            shutil.rmtree(proposal_root, ignore_errors=True)
+            continue
+
+        usable_images = 0
+        unlabeled_images = 0
+        unmapped_images = 0
+        duplicate_images = 0
+        seen_hashes = set(existing_hashes)
+        for image in staged_root.rglob("*"):
+            if not (image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS):
+                continue
+            label_path = _label_path_for_image(image)
+            if not label_path.exists() or label_path.stat().st_size == 0:
+                unlabeled_images += 1
+                continue
+            mapped_lines = 0
+            for line in label_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = line.split()
+                try:
+                    source_id = int(parts[0])
+                except (IndexError, ValueError):
+                    continue
+                if len(parts) >= 5 and source_id in mapping_by_id:
+                    mapped_lines += 1
+            if mapped_lines == 0:
+                unmapped_images += 1
+                continue
+            try:
+                digest = _image_hash(image)
+            except OSError:
+                continue
+            if digest in seen_hashes:
+                duplicate_images += 1
+                continue
+            seen_hashes.add(digest)
+            usable_images += 1
+
+        if usable_images == 0:
+            shutil.rmtree(proposal_root, ignore_errors=True)
+            continue
+
+        risks = []
+        unmapped_classes = [name for index, name in enumerate(source_classes) if index not in mapping_by_id]
+        if unmapped_classes:
+            risks.append(f"未對應類別將跳過：{', '.join(unmapped_classes)}")
+        if duplicate_images:
+            risks.append(f"{duplicate_images} 張重複圖片將跳過")
+        if candidate.get("license") == "未標示":
+            risks.append("來源未標示授權，合併前請自行確認使用權")
+
+        proposal = {
+            "status": "proposal_ready",
+            "proposal_id": proposal_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "dataset_name": dataset_name,
+            "query": search_query,
+            "candidate": candidate,
+            "candidate_count": len(candidates),
+            "candidate_summaries": candidate_summaries,
+            "local_classes": local_classes,
+            "source_classes": source_classes,
+            "class_mapping": class_mapping,
+            "baseline_images": _count_images(dataset_root),
+            "usable_images": usable_images,
+            "unlabeled_images": unlabeled_images,
+            "unmapped_images": unmapped_images,
+            "duplicate_images": duplicate_images,
+            "estimated_total_images": _count_images(dataset_root) + usable_images,
+            "risks": risks,
+        }
+        _save_roboflow_proposal(proposal)
+        return proposal
+
+    return {
+        "status": "no_compatible_candidates",
+        "message": "找到候選資料集，但沒有任何候選同時具備可下載版本、可明確對應的類別與可用標註。",
+        "query": search_query,
+        "candidates": candidate_summaries,
+        "local_classes": local_classes,
+    }
+
+
+@tool
+def apply_roboflow_proposal(
+    proposal_id: Annotated[str, Field(description="prepare_roboflow_augmentation 產生的 proposal_id")],
+) -> dict:
+    """使用者確認後，才把已評估的 Roboflow 暫存資料正式合併進目標資料集。"""
+    try:
+        proposal = _load_roboflow_proposal(proposal_id)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+    if proposal.get("status") != "proposal_ready":
+        return proposal if proposal.get("status") == "error" else {
+            "status": "error",
+            "message": "這份 Roboflow 評估已經處理過，不能重複套用",
+        }
+    dataset_name = proposal["dataset_name"]
+    dataset_root = DATASET_DIR / dataset_name
+    staged_root = _proposal_path(proposal_id) / "dataset"
+    if _count_images(dataset_root) == 0 or not staged_root.exists():
+        return {"status": "error", "message": "正式資料集或 Roboflow 暫存資料已不存在"}
+
+    if (dataset_root / "train" / "images").exists():
+        image_destination = dataset_root / "train" / "images"
+        label_destination = dataset_root / "train" / "labels"
+    else:
+        image_destination = dataset_root / "images"
+        label_destination = dataset_root / "labels"
+    image_destination.mkdir(parents=True, exist_ok=True)
+    label_destination.mkdir(parents=True, exist_ok=True)
+
+    mapping_by_id = {
+        int(item["source_id"]): int(item["target_id"])
+        for item in proposal.get("class_mapping", [])
+    }
+    existing_hashes = _existing_image_hashes(dataset_root)
+    prefix = _sanitize_name(proposal["candidate"]["project"])
+    added = 0
+    skipped = 0
+    for image in staged_root.rglob("*"):
+        if not (image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS):
+            continue
+        label_path = _label_path_for_image(image)
+        if not label_path.exists():
+            skipped += 1
+            continue
+        remapped = []
+        for line in label_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split()
+            try:
+                source_id = int(parts[0])
+            except (IndexError, ValueError):
+                continue
+            if len(parts) >= 5 and source_id in mapping_by_id:
+                parts[0] = str(mapping_by_id[source_id])
+                remapped.append(" ".join(parts))
+        if not remapped:
+            skipped += 1
+            continue
+        try:
+            digest = _image_hash(image)
+        except OSError:
+            skipped += 1
+            continue
+        if digest in existing_hashes:
+            skipped += 1
+            continue
+        existing_hashes.add(digest)
+
+        destination = image_destination / f"{prefix}_{image.name}"
+        suffix_index = 1
+        while destination.exists():
+            destination = image_destination / f"{prefix}_{suffix_index}_{image.name}"
+            suffix_index += 1
+        shutil.copy2(image, destination)
+        (label_destination / f"{destination.stem}.txt").write_text(
+            "\n".join(remapped) + "\n",
+            encoding="utf-8",
+        )
+        added += 1
+
+    applied_at = datetime.now(timezone.utc).isoformat()
+    result = {
+        "status": "success" if added else "no_new_images",
+        "proposal_id": proposal_id,
+        "dataset_name": dataset_name,
+        "source": (
+            f"roboflow:{proposal['candidate']['workspace']}/"
+            f"{proposal['candidate']['project']}/v{proposal['candidate']['version']}"
+        ),
+        "source_url": proposal["candidate"]["url"],
+        "license": proposal["candidate"]["license"],
+        "class_mapping": proposal["class_mapping"],
+        "added_images": added,
+        "skipped_images": skipped,
+        "before_images": proposal["baseline_images"],
+        "total_images_now": _count_images(dataset_root),
+        "applied_at": applied_at,
+    }
+    proposal.update(result)
+    _save_roboflow_proposal(proposal)
+    _append_roboflow_history(result)
+    shutil.rmtree(staged_root, ignore_errors=True)
+    return result
+
+
+@tool
 def download_roboflow_dataset(
     workspace: Annotated[str, Field(description="Roboflow workspace slug，來自 universe.roboflow.com/<workspace>/<project> 網址")],
     project: Annotated[str, Field(description="Roboflow project slug，同樣來自該網址")],
@@ -257,10 +752,9 @@ def download_roboflow_dataset(
     """從 Roboflow Universe 下載指定的公開資料集，解壓成 YOLO 格式存到 data/datasets/<dataset_name>/，
     下載完就能直接被 train_yolo_model 使用。
 
-    呼叫前要先猜出正確的 workspace 與 project slug（來自 universe.roboflow.com 的網址，
-    例如 https://universe.roboflow.com/roboflow-100/vehicles-oal2j 對應
-    workspace="roboflow-100", project="vehicles-oal2j"）。不確定的話就用最符合關鍵字的
-    猜測去試；回傳 status="not_found" 代表這個 workspace/project 不存在，換一個猜測再試一次。
+    呼叫前應先用 search_roboflow_universe 取得真實的 workspace、project 與最新版本，
+    不要自行猜測 slug。這個工具用於建立全新資料集；補強既有資料集應改走
+    prepare_roboflow_augmentation，並等待使用者確認 proposal。
     """
     api_key = _load_roboflow_key()
     if not api_key:
@@ -428,4 +922,13 @@ def augment_dataset_from_roboflow(
     }
 
 
-ALL_TOOLS = [check_dataset_health, import_images_to_dataset, train_yolo_model, evaluate_yolo_model, run_yolo_inference, download_roboflow_dataset, augment_dataset_from_roboflow]
+ALL_TOOLS = [
+    check_dataset_health,
+    import_images_to_dataset,
+    train_yolo_model,
+    evaluate_yolo_model,
+    run_yolo_inference,
+    search_roboflow_universe,
+    prepare_roboflow_augmentation,
+    download_roboflow_dataset,
+]

@@ -253,55 +253,52 @@ def case_manager_hands_off_data_agent_to_model_agent_to_evaluation_agent():
 
 
 def case_manager_auto_retries_known_gate_without_llm():
-    # 模擬 Evaluation Agent 剛回報 eval_gate_failed（reason_code 落在 GATE_ROUTING），
-    # Manager 應該直接靠規則轉給 model_agent 重新訓練，完全不必問 LLM。Planner 在每次
-    # graph.invoke() 一開始一定會先跑一次（產生/沿用一份 Plan），所以腳本第一項還是
-    # Plan，但決策本身（要轉給誰）不會消耗任何 Decision 項目。
-    script = [
-        Plan(goal="重新訓練模型", steps=[]),
-        _tool_call("skill_train", {"dataset_name": "__multi_smoke_retry__", "epochs": 1, "model_name": "smoke_exp2"}, "call_1"),
-        _report_call("success", "重新訓練完成", call_id="call_2"),
-        Decision(action="finish", rationale="重新訓練後已成功", final_reply="已重新訓練完成，可以使用。"),
-    ]
-    graph = build_multi_agent(FakeMultiAgentModel(script))
-
-    _make_fake_dataset("__multi_smoke_retry__")
-    try:
-        result = graph.invoke(
-            {
-                "messages": [HumanMessage(content="模型評估沒過，麻煩處理")],
-                "last_report": {
-                    "agent": "evaluation_agent",
-                    "status": "blocked",
-                    "reason": "mAP50 0.3 未達標",
-                    "suggestion": "增加訓練資料",
-                    "reason_code": "eval_gate_failed",
-                },
-                # 跟 last_report 對應的 Evaluation 也要一起 seed，不然 Manager 第一輪會看到
-                # evaluation 是空的、reason_code 判斷也還是照走，這裡主要是避免不小心被
-                # 誤判成 plan_invalid（見 case_manager_replans_after_repeated_stall）。
-                "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": True},
-            },
-            config={"configurable": {"thread_id": _thread("smoke_auto_retry")}},
-        )
-    finally:
-        shutil.rmtree(DATASET_DIR / "__multi_smoke_retry__", ignore_errors=True)
-
-    tool_names = [m.name for m in result["messages"] if isinstance(m, ToolMessage)]
-    assert tool_names == ["skill_train", "report_to_manager"], (
-        f"預期 Manager 直接靠固定規則轉給 model_agent 重新訓練，不呼叫 LLM：{tool_names}"
+    # Data Agent 已經完成暫存評估時，Manager 必須直接進入 proposal 確認 Gate，
+    # 不再自動重訓，也不讓 LLM 有機會提早 FINISH。拒絕後正式資料集不會變。
+    graph = build_multi_agent(FakeMultiAgentModel([Plan(goal="評估 Roboflow 補強資料", steps=[])]))
+    config = {"configurable": {"thread_id": _thread("smoke_proposal_gate")}}
+    proposal = {
+        "status": "proposal_ready",
+        "proposal_id": "smoke-proposal",
+        "dataset_name": "__multi_smoke_retry__",
+        "candidate_count": 3,
+        "candidate": {
+            "name": "Bear Mix",
+            "workspace": "demo",
+            "project": "bear-mix",
+            "version": 2,
+            "url": "https://universe.roboflow.com/demo/bear-mix",
+            "license": "CC BY 4.0",
+        },
+        "class_mapping": [{"source_name": "Bear", "target_name": "Bear"}],
+        "usable_images": 20,
+        "baseline_images": 10,
+        "estimated_total_images": 30,
+        "risks": [],
+    }
+    first = graph.invoke(
+        {
+            "messages": [HumanMessage(content="評估完再讓我確認")],
+            "roboflow_proposal": proposal,
+            "roboflow_proposal_handled": False,
+        },
+        config=config,
     )
-    assert result["retry_counters"].get("eval_gate_failed") == 1, "應該記錄這是 eval_gate_failed 的第 1 次重試"
-    assert result["messages"][-1].content == "已重新訓練完成，可以使用。"
-    print("[OK] Manager 收到已知 Gate 失敗（eval_gate_failed）時，直接用固定規則轉給 model_agent 重試，不呼叫 LLM")
+    assert "__interrupt__" in first, "有 proposal 時必須停在最後確認 Gate"
+    payload = first["__interrupt__"][0].value
+    assert payload["action_type"] == "roboflow_proposal"
+    assert payload["proposal"]["proposal_id"] == "smoke-proposal"
+
+    result = graph.invoke(Command(resume={"approved": False}), config=config)
+    assert result["roboflow_proposal_handled"] is True
+    assert "正式資料集沒有變更" in result["messages"][-1].content
+    print("[OK] Data Agent 完成暫存評估後，Manager 一定顯示最終 proposal；拒絕時不修改正式資料集")
 
 
 def case_manager_gives_up_after_retry_limit():
-    # retry_counters 已經到達 RETRY_LIMITS 上限，Manager 應該直接放棄、回報使用者，
-    # 不會再呼叫任何子 Agent 或額外的 LLM 決策——腳本只放 Planner 這一定會跑的一次，
-    # 如果 decision_engine 還多問了一次 LLM，會直接因為 pop 到空 list 而丟例外。
-    graph = build_multi_agent(FakeMultiAgentModel([Plan(goal="重新評估模型", steps=[])]))
-    limit = RETRY_LIMITS["eval_gate_failed"]
+    # 已經搜尋過但沒有產生相容 proposal 時，固定規則應直接停止，不會無限搜尋、
+    # 自動重訓或再問一次 LLM。
+    graph = build_multi_agent(FakeMultiAgentModel([Plan(goal="搜尋 Roboflow 候選", steps=[])]))
 
     result = graph.invoke(
         {
@@ -314,14 +311,14 @@ def case_manager_gives_up_after_retry_limit():
                 "reason_code": "eval_gate_failed",
             },
             "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": False},
-            "retry_counters": {"eval_gate_failed": limit},
+            "augment_offered": True,
         },
         config={"configurable": {"thread_id": _thread("smoke_retry_limit")}},
     )
 
     assert not any(isinstance(m, ToolMessage) for m in result["messages"]), "不該再呼叫任何子 Agent"
-    assert "重試" in result["messages"][-1].content
-    print(f"[OK] eval_gate_failed 重試達到上限（{limit} 次）後，Manager 直接停止並回報使用者，不再繼續重試")
+    assert "沒有找到" in result["messages"][-1].content
+    print("[OK] Roboflow 已搜尋但沒有相容 proposal 時，Manager 直接停止，不會無限搜尋或重訓")
 
 
 def case_manager_replans_after_repeated_stall():
@@ -336,7 +333,6 @@ def case_manager_replans_after_repeated_stall():
     assert STALL_ROUNDS_BEFORE_REPLAN == 2, "這個測試的輪數是照 STALL_ROUNDS_BEFORE_REPLAN=2 設計的，改了門檻要一起調整這裡"
 
     stalled_leg = [
-        _tool_call("skill_train", {"dataset_name": "__multi_smoke_stall__", "epochs": 1, "model_name": "smoke_exp3"}, "call_x"),
         _report_call("blocked", "訓練時遇到未知錯誤", suggestion="重試一次", call_id="call_y"),
     ]
     script = [
@@ -362,7 +358,9 @@ def case_manager_replans_after_repeated_stall():
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_stall__", ignore_errors=True)
 
-    assert result["evaluation"]["verdict"] != "plan_invalid", "重新規劃後 evaluation 應該被清掉，不會停在 plan_invalid"
+    assert not result.get("evaluation") or result["evaluation"]["verdict"] != "plan_invalid", (
+        "重新規劃後 evaluation 應該被清掉，不會停在 plan_invalid"
+    )
     assert result["plan"]["goal"] == "訓練模型（改用其他方式排查）", "應該是重新規劃後的第二份 Plan，不是原本那份"
     assert result["messages"][-1].content == "訓練一直卡在同樣的錯誤，能否提供更多環境或資料細節？"
     print("[OK] Observer 連續偵測到同一種未知失敗沒有進展，Manager 繞回 Planner 重新規劃，"

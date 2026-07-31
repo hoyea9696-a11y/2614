@@ -767,7 +767,12 @@ async def roboflow_readiness():
     這是純讀取的診斷 API：不會呼叫 Roboflow、建立 Agent graph 或修改資料集，
     讓 UI 能在使用者真正觸發訓練前清楚呈現為何會／不會出現補資料提示。
     """
-    from agent_tools import _count_images, _load_roboflow_key, check_dataset_health
+    from agent_tools import (
+        _count_images,
+        _load_roboflow_key,
+        check_dataset_health,
+        get_latest_roboflow_operation,
+    )
     from multi_agent import _active_dataset_is_single_class, _active_dataset_name
     from skills import COVERAGE_GATE
 
@@ -795,18 +800,19 @@ async def roboflow_readiness():
         pass
     evaluation = (state.get("model") or {}).get("evaluation") or {}
 
-    if not single_class:
-        eligible, reason_code = False, "multi_class_dataset"
-        reason = "目前資料集不是單類別；為避免外部標註被重映射成 class 0，已停用自動 Roboflow 合併。"
+    api_key_configured = bool(_load_roboflow_key())
+    if not api_key_configured:
+        eligible, reason_code = False, "api_key_missing"
+        reason = "尚未設定 Roboflow API Key，Agent 無法搜尋 Universe 候選。"
     elif not health_ok:
         eligible, reason_code = True, "health_gate_failed"
-        reason = "資料集健康檢查未通過；開始訓練後可詢問是否從 Roboflow 補充已標註資料。"
+        reason = "資料集健康檢查未通過；Agent 會先搜尋並在暫存區評估候選，最後才請你確認。"
     elif evaluation.get("passed") is False:
         eligible, reason_code = True, "eval_gate_failed"
-        reason = "最近一次模型評估未通過；可詢問是否從 Roboflow 補充同類資料後再訓練。"
+        reason = "最近一次模型評估未通過；Agent 可自動尋找並評估適合補強的 Roboflow 資料。"
     else:
-        eligible, reason_code = False, "gates_passed"
-        reason = "健康檢查與已記錄的評估皆通過，正常流程不會顯示 Roboflow 補資料提示。"
+        eligible, reason_code = True, "ready_on_request"
+        reason = "可以直接請 Agent 搜尋與評估 Roboflow 候選；確認前不會修改正式資料集。"
 
     return {
         "status": "success",
@@ -817,10 +823,12 @@ async def roboflow_readiness():
         "single_class": single_class,
         "evaluation_passed": evaluation.get("passed"),
         "last_map50": ((state.get("model") or {}).get("last_training_metrics") or {}).get("mAP50"),
-        "api_key_configured": bool(_load_roboflow_key()),
+        "api_key_configured": api_key_configured,
         "eligible": eligible,
         "reason_code": reason_code,
         "reason": reason,
+        "supports_class_mapping": True,
+        "latest_operation": get_latest_roboflow_operation(dataset_name),
     }
 
 def _get_manager_agent_graph(model_type: str = "gemini"):
