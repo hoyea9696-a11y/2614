@@ -73,7 +73,7 @@ from agent_tools import (
     prepare_roboflow_augmentation,
     search_roboflow_universe,
 )
-from skills import skill_train, skill_infer, skill_eval
+from skills import BALANCE_WARN_THRESHOLD, COVERAGE_GATE, skill_train, skill_infer, skill_eval
 
 DATA_TOOLS = [
     check_dataset_health,
@@ -226,6 +226,21 @@ Roboflow workspace/project slug、確切下載網址這類技術細節，是 dat
 這些技術細節就選 ask_user。action="ask_user" 只留給子 Agent 已經回報卡住（例如 blocked/
 dataset_not_found 重試上限用完），且需要使用者提供只有人類才知道的資訊
 （例如使用者自己要驗證的圖片檔案本身）時才用。
+
+【「評估」有兩種，不要混在一起講】
+系統裡「評估」指的是兩件不同的事，使用者問起來的時候要先分清楚是哪一種：
+- 資料集健康評估：data_agent 的 check_dataset_health。訓練「之前」就能做，看的是標記
+  覆蓋率、類別平衡、圖片與標籤數，跟有沒有訓練過完全無關。
+- 模型效能評估：evaluation_agent 的 skill_eval。只能在訓練「之後」做，看的是 mAP/loss。
+
+使用者問「這個資料集有沒有通過評估」「資料集適不適合訓練」「資料集狀況如何」時，指的
+一律是資料集健康評估。這時要派 data_agent 去拿 check_dataset_health 的實際數字來回答，
+「絕對不可以」用「還沒訓練所以還沒有評估指標」這類話帶過——那是模型效能評估的限制，
+答的根本不是使用者問的問題。訓練前系統已經自己跑過一次健康檢查並把數字顯示給使用者，
+你要據實引用那些數字，不可以說「尚未評估」。
+
+健康檢查沒通過時，「要不要照樣訓練」的決定權在使用者：把沒通過的項目與你的建議講清楚，
+然後等使用者決定，不要自己代替他決定要訓練或不訓練。
 
 評估任務完成時的回覆內容：final_reply 不要只說「評估完成」，要明確寫出實際評估的
 模型名稱，以及 Evaluation Agent 報告裡的關鍵指標（mAP50、mAP50-95、最終 loss、有沒有
@@ -665,6 +680,98 @@ def _normalized_training_params(step: dict) -> dict:
     }
 
 
+# 訓練前健康摘要的判讀門檻：覆蓋率與平衡度直接沿用 skill_train 的 Health Gate 常數，
+# 總分另外定一個，因為 skill_train 沒有拿總分當 Gate（分數低但標記完整仍然可以訓練）。
+HEALTH_SCORE_ADVICE_THRESHOLD = 60
+
+
+def _training_health_summary(dataset_name: str) -> Optional[dict]:
+    """問訓練參數之前先跑一次 check_dataset_health，整理成要一起講給使用者聽的摘要。
+
+    這裡只負責「讓使用者在決定訓練之前就看到真實數字與建議」，不擋訓練——真正會擋
+    下來的 Health Gate 仍然是 skill_train 裡的標記覆蓋率門檻。回 None 代表檢查本身
+    失敗（例如資料集讀不到），這時不阻斷流程，照原本的方式問參數就好。
+    """
+    try:
+        health = check_dataset_health.invoke({"dataset_name": dataset_name})
+    except Exception:
+        return None
+    if health.get("status") != "success":
+        return None
+
+    coverage = health.get("coverage") or 0
+    balance = health.get("balance") or 0
+    score = health.get("score") or 0
+
+    # 樣本數最少的幾個類別：使用者要判斷「值不值得現在訓練」的時候，看具體哪個類別缺圖
+    # 比看一個平衡度分數有用得多。
+    counts = [
+        (v.get("name") or str(k), v.get("count") or 0)
+        for k, v in (health.get("class_distribution") or {}).items()
+    ]
+    thinnest = sorted(counts, key=lambda kv: kv[1])[:3]
+
+    concerns = []
+    if coverage < COVERAGE_GATE:
+        concerns.append(
+            f"標記覆蓋率只有 {coverage}%，低於 {COVERAGE_GATE}% 門檻——這一項會讓訓練在啟動時"
+            f"被 Health Gate 擋下來，必須先補標記"
+        )
+    if balance < BALANCE_WARN_THRESHOLD:
+        detail = "、".join(f"{name} {count} 張" for name, count in thinnest)
+        concerns.append(
+            f"類別分佈不平衡（平衡度 {balance} 分）：樣本最少的是 {detail}，"
+            f"這些類別訓練後可能幾乎偵測不到"
+        )
+    if not concerns and score < HEALTH_SCORE_ADVICE_THRESHOLD:
+        concerns.append(f"健康總分偏低（{score} 分）")
+
+    return {
+        "dataset_name": dataset_name,
+        "score": score,
+        "coverage": coverage,
+        "balance": balance,
+        "total_images": health.get("total_images"),
+        "labeled_images": health.get("labeled_images"),
+        "passed": not concerns,
+        "blocks_training": coverage < COVERAGE_GATE,
+        "concerns": concerns,
+    }
+
+
+def _format_training_health_block(summary: Optional[dict]) -> str:
+    """把健康摘要寫成問參數時擺在最前面的那段文字：先講結論，再給建議。
+
+    數字一律由 check_dataset_health 算出來後直接帶進字串，不經過 LLM 轉述，避免
+    「建議」講得漂亮但數字是編的。要不要照樣訓練由使用者自己決定。
+    """
+    if not summary:
+        return ""
+
+    name = summary.get("dataset_name") or "—"
+    head = (
+        f"資料集「{name}」健康檢查：總分 {summary.get('score')} 分、"
+        f"標記覆蓋率 {summary.get('coverage')}%"
+        f"（{summary.get('labeled_images')}/{summary.get('total_images')} 張）、"
+        f"平衡度 {summary.get('balance')} 分。"
+    )
+    if summary.get("passed"):
+        return f"✅ {head}\n\n"
+
+    lines = [f"⚠️ {head}這個資料集**沒有通過健康檢查**："]
+    lines += [f"・{c}" for c in summary.get("concerns") or []]
+    if summary.get("blocks_training"):
+        lines.append(
+            "建議先把沒標記的圖片補完再訓練——現在硬跑會在啟動時被 Health Gate 擋下來，等於白等一輪。"
+        )
+    else:
+        lines.append(
+            "建議補齊樣本數過少的類別再訓練，效果會好一截；但先跑一輪看基準線也是合理的做法，"
+            "訓練不會被擋下。要不要繼續由你決定。"
+        )
+    return "\n".join(lines) + "\n\n"
+
+
 def _training_fingerprint(step_id: str, params: dict) -> str:
     payload = json.dumps(
         {"step_id": step_id, "params": params},
@@ -988,6 +1095,9 @@ def build_multi_agent(chat_model):
         ):
             operation = pending
         else:
+            # 健康檢查在「問參數之前」就跑完：以前只有 skill_train 內部會檢查，使用者
+            # 會先被問完一輪參數、按下確認，才在訓練啟動時看到 Gate 沒過，體感上像是
+            # 系統默許了這個資料集。這裡只是把數字提早攤開，不改變能不能訓練的判斷。
             operation = {
                 "operation_id": f"train-{uuid.uuid4().hex[:12]}",
                 "type": "training",
@@ -996,6 +1106,7 @@ def build_multi_agent(chat_model):
                 "params": params,
                 "fingerprint": fingerprint,
                 "status": "pending_confirmation",
+                "health": _training_health_summary(params["dataset_name"]),
             }
         return {
             "next": "train_params_gate",
@@ -1004,7 +1115,7 @@ def build_multi_agent(chat_model):
         }
 
     def train_params_gate(state: SupervisorState) -> dict:
-        """訓練前先用對話問一次參數，不直接跳確認框。
+        """訓練前先用對話講一次資料集健康狀況、問一次參數，不直接跳確認框。
 
         這裡刻意不用 interrupt()：確認框只有「開始／取消」兩顆按鈕，改不了參數值，
         而使用者要的是能在聊天視窗直接說「epochs 改 50」。所以把即將使用的參數當成
@@ -1017,6 +1128,7 @@ def build_multi_agent(chat_model):
         operation = state.get("pending_operation") or {}
         params = operation.get("params") or {}
         question = (
+            f"{_format_training_health_block(operation.get('health'))}"
             f"準備開始訓練資料集「{params.get('dataset_name') or '—'}」，這是我打算使用的參數：\n"
             f"・模型權重 variant：{params.get('variant') or '—'}\n"
             f"・訓練輪數 epochs：{params.get('epochs') if params.get('epochs') is not None else '—'}\n"

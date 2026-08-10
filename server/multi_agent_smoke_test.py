@@ -39,6 +39,7 @@ from multi_agent import (
     Decision,
     Plan,
     Step,
+    TrainingParamsReply,
     TrainingProposal,
     _build_approved_training_tool,
     _build_post_augment_training_transition,
@@ -122,13 +123,52 @@ def _thread(name: str) -> str:
     return f"{name}_{uuid.uuid4().hex[:8]}"
 
 
-def _invoke_confirming_training(graph, initial_input, config):
-    """跟 stream_trace() 對 interrupt 的處理邏輯一樣：Plan 裡有訓練字樣的步驟第一次
-    派給 model_agent 時，train_confirm_gate 會 interrupt() 暫停——這裡直接模擬使用者
-    按下確認（approved=True）讓流程恢復，測試才能繼續往下走到 model_agent/skill_train。"""
+def _resume_param_question(graph, config, result):
+    """回答 train_params_gate 問的訓練參數，讓流程往下走到確認 Gate。
+
+    這個 Gate 刻意不用 interrupt()：它走 ASK_USER，也就是「這一輪直接結束、等使用者
+    在聊天視窗回一句話」。所以測試不能用 Command(resume=...) 恢復，必須真的再送一則
+    HumanMessage 進去，模擬使用者回「就用這些」。腳本裡要對應放一筆
+    TrainingParamsReply，那是 Manager 解析這句回覆時會消耗的一格。
+    """
+    if not result.get("pending_param_question"):
+        return result
+    return graph.invoke({"messages": [HumanMessage(content="就用這些")]}, config=config)
+
+
+def _is_training_interrupt(result) -> bool:
+    """這次 interrupt 是不是「要不要開始訓練」的確認框。
+
+    結束時還有另一個 interrupt 會問「要不要把模型存進模型庫」，那個不該由測試代答，
+    所以要能分辨——只有訓練確認才自動按下同意。
+    """
+    interrupts = result.get("__interrupt__") or []
+    if not interrupts:
+        return False
+    payload = getattr(interrupts[0], "value", None) or {}
+    return payload.get("action_type") == "training" or "training_params" in payload
+
+
+def _invoke_confirming_training(graph, initial_input, config, max_stops=12):
+    """跑到底：訓練前有兩個停頓點，兩個都答掉才走得到 model_agent/skill_train。
+
+    1. train_params_gate 用 ASK_USER 問參數 —— 補送一句「就用這些」（見
+       _resume_param_question）。
+    2. train_confirm_gate 用 interrupt() 等最後確認 —— 模擬使用者按下確認
+       （approved=True），跟 stream_trace() 對 interrupt 的處理邏輯一樣。
+
+    訓練失敗後 Manager 重試會再繞回這兩個 Gate 一次，所以這裡用迴圈處理到不再停下來
+    為止，不是只答一次；max_stops 只是避免測試在接線出錯時無限迴圈的保險絲。
+    """
     result = graph.invoke(initial_input, config=config)
-    if "__interrupt__" in result:
-        result = graph.invoke(Command(resume={"approved": True}), config=config)
+    for _ in range(max_stops):
+        if result.get("pending_param_question"):
+            result = _resume_param_question(graph, config, result)
+            continue
+        if _is_training_interrupt(result):
+            result = graph.invoke(Command(resume={"approved": True}), config=config)
+            continue
+        break
     return result
 
 
@@ -203,6 +243,8 @@ def case_manager_hands_off_data_agent_to_model_agent_to_evaluation_agent():
         _tool_call("download_roboflow_dataset", {"workspace": "ws", "project": "proj", "dataset_name": "__multi_smoke_train__"}, "call_1"),
         _report_call("success", "已從 Roboflow 補齊資料，共 1 張圖片。", call_id="call_2"),
         Decision(action="call_agent", target_agent="model_agent", rationale="資料備妥，開始訓練"),
+        # train_params_gate 先用對話問一次參數，使用者回「就用這些」的解析結果
+        TrainingParamsReply(intent="use_suggested"),
         _tool_call("skill_train", {"dataset_name": "__multi_smoke_train__", "epochs": 1, "model_name": "smoke_exp"}, "call_3"),
         _report_call("success", "模型訓練完成，接下來幫你評估效果。", call_id="call_4"),
         Decision(action="call_agent", target_agent="evaluation_agent", rationale="訓練完成，評估效果"),
@@ -284,15 +326,19 @@ def case_training_confirmation_contains_exact_params_and_operation_id():
             training_params=proposal,
         )]),
         Decision(action="call_agent", target_agent="model_agent", rationale="參數已完整，等待確認"),
+        TrainingParamsReply(intent="use_suggested"),
     ]))
 
     _make_fake_dataset("__multi_smoke_confirm__")
     config = {"configurable": {"thread_id": _thread("smoke_exact_confirmation")}}
     try:
-        result = graph.invoke(
+        first = graph.invoke(
             {"messages": [HumanMessage(content="用指定參數訓練")]},
             config=config,
         )
+        # 確認框不是第一個停頓點：先問參數（ASK_USER），回答完才進 train_confirm_gate。
+        assert first.get("pending_param_question"), "訓練前應該先用對話問一次參數"
+        result = _resume_param_question(graph, config, first)
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_confirm__", ignore_errors=True)
 
@@ -351,7 +397,8 @@ def case_roboflow_merge_builds_refresh_and_retrain_transition():
         merge_result,
         {"status": "success", "coverage": 95.0},
     )
-    assert transition["next"] == "train_confirm_gate"
+    # 補強後的重訓也是先問參數（train_params_gate），不是直接跳確認框
+    assert transition["next"] == "train_params_gate"
     assert transition["dataset_refresh"]["total_images_now"] == 42
     assert transition["post_augment_eval_required"] is True
     assert transition["pending_operation"]["operation_id"] != "train-before-augment"
@@ -372,6 +419,8 @@ def case_roboflow_merge_builds_refresh_and_retrain_transition():
 def case_roboflow_merge_continues_through_confirm_train_and_eval():
     graph = build_multi_agent(FakeMultiAgentModel([
         Plan(goal="補強後重訓並評估", steps=[]),
+        # 補強後的重訓一樣要先經過 train_params_gate 問一次參數
+        TrainingParamsReply(intent="use_suggested"),
         _tool_call("skill_train", {}, "call_aug_train"),
         _report_call("success", "補強後模型訓練完成。", call_id="call_aug_train_report"),
         _tool_call("skill_eval", {"model_name": "bear_aug_test"}, "call_aug_eval"),
@@ -419,9 +468,12 @@ def case_roboflow_merge_continues_through_confirm_train_and_eval():
         first = graph.invoke(initial, config=config)
         assert first["__interrupt__"][0].value["action_type"] == "roboflow_proposal"
 
-        second = graph.invoke(Command(resume={"approved": True}), config=config)
+        after_merge = graph.invoke(Command(resume={"approved": True}), config=config)
+        assert after_merge.get("pending_param_question"), "補強後的重新訓練也要先問一次參數"
+        assert after_merge["dataset_refresh"]["total_images_now"] == 42
+
+        second = _resume_param_question(graph, config, after_merge)
         assert second["__interrupt__"][0].value["action_type"] == "training"
-        assert second["dataset_refresh"]["total_images_now"] == 42
 
         third = graph.invoke(Command(resume={"approved": True}), config=config)
         assert third["__interrupt__"][0].value["action_type"] == "model_save"
@@ -527,11 +579,16 @@ def case_manager_replans_after_repeated_stall():
                 model_name="smoke_exp3",
             ),
         )]),
+        # 每一輪重試都會重新繞過 train_params_gate 問一次參數，所以三輪各要一筆
+        # TrainingParamsReply；少一筆的話 Manager 會把下一個腳本項目誤當成參數回覆。
         Decision(action="call_agent", target_agent="model_agent", rationale="開始訓練"),
+        TrainingParamsReply(intent="use_suggested"),
         _report_call("blocked", "訓練時遇到未知錯誤", suggestion="重試一次", call_id="call_y1"),
         Decision(action="call_agent", target_agent="model_agent", rationale="再試一次"),
+        TrainingParamsReply(intent="use_suggested"),
         _report_call("blocked", "訓練時遇到未知錯誤", suggestion="重試一次", call_id="call_y2"),
         Decision(action="call_agent", target_agent="model_agent", rationale="再試最後一次"),
+        TrainingParamsReply(intent="use_suggested"),
         _report_call("blocked", "訓練時遇到未知錯誤", suggestion="重試一次", call_id="call_y3"),
         Plan(goal="訓練模型（改用其他方式排查）", steps=[Step(id="1", description="請使用者確認環境設定", agent="model_agent")]),
         Decision(action="ask_user", rationale="重新規劃後判斷需要使用者提供更多資訊", final_reply="訓練一直卡在同樣的錯誤，能否提供更多環境或資料細節？"),
