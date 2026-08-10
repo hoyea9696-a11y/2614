@@ -7,6 +7,23 @@ import socket
 PORTS = [8001, 8002, 8003, 8000]  # 子系統先起，主頁面（8000）最後
 LOG_DIR = os.path.join(os.getcwd(), "logs")
 
+# 單一實例鎖用的 sentinel 埠：啟動器活著就一直綁著它。第二個啟動器綁不到就知道
+# 已經有一個在跑了。沒有這個鎖的話，兩個啟動器會互相把對方的伺服器當殘留清掉，
+# 看門狗再各自拉起來，變成無限互殺重啟的洗版迴圈。
+LAUNCHER_LOCK_PORT = 8990
+
+
+def acquire_launcher_lock():
+    """搶到鎖回傳 socket（要一直握著直到行程結束），搶不到回傳 None。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", LAUNCHER_LOCK_PORT))
+        s.listen(1)
+        return s
+    except OSError:
+        s.close()
+        return None
+
 
 def _pids_on_port(port):
     """回傳目前在這個埠口 LISTENING 的所有 PID（可能有殘留的舊行程不只一個）。"""
@@ -165,6 +182,13 @@ def start_all(ports, timeout=45):
 
 
 if __name__ == "__main__":
+    launcher_lock = acquire_launcher_lock()
+    if launcher_lock is None:
+        print("偵測到另一個啟動器已經在執行中，這裡不再重複啟動。")
+        print("-> 介面請直接開 http://localhost:8000")
+        print("-> 想重開的話，先關閉舊的啟動器視窗（或按它的 Ctrl+C）再執行一次。")
+        sys.exit(0)
+
     processes = []
 
     try:

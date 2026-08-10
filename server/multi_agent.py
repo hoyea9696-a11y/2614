@@ -37,9 +37,11 @@ Engine 的 LLM fallback 一直用同一份 Plan 瞎猜。
 跟 manager_agent.py（單一 Agent 版本）並存，不刪除舊版。
 """
 import json
+import hashlib
 import shutil
 import sqlite3
 import sys
+import uuid
 from pathlib import Path
 from typing import Annotated, Literal, Optional, TypedDict
 
@@ -105,6 +107,10 @@ DATA_AGENT_PROMPT = """你是 Data Agent，只負責資料集相關的任務，�
    或下載，直接回報現況即可。注意：健康分數低如果只是「類別不平衡（balance 低）」而
    標記覆蓋率（coverage）夠，不算卡關，照常回報 status="success"，把不平衡當備註寫進
    reason 即可；只有「覆蓋率低（很多圖沒標記）」或「根本沒有圖片」才算真正的問題。
+   ——但這條「已經有圖片就停手」不適用於使用者主動要求去外部找資料的情況：只要使用者
+   的意思是要補強／擴充／去外面抓圖片，不管本機健康分數多高、圖片多完整，都要繼續往
+   第 4 點走，不可以用「資料集已經很健康、無需補強」當理由停下來。要不要補強是使用者
+   的決定，不是你的。
 2. 使用者提到本機/已上傳有現成圖片路徑（例如推論頁面暫存上傳的 data/uploads/ 或
    temp_verify/），且本機資料集還沒有圖片時，呼叫 import_images_to_dataset 把這些
    圖片匯入。這個工具只搬圖片、不會產生標記檔，匯入後健康度是 0% 標記率是正常現象，
@@ -112,8 +118,10 @@ DATA_AGENT_PROMPT = """你是 Data Agent，只負責資料集相關的任務，�
 3. 本機、使用者提供的路徑都沒有圖片可用，而且使用者確實要建立全新資料集時，才呼叫
    download_roboflow_dataset。先用 search_roboflow_universe 取得真實候選，不要猜
    workspace/project slug。
-4. 收到「尋找 Roboflow 資料並評估」「資料集樣本不足」「分數偏低，找外部資料補強」
-   這類指示時，呼叫 prepare_roboflow_augmentation。它會自行搜尋候選、下載到暫存區，
+4. 只要使用者的意思是「去外面找圖片／抓資料／補強／擴充這個資料集／多找一些樣本」，
+   就直接呼叫 prepare_roboflow_augmentation——不需要出現「Roboflow」這個字，也不需要
+   資料集分數低才做。**絕對不要只在回覆裡提到工具名稱、叫使用者自己去用**：你就是負責
+   呼叫這個工具的人，只寫出工具名稱等於這一步沒做。它會自行搜尋候選、下載到暫存區，
    檢查實際類別對應、重複圖片和可用標註，完全不會修改正式資料集。回傳
    status="proposal_ready" 時，把 proposal_id、來源、可用圖片數、類別對應與風險完整
    寫進 reason，然後 status="success" 回報 Manager。不要呼叫任何正式合併工具；
@@ -149,6 +157,16 @@ MODEL_AGENT_PROMPT = """你是 Model Agent，只負責模型的訓練與推論�
 EVALUATION_AGENT_PROMPT = """你是 Evaluation Agent，只負責用 skill_eval 評估已經訓練完成
 的模型：讀取 mAP/Loss 等指標，判斷有沒有過擬合或資料傾斜，並把結果解釋給使用者。
 
+評估只讀訓練紀錄，不需要使用者提供任何圖片——不要向使用者要圖片。使用者說「剛剛
+訓練完的模型」「最新的模型」時，直接呼叫 skill_eval 並把 model_name 留空，它會自己
+解析成最近一次有訓練紀錄的實驗；不要自己猜一個名稱（例如 exp），猜錯就會評估到
+別的模型。skill_eval 回傳的 resolved_model_name 就是實際評估的模型，解釋結果時要
+明確講出這個名稱，讓使用者知道看的是哪一個。
+
+回報給 Manager 的 reason 要帶上實際數字（resolved_model_name、mAP50、mAP50-95、
+最終 loss、gate_passed），Manager 才有東西可以寫進給使用者看的回覆——只寫「評估
+完成」會讓使用者什麼都看不到。
+
 完成後一定要呼叫 report_to_manager 回報結果：
 - skill_eval 回傳 gate_passed=False → status="blocked", reason_code="eval_gate_failed"，
   reason 附上關鍵指標（mAP50/loss）
@@ -166,11 +184,26 @@ PLANNER_SYSTEM_PROMPT = """你是 Manager Agent 的規劃模組。看使用者�
 不用寫技術細節，只要列出「做什麼、交給誰」，依實際執行順序排列。如果使用者的請求
 不需要任何子 Agent（例如打招呼、問一般問題），steps 留空清單即可。
 
+使用者只是想知道「模型表現/效能怎麼樣」（例如「剛剛訓練完的模型如何」「評估一下
+這個模型」「mAP 多少」）時，只排一個 evaluation_agent 步驟就好——評估是讀訓練紀錄
+裡的 mAP/Loss，不需要任何圖片。不要順便加一個「對新圖片做推論」的 model_agent
+步驟，那會逼使用者去找圖片給你，而他要的只是評估結果。只有使用者明確說要「用某張
+圖/某個資料夾測試、看看抓不抓得到」時才排推論步驟。
+
+評估步驟的描述不用指定模型名稱：使用者說「剛剛訓練完的」「最新的」時，
+evaluation_agent 的 skill_eval 會自己解析成最近一次有訓練紀錄的實驗，不要自己猜
+一個名稱（猜錯會評估到別的模型）。
+
 指派給 model_agent 的步驟要標 is_training：這個步驟本身要不要啟動一次新的訓練
 流程。使用者要求「用剛剛訓練好的模型做推論/驗證」是 is_training=False——句子裡
 出現「訓練」兩個字只是在描述要用哪個模型，動作本身是推論/驗證，不是訓練；只有
 真的要開始訓練一個新模型時才是 is_training=True。這個欄位會直接決定要不要跳出
 「確認是否訓練」的畫面，標錯會讓使用者在做推論時被誤問一次訓練確認。
+
+is_training=True 時也要填 training_params，內容必須反映對話裡已經確認的實際值：
+dataset_name、variant、epochs、imgsz、batch、model_name。使用者沒指定的欄位採用低資源
+建議值 yolov9s.pt / epochs=20 / imgsz=320 / batch=4 / model_name=exp；不要改回高資源
+預設值。這份參數會直接顯示在確認視窗，之後 skill_train 也只能用完全相同的值。
 
 如果對話裡已經有失敗紀錄，代表原本的計畫卡住了，這次要參考失敗原因重新規劃，
 不要原封不動照抄同一份計畫。"""
@@ -194,20 +227,25 @@ Roboflow workspace/project slug、確切下載網址這類技術細節，是 dat
 dataset_not_found 重試上限用完），且需要使用者提供只有人類才知道的資訊
 （例如使用者自己要驗證的圖片檔案本身）時才用。
 
+評估任務完成時的回覆內容：final_reply 不要只說「評估完成」，要明確寫出實際評估的
+模型名稱，以及 Evaluation Agent 報告裡的關鍵指標（mAP50、mAP50-95、最終 loss、有沒有
+通過門檻），並簡短解讀好壞。寫完指標後，再主動問一句要不要用實際圖片做推論驗證——
+聊天視窗輸入框左邊有 📎 按鈕，也可以直接把圖片拖進對話視窗，使用者不需要自己去找
+檔案路徑（不要叫他手動輸入路徑）。這只是邀請，不是 ask_user：評估本身已經完成，
+action 仍然是 finish。
+
 訓練資料集的選擇例外：如果要指派給 model_agent 的步驟是訓練，使用者訊息裡沒有
 明確指名要用哪一個本機資料集，且下面列出的「目前本機已有的資料集」不只一個，
 不要自己隨便挑一個或叫 model_agent 自己猜——用 action="ask_user"，final_reply
 列出這些資料集名稱請使用者選一個。如果目前本機剛好只有一個資料集，直接指派給
 model_agent 使用它即可，不用多問。
 
-訓練參數的選擇例外：這台機器是 CPU-only、記憶體有限，訓練很吃資源，直接套用
-預設參數（yolov9m.pt/epochs=50/imgsz=640/batch=16）容易讓整台機器當機。如果
-要指派給 model_agent 的步驟是訓練，且使用者訊息裡（包含之前的對話）沒有明確
-指定 epochs/imgsz/batch/模型權重這些訓練參數，不要直接放行——用 action=
-"ask_user"，final_reply 列出建議的低資源預設值（例如 yolov9s.pt、epochs=20、
-imgsz=320、batch=4），請使用者確認要不要用這組，或自己指定別的數值。使用者已經
-明確講清楚要用的參數（不管是這輪還是對話中前面已經指定過），就直接照做，不用
-重複問。
+訓練參數不用你問：每一次要開始訓練前，程式都會固定先在對話裡把即將使用的參數
+列出來讓使用者用文字修改，之後才跳訓練確認畫面。所以即使使用者沒有指定
+epochs/imgsz/batch/模型權重，也不要用 action="ask_user" 去問參數——直接指派
+model_agent 就好，參數那一關會自己出現；你多問一次只會讓使用者被問兩遍。
+這台機器是 CPU-only、記憶體有限，Planner 填的建議值本來就是低資源組合
+（yolov9s.pt、epochs=20、imgsz=320、batch=4）。
 
 子 Agent 的 suggestion 只是參考意見，不代表你一定要照做，你可以選擇別的 Agent 或直接結束。"""
 
@@ -299,6 +337,52 @@ class Decision(BaseModel):
     )
 
 
+class TrainingProposal(BaseModel):
+    """使用者確認前就固定下來的實際訓練參數。"""
+
+    dataset_name: Optional[str] = Field(
+        default=None,
+        description="要用來訓練的本機資料集名稱；對話中已指定時必須照填",
+    )
+    variant: str = Field(
+        default="yolov9s.pt",
+        description="YOLO 權重檔名；使用者未指定時採低資源建議值 yolov9s.pt",
+    )
+    epochs: int = Field(default=20, ge=1, description="訓練輪數")
+    imgsz: int = Field(default=320, ge=32, description="輸入影像尺寸")
+    batch: int = Field(default=4, ge=1, description="batch size")
+    model_name: str = Field(default="exp", description="輸出的實驗名稱")
+
+
+class TrainingParamsReply(BaseModel):
+    """使用者用文字回覆「這次訓練要用什麼參數」時的結構化解讀。
+
+    訓練前改成先在對話裡問一次參數，使用者回的是自然語言（「就用這些」、「epochs 改
+    50、batch 8」、「先不要訓練」），這裡只把它翻成明確意圖與欄位；值合不合理由
+    Manager 端再檢查一次，不信任 LLM 直接填進 skill_train。
+    """
+
+    intent: Literal["use_suggested", "override", "cancel", "unrelated"] = Field(
+        description="use_suggested：照建議的參數跑；override：要改其中幾個參數；"
+                    "cancel：不要訓練了；unrelated：這句話不是在回答參數問題，是別的需求"
+    )
+    variant: Optional[str] = Field(default=None, description="要改用的 YOLO 權重檔名，沒提到就留空")
+    epochs: Optional[int] = Field(default=None, description="要改成的訓練輪數，沒提到就留空")
+    imgsz: Optional[int] = Field(default=None, description="要改成的輸入影像尺寸，沒提到就留空")
+    batch: Optional[int] = Field(default=None, description="要改成的 batch size，沒提到就留空")
+    model_name: Optional[str] = Field(default=None, description="要改成的實驗名稱，沒提到就留空")
+
+
+class AugmentReply(BaseModel):
+    """使用者用文字回覆「要不要去 Roboflow 補資料」時的結構化解讀。"""
+
+    decision: Literal["yes", "no", "unrelated"] = Field(
+        description="yes：同意現在去搜尋候選資料；no：不要；"
+                    "unrelated：這句話不是在回答這個問題，是別的需求"
+    )
+    rationale: str = Field(default="", description="判斷依據，用於稽核紀錄")
+
+
 class Step(BaseModel):
     """Plan 裡的一個步驟，只描述「打算做什麼、交給誰」，不包含事實細節或失敗原因——
     那些是 AgentReport／Evaluation 的責任，Step 只記錄意圖跟目前做到哪了。"""
@@ -311,6 +395,10 @@ class Step(BaseModel):
         description="這個步驟指派給 model_agent 時，是不是要啟動一次新的訓練流程"
                      "（不是推論、不是評估，也不是單純提到「剛剛訓練好的模型」）。"
                      "指派給 data_agent／evaluation_agent 的步驟一律 False。",
+    )
+    training_params: Optional[TrainingProposal] = Field(
+        default=None,
+        description="is_training=True 時要執行的確切訓練參數；使用者確認畫面與 skill_train 都使用這一份",
     )
 
 
@@ -338,12 +426,27 @@ class SupervisorState(TypedDict):
     train_confirmed: bool
     last_trained_model: Optional[str]
     model_save_offered: bool
+    pending_operation: Optional[dict]
+    train_confirmed_operation_id: Optional[str]
+    # skill_eval 回報的診斷圖表（混淆矩陣／F1／P-R），由 stream_trace 轉成 SSE 事件
+    eval_charts: Optional[dict]
     # 分數不夠時只問一次「要不要去 Roboflow 增強」，避免反覆騷擾；baseline 記錄提議
     # 增強當下的圖片數，用來判斷之後資料到底有沒有真的長大（有長大才值得再重訓）。
     augment_offered: bool
     augment_baseline_count: Optional[int]
     roboflow_proposal: Optional[dict]
     roboflow_proposal_handled: bool
+    # Frontend refresh payload emitted after a confirmed Roboflow merge.
+    dataset_refresh: Optional[dict]
+    # Keeps the post-augmentation train -> evaluate continuation deterministic.
+    post_augment_eval_required: bool
+    # 訓練前「先用對話問一次參數」的待辦。使用者要回一句話才會繼續，所以這一輪會先
+    # 結束；而 stream_trace 在新訊息進來時會把 pending_operation／
+    # post_augment_eval_required 這類單次任務欄位重置，因此整份 operation 與「補強後
+    # 必須自動接評估」的旗標都要存在這裡，下一輪 Manager 解析完回覆才復原。
+    pending_param_question: Optional[dict]
+    # 已經在對話裡建議過「去 Roboflow 補資料」，正在等使用者回文字決定要不要做。
+    augment_suggested: bool
 
 
 def _build_sub_agent(chat_model, tools, system_prompt):
@@ -514,12 +617,179 @@ def _extract_agent_report(agent_name: str, new_messages: list) -> dict:
     return {"agent": agent_name, "status": "partial", "reason": text, "suggestion": "", "reason_code": ""}
 
 
+def _extract_eval_charts(new_messages: list) -> Optional[dict]:
+    """從 skill_eval 的回傳裡取出實際評估的模型名稱與診斷圖表清單。
+
+    圖表路徑一律取自 Tool 的結構化回傳，不讓 LLM 轉述——它抄錯檔名就會變成破圖。
+    """
+    for m in reversed(new_messages):
+        if isinstance(m, ToolMessage) and m.name == "skill_eval":
+            data = _parse_tool_content(m.content)
+            if isinstance(data, dict) and data.get("charts"):
+                return {
+                    "model_name": data.get("resolved_model_name", ""),
+                    "charts": data["charts"],
+                }
+    return None
+
+
 def _plan_to_state(plan: Plan) -> dict:
     steps = [
-        {"id": s.id, "description": s.description, "agent": s.agent, "is_training": s.is_training, "status": "pending"}
+        {
+            "id": s.id,
+            "description": s.description,
+            "agent": s.agent,
+            "is_training": s.is_training,
+            "training_params": s.training_params.model_dump() if s.training_params else None,
+            "status": "pending",
+        }
         for s in plan.steps
     ]
     return {"goal": plan.goal, "steps": steps}
+
+
+def _normalized_training_params(step: dict) -> dict:
+    """把 Planner 的提案補成可直接交給 skill_train 的完整參數。"""
+    raw = dict(step.get("training_params") or {})
+    datasets = _existing_dataset_names()
+    dataset_name = raw.get("dataset_name")
+    if not dataset_name and len(datasets) == 1:
+        dataset_name = datasets[0]
+    return {
+        "dataset_name": dataset_name,
+        "variant": raw.get("variant") or "yolov9s.pt",
+        "epochs": int(raw.get("epochs") or 20),
+        "imgsz": int(raw.get("imgsz") or 320),
+        "batch": int(raw.get("batch") or 4),
+        "model_name": raw.get("model_name") or "exp",
+    }
+
+
+def _training_fingerprint(step_id: str, params: dict) -> str:
+    payload = json.dumps(
+        {"step_id": step_id, "params": params},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_post_augment_training_transition(state: SupervisorState, merge_result: dict, health: dict) -> dict:
+    """Build a new confirmed training operation after a successful Roboflow merge."""
+    dataset_name = merge_result.get("dataset_name") or ""
+    refresh = {
+        "dataset_name": dataset_name,
+        "added_images": merge_result.get("added_images", 0),
+        "total_images_now": merge_result.get("total_images_now", 0),
+    }
+    coverage = health.get("coverage") or 0
+    if health.get("status") != "success" or coverage < 70:
+        detail = health.get("message") or f"標記覆蓋率為 {coverage}%（需要至少 70%）"
+        return {
+            "next": "FINISH",
+            "augment_offered": True,
+            "roboflow_proposal_handled": True,
+            "dataset_refresh": refresh,
+            "post_augment_eval_required": False,
+            "last_trained_model": None,
+            "messages": [AIMessage(content=(
+                f"Roboflow 資料已合併到「{dataset_name}」，但重新檢查後仍不適合訓練：{detail}。"
+                "請先完成資料整理或標記，再重新提出訓練要求。"
+            ))],
+        }
+
+    previous = dict((state.get("pending_operation") or {}).get("params") or {})
+    base_model_name = str(previous.get("model_name") or "exp")
+    params = {
+        "dataset_name": dataset_name,
+        "variant": previous.get("variant") or "yolov9s.pt",
+        "epochs": int(previous.get("epochs") or 20),
+        "imgsz": int(previous.get("imgsz") or 320),
+        "batch": int(previous.get("batch") or 4),
+        "model_name": f"{base_model_name}_aug_{uuid.uuid4().hex[:6]}",
+    }
+    step_id = f"post-augment-train-{uuid.uuid4().hex[:8]}"
+    operation = {
+        "operation_id": f"train-{uuid.uuid4().hex[:12]}",
+        "type": "training",
+        "step_id": step_id,
+        "step_description": "Roboflow 補強完成且健康檢查通過，使用補強後資料重新訓練",
+        "params": params,
+        "fingerprint": _training_fingerprint(step_id, params),
+        "status": "pending_confirmation",
+    }
+    plan = state.get("plan") or {"goal": "補強資料後重新訓練並評估", "steps": []}
+    steps = [dict(s) for s in plan.get("steps", [])]
+    steps.extend([
+        {
+            "id": step_id,
+            "description": "使用 Roboflow 補強後的資料重新訓練",
+            "agent": "model_agent",
+            "is_training": True,
+            "training_params": params,
+            "status": "in_progress",
+        },
+        {
+            "id": f"post-augment-eval-{uuid.uuid4().hex[:8]}",
+            "description": "評估補強後重新訓練的模型",
+            "agent": "evaluation_agent",
+            "is_training": False,
+            "training_params": None,
+            "status": "pending",
+        },
+    ])
+    return {
+        "next": "train_params_gate",
+        "augment_offered": True,
+        "roboflow_proposal_handled": True,
+        "dataset_refresh": refresh,
+        "post_augment_eval_required": True,
+        "last_trained_model": None,
+        "pending_operation": operation,
+        "plan": {**plan, "steps": steps},
+        "messages": [AIMessage(content=(
+            f"已將 Roboflow 資料合併到「{dataset_name}」，目前共有 {refresh['total_images_now']} 張圖片；"
+            f"重新檢查後標記覆蓋率為 {coverage}%，已達訓練門檻。接下來我先跟你確認這次重訓要用的參數。"
+        ))],
+    }
+
+
+def _build_approved_training_tool(params: dict, operation_id: str):
+    """建立只接受已核准參數的 skill_train，避免 LLM 在確認後偷偷改值。"""
+    approved = dict(params)
+
+    @tool("skill_train")
+    def approved_skill_train(
+        dataset_name: str = approved["dataset_name"],
+        variant: str = approved["variant"],
+        epochs: int = approved["epochs"],
+        imgsz: int = approved["imgsz"],
+        batch: int = approved["batch"],
+        model_name: str = approved["model_name"],
+    ) -> dict:
+        """執行已由使用者確認的模型訓練；所有參數都必須與確認畫面完全相同。"""
+        requested = {
+            "dataset_name": dataset_name,
+            "variant": variant,
+            "epochs": epochs,
+            "imgsz": imgsz,
+            "batch": batch,
+            "model_name": model_name,
+        }
+        if requested != approved:
+            return {
+                "status": "approval_mismatch",
+                "message": (
+                    f"操作 {operation_id} 的訓練參數與使用者核准內容不一致，"
+                    "已阻止訓練啟動。"
+                ),
+                "approved_params": approved,
+                "requested_params": requested,
+            }
+        return skill_train.invoke(approved)
+
+    return approved_skill_train
 
 
 def _summarize_plan(plan: Optional[dict]) -> str:
@@ -562,8 +832,18 @@ def build_multi_agent(chat_model):
     # 邏輯不變，只是多留一份原始訊息。
     decision_model = chat_model.with_structured_output(Decision, method="function_calling", include_raw=True)
     planner_model = chat_model.with_structured_output(Plan, method="function_calling", include_raw=True)
+    param_reply_model = chat_model.with_structured_output(
+        TrainingParamsReply, method="function_calling", include_raw=True
+    )
+    augment_reply_model = chat_model.with_structured_output(
+        AugmentReply, method="function_calling", include_raw=True
+    )
 
     def planner_node(state: SupervisorState) -> dict:
+        # 使用者這句話是在回答 Manager 上一輪問的問題（訓練參數怎麼設、要不要去補
+        # 資料），不是新需求——不要重新規劃，直接交給 Manager 解析那句回覆。
+        if state.get("pending_param_question") or state.get("augment_suggested"):
+            return {}
         context = [SystemMessage(content=PLANNER_SYSTEM_PROMPT)] + list(state["messages"])
         try:
             result = _invoke_with_retry(lambda: planner_model.invoke(context))
@@ -647,35 +927,231 @@ def build_multi_agent(chat_model):
 
         return {"evaluation": evaluation, "plan": {**plan, "steps": steps}, "stall_count": stall_count}
 
+    def prepare_train_operation(state: SupervisorState) -> dict:
+        """把訓練 Step 固定成一份有唯一 ID 的操作，再交給確認 Gate。
+
+        operation_id 必須在 interrupt() 前先寫入 checkpoint；如果直接在 interrupt
+        node 裡產生，resume 時 node 會從頭執行而產生另一個 ID。
+        """
+        plan = state.get("plan") or {"steps": []}
+        steps = [dict(s) for s in plan.get("steps", [])]
+        step = next(
+            (s for s in steps if s.get("agent") == "model_agent" and s.get("status") == "in_progress"),
+            None,
+        )
+        pending = state.get("pending_operation")
+
+        if step and not step.get("is_training"):
+            return {"next": "model_agent", "pending_operation": None}
+
+        if not step:
+            if pending and pending.get("type") == "training" and pending.get("status") == "approved":
+                return {"next": "model_agent"}
+            if (
+                pending
+                and pending.get("type") == "training"
+                and pending.get("status") == "completed"
+                and (state.get("last_report") or {}).get("reason_code") == "eval_gate_failed"
+            ):
+                retry_params = dict(pending.get("params") or {})
+                retry_step_id = f"{pending.get('step_id') or 'training'}-retry"
+                retry_operation = {
+                    "operation_id": f"train-{uuid.uuid4().hex[:12]}",
+                    "type": "training",
+                    "step_id": retry_step_id,
+                    "step_description": "模型評估未達門檻，使用相同參數重新訓練",
+                    "params": retry_params,
+                    "fingerprint": _training_fingerprint(retry_step_id, retry_params),
+                    "status": "pending_confirmation",
+                }
+                return {
+                    "next": "train_params_gate",
+                    "pending_operation": retry_operation,
+                }
+            return {"next": "model_agent", "pending_operation": None}
+
+        params = _normalized_training_params(step)
+        if not params.get("dataset_name"):
+            return {
+                "next": "FINISH",
+                "messages": [AIMessage(
+                    content="開始訓練前還缺少資料集名稱，請先指定要使用哪一個本機資料集。"
+                )],
+            }
+
+        step["training_params"] = params
+        fingerprint = _training_fingerprint(str(step.get("id", "")), params)
+        if (
+            pending
+            and pending.get("fingerprint") == fingerprint
+            and pending.get("status") in {"pending_confirmation", "approved"}
+        ):
+            operation = pending
+        else:
+            operation = {
+                "operation_id": f"train-{uuid.uuid4().hex[:12]}",
+                "type": "training",
+                "step_id": step.get("id"),
+                "step_description": step.get("description", ""),
+                "params": params,
+                "fingerprint": fingerprint,
+                "status": "pending_confirmation",
+            }
+        return {
+            "next": "train_params_gate",
+            "pending_operation": operation,
+            "plan": {**plan, "steps": steps},
+        }
+
+    def train_params_gate(state: SupervisorState) -> dict:
+        """訓練前先用對話問一次參數，不直接跳確認框。
+
+        這裡刻意不用 interrupt()：確認框只有「開始／取消」兩顆按鈕，改不了參數值，
+        而使用者要的是能在聊天視窗直接說「epochs 改 50」。所以把即將使用的參數當成
+        一般回覆送出、這一輪就結束，等使用者回一句話；下一輪由 decision_engine 的
+        pending_param_question 分支解析，再進 train_confirm_gate 做最後確認。
+
+        next 走 ASK_USER 而不是 FINISH：這一輪只是停下來等回話，不是任務收尾，不該
+        順手把 save_offer_gate 的「要不要存模型」也問出來。
+        """
+        operation = state.get("pending_operation") or {}
+        params = operation.get("params") or {}
+        question = (
+            f"準備開始訓練資料集「{params.get('dataset_name') or '—'}」，這是我打算使用的參數：\n"
+            f"・模型權重 variant：{params.get('variant') or '—'}\n"
+            f"・訓練輪數 epochs：{params.get('epochs') if params.get('epochs') is not None else '—'}\n"
+            f"・影像尺寸 imgsz：{params.get('imgsz') if params.get('imgsz') is not None else '—'}\n"
+            f"・batch：{params.get('batch') if params.get('batch') is not None else '—'}\n"
+            f"・實驗名稱 model_name：{params.get('model_name') or '—'}\n"
+            "照這樣跑就回「就用這些」；要改直接說，例如「epochs 改 50、batch 8」；"
+            "不想訓練就說「取消」。"
+        )
+        return {
+            "next": "ASK_USER",
+            "pending_param_question": {
+                "operation": operation,
+                "post_augment_eval_required": bool(state.get("post_augment_eval_required")),
+            },
+            "messages": [AIMessage(content=question)],
+        }
+
+    def _latest_user_text(state: SupervisorState) -> str:
+        for message in reversed(state["messages"]):
+            if isinstance(message, HumanMessage):
+                return str(message.content)
+        return ""
+
+    def _parse_reply(model, system_prompt: str, state: SupervisorState):
+        """把使用者的最後一句話丟給結構化模型解讀，回傳 (parsed, usage)。
+
+        解析失敗不拋例外——呼叫端會當成「這句話跟剛問的問題無關」，退回一般決策流程，
+        不要因為一次 LLM 失誤就把使用者的訊息吃掉。
+        """
+        context = [SystemMessage(content=system_prompt), HumanMessage(content=_latest_user_text(state))]
+        try:
+            result = _invoke_with_retry(lambda: model.invoke(context))
+        except Exception:
+            return None, None
+        return result["parsed"], _usage_from_message(result["raw"])
+
+    # 使用者回覆參數時允許修改的欄位：(欄位名, 型別, 顯示名稱)。variant／model_name
+    # 是字串，其餘三個必須是正整數——LLM 可能把「不改」解讀成 0 或負數，這裡擋掉。
+    PARAM_FIELDS = (
+        ("variant", str, "模型權重"),
+        ("epochs", int, "訓練輪數"),
+        ("imgsz", int, "影像尺寸"),
+        ("batch", int, "batch"),
+        ("model_name", str, "實驗名稱"),
+    )
+
+    def _resolve_param_reply(state: SupervisorState, question: dict, reply: TrainingParamsReply,
+                             rounds: int, retry_counters: dict, usage) -> dict:
+        """把使用者的參數回覆套進待確認的訓練操作，再送去確認 Gate。"""
+        operation = dict(question.get("operation") or {})
+        params = dict(operation.get("params") or {})
+        applied, ignored = [], []
+
+        if reply.intent == "override":
+            for field, caster, label in PARAM_FIELDS:
+                value = getattr(reply, field, None)
+                if value is None:
+                    continue
+                try:
+                    value = caster(value)
+                except (TypeError, ValueError):
+                    ignored.append(label)
+                    continue
+                if caster is int and value <= 0:
+                    ignored.append(label)
+                    continue
+                if params.get(field) == value:
+                    continue
+                params[field] = value
+                applied.append(f"{label} {value}")
+
+        if applied:
+            # 參數變了就是另一個操作：換 operation_id 與 fingerprint，確認框才會重新顯示。
+            operation.update({
+                "operation_id": f"train-{uuid.uuid4().hex[:12]}",
+                "params": params,
+                "fingerprint": _training_fingerprint(str(operation.get("step_id") or "training"), params),
+                "status": "pending_confirmation",
+            })
+            note = "已改成：" + "、".join(applied) + "。"
+        else:
+            note = "好，就用剛剛列出的參數。"
+        if ignored:
+            note += "（" + "、".join(ignored) + " 看不出要改成什麼，先沿用原值。）"
+        note += "接下來會跳出訓練確認，按「開始訓練」就會用這份參數跑。"
+
+        return {
+            "next": "train_confirm_gate",
+            "rounds": rounds,
+            "retry_counters": retry_counters,
+            "pending_operation": operation,
+            "pending_param_question": None,
+            # 補強後重訓必須自動接評估，這個旗標在新訊息進來時被重置過，這裡復原。
+            "post_augment_eval_required": bool(question.get("post_augment_eval_required")),
+            "usage": usage,
+            "messages": [AIMessage(content=note)],
+        }
+
     def train_confirm_gate(state: SupervisorState) -> dict:
         """manager 決定路由到 model_agent 時，先經過這一關：不是訓練步驟就直接
         放行；是訓練步驟就用 interrupt() 暫停，等待前端使用者確認後才真的進
         model_agent（訓練耗時、耗運算資源，不該讓 Agent 自己說做就做）。
 
-        train_confirmed 記錄「這個任務裡使用者已經確認過一次」——同一個任務裡
-        Gate 失敗（dataset_not_found/health_gate_failed）重試、或 Observer 判定
-        plan_invalid 繞回 Planner 後再度指派 model_agent，都不該讓使用者對同一次
-        訓練意圖重複按確認；只有使用者發送新的一則訊息（stream_trace 會重置這個
-        欄位）才要重新問一次。"""
-        plan = state.get("plan") or {"steps": []}
-        step = next(
-            (s for s in plan.get("steps", []) if s.get("agent") == "model_agent" and s.get("status") == "in_progress"),
-            None,
-        )
-        if not (step or {}).get("is_training"):
+        train_confirmed_operation_id 記錄核准的是哪一個具體操作；同一個操作因 Gate
+        失敗或重新規劃而重試時不重複詢問，但只要參數或 operation_id 改變，就必須
+        顯示新的確認內容。"""
+        operation = state.get("pending_operation") or {}
+        if operation.get("type") != "training":
             return {"next": "model_agent"}
 
-        if state.get("train_confirmed"):
-            return {"next": "model_agent"}
+        operation_id = operation.get("operation_id")
+        if state.get("train_confirmed_operation_id") == operation_id:
+            return {
+                "next": "model_agent",
+                "pending_operation": {**operation, "status": "approved"},
+            }
 
         resume = interrupt({
+            "action_type": "training",
+            "operation_id": operation_id,
             "reason": "即將啟動模型訓練，這是高成本、耗時的操作，請確認是否繼續。",
-            "step_description": step.get("description", ""),
+            "step_description": operation.get("step_description", ""),
+            "training_params": operation.get("params", {}),
         })
         if isinstance(resume, dict) and resume.get("approved"):
-            return {"next": "model_agent", "train_confirmed": True}
+            return {
+                "next": "model_agent",
+                "train_confirmed": True,
+                "train_confirmed_operation_id": operation_id,
+                "pending_operation": {**operation, "status": "approved"},
+            }
         return {
             "next": "FINISH",
+            "pending_operation": {**operation, "status": "rejected"},
             "messages": [AIMessage(content="使用者取消了這次訓練，已停止。")],
         }
 
@@ -689,6 +1165,73 @@ def build_multi_agent(chat_model):
                 "rounds": rounds,
                 "messages": [AIMessage(content="已經嘗試多輪仍未完成，請確認需求或稍後再協助確認資料/模型狀態。")],
             }
+
+        # 上一輪 Manager 問了問題、這一輪使用者回了一句話時，那句話就是答案，要先解析
+        # 完再談路由。若解析結果是「在講別的事」，就把待辦放掉、照一般流程處理新需求，
+        # 但不能讓旗標留著（否則下一句話又會被當成在回答同一個問題）——stale_updates
+        # 帶著這件事一路傳到最後的 return。
+        stale_updates: dict = {}
+
+        param_question = state.get("pending_param_question")
+        if param_question:
+            suggested = (param_question.get("operation") or {}).get("params") or {}
+            reply, usage = _parse_reply(param_reply_model, (
+                "Manager 剛問使用者「這次訓練要用什麼參數」，建議值是：\n"
+                + json.dumps(suggested, ensure_ascii=False, sort_keys=True)
+                + "\n把使用者的回覆翻成結構化意圖：同意照建議跑填 use_suggested；要改參數填"
+                  " override 並只填他明確提到的欄位（沒提到的一律留空）；不想訓練填 cancel；"
+                  "這句話根本不是在回答參數問題填 unrelated。"
+            ), state)
+            intent = reply.intent if reply else "unrelated"
+            if intent == "cancel":
+                return {
+                    "next": "FINISH",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "pending_param_question": None,
+                    "usage": usage,
+                    "messages": [AIMessage(content="好，這次不訓練，已經停下來了。要再訓練隨時跟我說。")],
+                }
+            if intent in {"use_suggested", "override"}:
+                return _resolve_param_reply(state, param_question, reply, rounds, retry_counters, usage)
+            stale_updates["pending_param_question"] = None
+
+        if state.get("augment_suggested"):
+            reply, usage = _parse_reply(augment_reply_model, (
+                "Manager 剛建議使用者「去 Roboflow Universe 找公開資料集，補強目前的訓練資料」，"
+                "現在要判斷使用者這句回覆是同意去找（yes）、不要（no），還是在講別的事"
+                "（unrelated）。"
+            ), state)
+            augment_decision = reply.decision if reply else "unrelated"
+            if augment_decision == "yes":
+                ds_name = _active_dataset_name()
+                return {
+                    "next": "data_agent",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "augment_suggested": False,
+                    "augment_offered": True,
+                    "augment_baseline_count": _count_images(DATASET_DIR / ds_name) if ds_name else None,
+                    "usage": usage,
+                    "messages": [HumanMessage(content=(
+                        f"使用者同意補強資料集「{ds_name}」。請呼叫 prepare_roboflow_augmentation "
+                        "自動搜尋 Roboflow Universe 候選，下載到暫存區並評估類別對應、重複圖片、"
+                        "可用標註與風險。不要修改正式資料集；完成後把 proposal 結果回報給 Manager，"
+                        "等待使用者最後確認。"
+                    ))],
+                }
+            if augment_decision == "no":
+                return {
+                    "next": "FINISH",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "augment_suggested": False,
+                    "usage": usage,
+                    "messages": [AIMessage(content=(
+                        "好，這次不去 Roboflow 補資料。想改參數重訓、或換一個資料集，都可以跟我說。"
+                    ))],
+                }
+            stale_updates["augment_suggested"] = False
 
         evaluation = state.get("evaluation") or {}
         if evaluation.get("verdict") == "plan_invalid":
@@ -717,6 +1260,39 @@ def build_multi_agent(chat_model):
         last_report = state.get("last_report") or {}
         reason_code = last_report.get("reason_code") or ""
 
+        # After a confirmed Roboflow merge, training and evaluation are one explicit continuation.
+        # Do not ask the LLM to infer this handoff from conversational text.
+        if state.get("post_augment_eval_required"):
+            report_agent = last_report.get("agent")
+            report_status = last_report.get("status")
+            if report_agent == "model_agent" and report_status == "success":
+                plan = _mark_step_in_progress(state.get("plan"), "evaluation_agent")
+                model_name = state.get("last_trained_model") or "最新完成的模型"
+                return {
+                    "next": "evaluation_agent",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "plan": plan,
+                    "messages": [HumanMessage(content=(
+                        f"請立即評估剛完成的模型「{model_name}」，回報 mAP50、loss 與是否通過門檻。"
+                    ))],
+                }
+            if report_agent == "evaluation_agent":
+                if report_status == "success":
+                    message = f"Roboflow 補強後的重新訓練與評估已完成：{last_report.get('reason', '')}"
+                else:
+                    message = (
+                        "Roboflow 補強後已重新訓練並評估，但結果仍未通過門檻："
+                        f"{last_report.get('reason', '')}。本輪先停止，避免自動反覆補資料與重訓。"
+                    )
+                return {
+                    "next": "FINISH",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "post_augment_eval_required": False,
+                    "messages": [AIMessage(content=message)],
+                }
+
         # Data Agent 已經完成 Roboflow 搜尋與暫存評估時，先呈現完整 proposal；
         # 使用者確認前絕不修改正式資料集。
         proposal = state.get("roboflow_proposal")
@@ -727,24 +1303,27 @@ def build_multi_agent(chat_model):
                 "retry_counters": retry_counters,
             }
 
-        # 分數不夠時先讓 Data Agent 自動搜尋、下載到暫存區並評估，不先打擾使用者。
-        # 搜尋完成後會由上面的 proposal 分支進入最後確認；找不到相容候選才結束。
+        # 分數不夠時先在對話裡「建議」去補資料，等使用者回一句話再動作——搜尋要下載
+        # 外部資料、花時間也花額度，不該在使用者沒表示意見前就先跑。同意與否由上面的
+        # augment_suggested 分支解析；同意後才派 Data Agent 搜尋、暫存並評估，接著由
+        # proposal 分支進入合併前的最後確認。
         if reason_code in AUGMENTABLE_GATES:
             ds_name = _active_dataset_name()
             if ds_name and not state.get("augment_offered"):
-                instruction = HumanMessage(content=(
-                    f"資料集「{ds_name}」因 {reason_code} 需要補強。請呼叫 "
-                    f"prepare_roboflow_augmentation 自動搜尋 Roboflow Universe 候選，下載到"
-                    f"暫存區並評估類別對應、重複圖片、可用標註與風險。不要修改正式資料集；"
-                    f"完成後把 proposal 結果回報給 Manager，等待使用者最後確認。"
-                ))
+                gate_reason = (last_report.get("reason") or "").strip()
+                detail = f"（{gate_reason}）" if gate_reason else ""
                 return {
-                    "next": "data_agent",
+                    "next": "ASK_USER",
                     "rounds": rounds,
                     "retry_counters": retry_counters,
-                    "augment_baseline_count": _count_images(DATASET_DIR / ds_name),
-                    "augment_offered": True,
-                    "messages": [instruction],
+                    "augment_suggested": True,
+                    "messages": [AIMessage(content=(
+                        f"資料集「{ds_name}」這次沒通過門檻{detail}。\n"
+                        "我建議去 Roboflow Universe 找公開資料集，把能對應到你現有類別的已標記"
+                        "圖片補進來——只會先下載到暫存區做評估，正式資料集不會被改動，要不要"
+                        "真的合併由你在確認畫面決定。\n"
+                        "要我去找就回「去找」；不用就回「不用」，我先停在這裡。"
+                    ))],
                 }
             return {
                 "next": "FINISH",
@@ -782,9 +1361,21 @@ def build_multi_agent(chat_model):
         if plan_summary:
             context.append(SystemMessage(content=f"目前的計畫進度：\n{plan_summary}"))
         dataset_names = _existing_dataset_names()
-        context.append(SystemMessage(
-            content=f"目前本機已有的資料集：{', '.join(dataset_names) if dataset_names else '（無）'}"
-        ))
+        if dataset_names:
+            # 名稱一律用「」括起來：以前是逗號分隔的裸字串，資料夾名稱剛好是數字時
+            # （例如「2」）模型會把它當成數量或順序編號而不是名稱，列清單給使用者
+            # 看的時候直接漏掉；使用者回「2」也會被理解成「清單第 2 項」而選錯資料集。
+            listed = "、".join(f"「{name}」" for name in dataset_names)
+            dataset_note = (
+                f"目前本機已有的資料集共 {len(dataset_names)} 個，"
+                f"名稱如下（「」裡面就是完整的資料夾名稱）：{listed}。\n"
+                "注意：資料夾名稱本身可能就是一個數字（例如「2」），那是它的名稱、不是數量或"
+                "順序編號——列清單給使用者看時絕對不能漏掉這種名稱。使用者只回一個數字或短"
+                "名稱時，指的是名稱完全相同的那個資料集，不要理解成「清單的第幾項」。"
+            )
+        else:
+            dataset_note = "目前本機沒有任何含圖片的資料集。"
+        context.append(SystemMessage(content=dataset_note))
         context += list(state["messages"])
         try:
             result = _invoke_with_retry(lambda: decision_model.invoke(context))
@@ -796,13 +1387,21 @@ def build_multi_agent(chat_model):
                 "rounds": rounds,
                 "retry_counters": retry_counters,
                 "messages": [AIMessage(content=f"決策時發生錯誤，請稍後再試一次：{e}")],
+                **stale_updates,
             }
         decision = result["parsed"]
         usage = _usage_from_message(result["raw"])
 
         if decision.action == "call_agent" and decision.target_agent:
             plan = _mark_step_in_progress(state.get("plan"), decision.target_agent)
-            return {"next": decision.target_agent, "rounds": rounds, "retry_counters": retry_counters, "plan": plan, "usage": usage}
+            return {
+                "next": decision.target_agent,
+                "rounds": rounds,
+                "retry_counters": retry_counters,
+                "plan": plan,
+                "usage": usage,
+                **stale_updates,
+            }
 
         reply_text = decision.final_reply or decision.rationale
         return {
@@ -811,6 +1410,7 @@ def build_multi_agent(chat_model):
             "retry_counters": retry_counters,
             "messages": [AIMessage(content=reply_text)],
             "usage": usage,
+            **stale_updates,
         }
 
     def _run_sub_agent(agent_name, sub_agent, state: SupervisorState) -> dict:
@@ -829,10 +1429,28 @@ def build_multi_agent(chat_model):
         return result
 
     def run_model_agent(state: SupervisorState) -> dict:
-        result = _run_sub_agent("model_agent", model_agent, state)
+        operation = state.get("pending_operation") or {}
+        active_agent = model_agent
+        if operation.get("type") == "training" and operation.get("status") == "approved":
+            params = operation.get("params") or {}
+            approved_tool = _build_approved_training_tool(params, operation.get("operation_id", ""))
+            exact_prompt = (
+                MODEL_AGENT_PROMPT
+                + "\n\n這次訓練已由使用者核准。你必須呼叫 skill_train，且只能使用以下參數，"
+                  "不得自行替換或省略：\n"
+                + json.dumps(params, ensure_ascii=False, sort_keys=True)
+            )
+            active_agent = _build_sub_agent(chat_model, [approved_tool, skill_infer], exact_prompt)
+
+        result = _run_sub_agent("model_agent", active_agent, state)
         trained_model = _extract_trained_model_name(result["messages"])
         if trained_model:
             result["last_trained_model"] = trained_model
+            result["pending_operation"] = {**operation, "status": "completed"}
+        elif operation.get("type") == "training":
+            report_status = (result.get("last_report") or {}).get("status")
+            if report_status == "failed":
+                result["pending_operation"] = {**operation, "status": "failed"}
         return result
 
     def save_offer_gate(state: SupervisorState) -> dict:
@@ -846,6 +1464,7 @@ def build_multi_agent(chat_model):
             return {}
 
         resume = interrupt({
+            "action_type": "model_save",
             "reason": f"模型「{model_name}」已訓練完成，要把它加入模型庫（驗證中心下拉選單可選）嗎？",
             "model_name": model_name,
         })
@@ -887,11 +1506,8 @@ def build_multi_agent(chat_model):
         if isinstance(resume, dict) and resume.get("approved"):
             result = apply_roboflow_proposal.invoke({"proposal_id": proposal_id})
             if result.get("status") == "success":
-                note = (
-                    f"已從 {result.get('source')} 合併 {result.get('added_images', 0)} 張圖片到"
-                    f"「{result.get('dataset_name')}」，圖片數由 {result.get('before_images')} 增加到"
-                    f" {result.get('total_images_now')}。未自動啟動訓練；你可以先檢查資料，再決定是否重訓。"
-                )
+                health = check_dataset_health.invoke({"dataset_name": result.get("dataset_name", "")})
+                return _build_post_augment_training_transition(state, result, health)
             else:
                 note = f"Roboflow 合併沒有完成：{result.get('message') or result.get('status')}。"
             return {
@@ -909,12 +1525,18 @@ def build_multi_agent(chat_model):
         }
 
     def run_evaluation_agent(state: SupervisorState) -> dict:
-        return _run_sub_agent("evaluation_agent", evaluation_agent, state)
+        result = _run_sub_agent("evaluation_agent", evaluation_agent, state)
+        charts = _extract_eval_charts(result["messages"])
+        if charts:
+            result["eval_charts"] = charts
+        return result
 
     graph = StateGraph(SupervisorState)
     graph.add_node("planner", planner_node)
     graph.add_node("manager", decision_engine)
     graph.add_node("observer", observer_node)
+    graph.add_node("prepare_train_operation", prepare_train_operation)
+    graph.add_node("train_params_gate", train_params_gate)
     graph.add_node("train_confirm_gate", train_confirm_gate)
     graph.add_node("save_offer_gate", save_offer_gate)
     graph.add_node("augment_gate", augment_gate)
@@ -929,12 +1551,32 @@ def build_multi_agent(chat_model):
         lambda s: s["next"],
         {
             "data_agent": "data_agent",
-            "model_agent": "train_confirm_gate",
+            "model_agent": "prepare_train_operation",
             "evaluation_agent": "evaluation_agent",
             "planner": "planner",
             "augment_gate": "augment_gate",
+            # 使用者回覆完訓練參數後直接進最後確認，不必再繞 prepare_train_operation
+            # 重新組一份 operation（那會把剛談好的參數蓋掉）。
+            "train_confirm_gate": "train_confirm_gate",
+            # 這一輪只是停下來等使用者回話，不是任務收尾：不走 save_offer_gate，
+            # 免得在等回覆的同時又跳出「要不要把模型存進模型庫」。
+            "ASK_USER": END,
             "FINISH": "save_offer_gate",
         },
+    )
+    graph.add_conditional_edges(
+        "prepare_train_operation",
+        lambda s: s["next"],
+        {
+            "train_params_gate": "train_params_gate",
+            "model_agent": "model_agent",
+            "FINISH": "save_offer_gate",
+        },
+    )
+    graph.add_conditional_edges(
+        "train_params_gate",
+        lambda s: s["next"],
+        {"ASK_USER": END},
     )
     graph.add_conditional_edges(
         "train_confirm_gate",
@@ -944,7 +1586,11 @@ def build_multi_agent(chat_model):
     graph.add_conditional_edges(
         "augment_gate",
         lambda s: s["next"],
-        {"data_agent": "data_agent", "FINISH": "save_offer_gate"},
+        {
+            "data_agent": "data_agent",
+            "train_params_gate": "train_params_gate",
+            "FINISH": "save_offer_gate",
+        },
     )
     graph.add_edge("save_offer_gate", END)
     graph.add_edge("data_agent", "observer")
@@ -984,8 +1630,8 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
 
     thread_id 對應同一個 checkpointer 裡的一份記憶——同一個 thread_id 的
     messages 會跟之前的對話合併，但 rounds/retry_counters/stall_count/
-    plan/evaluation/last_report/train_confirmed/last_trained_model/
-    model_save_offered 每次新訊息都明確重置，這些欄位
+    plan/evaluation/last_report/train_confirmed/pending_operation/
+    train_confirmed_operation_id/last_trained_model/model_save_offered 每次新訊息都明確重置，這些欄位
     是「這一次任務」用的保險絲，不該延續到下一次使用者發的新任務（resume 不算
     新任務，不會重置這些欄位，接著用暫停當下的狀態繼續——train_confirmed 也是
     因為這樣才能在同一個任務裡重試訓練時不用重複跳出確認畫面）。"""
@@ -995,6 +1641,14 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
     interrupted = False
 
     try:
+        # graph.stream() 的第一個 update 要等 Planner 完成一次 LLM 呼叫才會出現。
+        # 先送出一個狀態事件，讓前端在這段等待期間仍能明確顯示 Agent 正在規劃，
+        # 而不是只在 Observer 完成後才看到任何回饋。
+        yield {
+            "type": "status",
+            "stage": "planner",
+            "message": "Manager 正在理解需求並制定執行計畫…",
+        }
         if resume_value is not None:
             stream_input = Command(resume=resume_value)
         else:
@@ -1008,12 +1662,17 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                 "last_report": None,
                 "replan_count": 0,
                 "train_confirmed": False,
+                "train_confirmed_operation_id": None,
+                "pending_operation": None,
                 "last_trained_model": None,
+                "eval_charts": None,
                 "model_save_offered": False,
                 "augment_offered": False,
                 "augment_baseline_count": None,
                 "roboflow_proposal": None,
                 "roboflow_proposal_handled": False,
+                "dataset_refresh": None,
+                "post_augment_eval_required": False,
             }
         total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         llm_calls = 0
@@ -1032,7 +1691,11 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                 # 不一樣，是 {"__interrupt__": (Interrupt(value=...),)}——這裡是暫停點，
                 # 之後不會再有新 chunk，呼叫端要帶著使用者的回應再呼叫一次才會繼續。
                 interrupt_obj = step["__interrupt__"][0]
-                yield {"type": "interrupt", "payload": interrupt_obj.value}
+                yield {
+                    "type": "interrupt",
+                    "interrupt_id": interrupt_obj.id,
+                    "payload": interrupt_obj.value,
+                }
                 interrupted = True
                 continue
             for node_name, node_output in step.items():
@@ -1088,6 +1751,13 @@ def stream_trace(graph, thread_id: str, user_message: Optional[str] = None, resu
                 if node_usage or sub_agent_usage:
                     entry["usage"] = node_usage or sub_agent_usage
                 yield entry
+
+                # 評估圖表（混淆矩陣／F1／P-R 曲線）由後端直接把檔案 URL 送給前端
+                # 畫出來，不經過 LLM 轉述——路徑要是讓模型自己寫，寫錯就變成破圖。
+                if node_output.get("eval_charts"):
+                    yield {"type": "eval_charts", **node_output["eval_charts"]}
+                if node_output.get("dataset_refresh"):
+                    yield {"type": "dataset_refresh", **node_output["dataset_refresh"]}
     except Exception as e:
         import traceback
         traceback.print_exc()

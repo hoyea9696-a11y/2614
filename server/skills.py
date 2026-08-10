@@ -200,16 +200,83 @@ def skill_infer(
     return {"status": "success", "model_used": model_path, **result}
 
 
+TRAIN_RUNS_DIR = PROJECT_ROOT / "runs" / "train"
+# 模型效能診斷頁用的三張圖。檔名跟 ultralytics 版本有關（新版的曲線圖多了 Box 前綴），
+# 所以每一張都列出可能的檔名，取實際存在的那個。
+EVAL_CHART_CANDIDATES = [
+    ("混淆矩陣 (Confusion Matrix)", ["confusion_matrix.png", "confusion_matrix_normalized.png"]),
+    ("F1-Score 曲線", ["BoxF1_curve.png", "F1_curve.png"]),
+    ("P-R 曲線 (Precision-Recall)", ["BoxPR_curve.png", "PR_curve.png"]),
+]
+
+
+def _latest_trained_model() -> Optional[str]:
+    """回傳最近一次「真的訓練過」的實驗名稱（以 results.csv 的寫入時間判斷）。
+
+    訓練途中每個 epoch 都會寫 results.csv，所以它的 mtime 比資料夾 mtime 更貼近
+    最後一次訓練的時間；沒有 results.csv 的資料夾（訓練一開始就被終止）不算。
+    """
+    if not TRAIN_RUNS_DIR.exists():
+        return None
+    runs = [d for d in TRAIN_RUNS_DIR.iterdir() if d.is_dir() and (d / "results.csv").exists()]
+    if not runs:
+        return None
+    return max(runs, key=lambda d: (d / "results.csv").stat().st_mtime).name
+
+
+def _eval_charts(model_name: str) -> list:
+    """回傳這個實驗實際存在的診斷圖表，附上前端可直接載入的 URL。"""
+    from urllib.parse import quote
+
+    run_dir = TRAIN_RUNS_DIR / model_name
+    charts = []
+    for label, filenames in EVAL_CHART_CANDIDATES:
+        for fname in filenames:
+            if (run_dir / fname).exists():
+                charts.append({
+                    "name": label,
+                    "url": f"/api/model/evaluation/charts/{fname}?model={quote(model_name)}",
+                })
+                break
+    return charts
+
+
 @tool
 def skill_eval(
-    model_name: Annotated[str, Field(description="要評估的實驗名稱，對應 runs/train/<model_name>")] = "exp",
+    model_name: Annotated[str, Field(description="要評估的實驗名稱，對應 runs/train/<model_name>；留空或填 latest 就自動用最近一次訓練完成的模型")] = "",
 ) -> dict:
     """模型評估流程（Skill）：呼叫 evaluate_yolo_model 拿到 mAP/Loss 摘要後，
     再跑一個確定性的 Evaluation Gate —— mAP50 >= 0.5 才算通過，並把結果寫回
-    workspace_state.json，讓下一次 skill_infer/skill_train 可以讀到最新狀態。"""
+    workspace_state.json，讓下一次 skill_infer/skill_train 可以讀到最新狀態。
+
+    使用者說「剛剛訓練完的模型」「最新的模型」時不用自己猜名稱：model_name 留空
+    （或填 latest）就會自動解析成最近一次有訓練紀錄的實驗。回傳值一律包含
+    resolved_model_name 與 charts（混淆矩陣／F1／P-R 曲線），評估這個動作本身
+    不需要使用者提供任何圖片。"""
+    requested = (model_name or "").strip()
+    if requested.lower() in ("", "latest", "last", "newest"):
+        resolved = _latest_trained_model()
+        if not resolved:
+            return {
+                "status": "no_data",
+                "message": "runs/train 底下沒有任何含 results.csv 的訓練紀錄，目前沒有模型可以評估。",
+            }
+    else:
+        resolved = requested
+        if not (TRAIN_RUNS_DIR / resolved / "results.csv").exists():
+            fallback = _latest_trained_model()
+            return {
+                "status": "no_data",
+                "message": (
+                    f"找不到模型「{resolved}」的訓練紀錄（runs/train/{resolved}/results.csv 不存在）。"
+                    + (f"最近一次有紀錄的訓練是「{fallback}」，要評估它請改用這個名稱。" if fallback else "")
+                ),
+            }
+
+    model_name = resolved
     result = evaluate_yolo_model.invoke({"model_name": model_name})
     if result.get("status") != "success":
-        return result
+        return {**result, "resolved_model_name": model_name}
 
     passed = bool(result.get("final_map50", 0) >= EVAL_MAP50_GATE)
     state = _read_state()
@@ -226,7 +293,13 @@ def skill_eval(
     }
     _write_state(state)
 
-    return {"gate_passed": passed, "gate_threshold": EVAL_MAP50_GATE, **result}
+    return {
+        "gate_passed": passed,
+        "gate_threshold": EVAL_MAP50_GATE,
+        "resolved_model_name": model_name,
+        "charts": _eval_charts(model_name),
+        **result,
+    }
 
 
 SKILL_TOOLS = [skill_train, skill_infer, skill_eval]

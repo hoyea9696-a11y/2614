@@ -236,6 +236,23 @@ async def list_models():
     models = [f.name for f in MODEL_DIR.glob("*.pt")]
     return {"models": models}
 
+@app.post("/api/models/delete")
+async def delete_model(model_name: str = Form(...)):
+    """刪除訓練產出的模型檔。只允許刪 *_best.pt（訓練產物），預訓練權重不給刪；
+    路徑鎖死在 models/ 資料夾內，防止用 ../ 之類的名稱越權刪檔。"""
+    try:
+        target = (MODEL_DIR / model_name).resolve()
+        if target.parent != MODEL_DIR.resolve() or target.suffix != ".pt":
+            return {"status": "error", "message": "不合法的模型名稱"}
+        if not model_name.endswith("_best.pt"):
+            return {"status": "error", "message": "只能刪除訓練產出的模型（*_best.pt），預訓練權重不可刪除"}
+        if not target.exists():
+            return {"status": "error", "message": "找不到這個模型檔"}
+        target.unlink()
+        return {"status": "success", "message": f"已刪除模型 {model_name}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 from fastapi.responses import FileResponse
 
 @app.get("/api/model/evaluation/charts/{chart_name}")
@@ -545,13 +562,37 @@ async def ai_chat(request: ChatRequest):
         
         final_context = request.context_data or {}
         final_context.update(auto_context)
+        # 訓練授權只認前端在本次頁面送來的原始選取值。後面健康度分析可能為了回答
+        # 問題而更新 final_context["activeDataset"]，不能讓那個補充資料變成開訓依據。
+        selected_dataset_for_training = final_context.get("activeDataset", "")
         
         print(f">>> [AI Chat Request] Platform: {request.model_type}")
         user_msg = request.messages[-1]["content"] if request.messages else ""
         # --- 意圖偵測：健康度 vs 模型診斷（可共存） ---
         # 健康度觸發：訊息中出現「健康」「品質」「體檢」等資料集相關字眼
-        health_keywords = ["健康", "品質", "體檢"]
+        health_keywords = ["健康", "品質", "體檢", "覆蓋率", "標註", "資料集", "dataset", "狀況", "狀態"]
         is_health_request = any(k in user_msg for k in health_keywords)
+
+        # 使用者訊息中明確點名的資料集（長名優先，防止「測」搶先誤匹配「測試」）。
+        # 單字元的資料集名稱（如「2」「花」）太容易撞到一般文字，必須連著「資料集」
+        # 一起出現才算點名；比對前先拿掉括號、引號等修飾符號，讓「[2]資料集」
+        # 「「花」資料集」這類寫法也能配到。
+        import re as _re
+        stripped_msg = _re.sub(r"[\[\]（）()「」『』【】<>\"'`＊*\s]", "", user_msg)
+        mentioned_ds = None
+        for name in sorted(summarized_datasets, key=len, reverse=True):
+            if not name:
+                continue
+            if len(name) >= 2 and name.lower() in user_msg.lower():
+                mentioned_ds = name
+                break
+            if len(name) == 1 and f"{name}資料集" in stripped_msg:
+                mentioned_ds = name
+                break
+
+        # 有點名資料集就視為在問它的狀態（這個旗標之後還要用來決定模型診斷的優先順序）
+        if mentioned_ds:
+            is_health_request = True
         
         # 模型診斷觸發：訊息中出現「模型」「訓練」「效能」等字眼，但排除純健康度請求
         model_exclusive_keywords = ["模型", "訓練", "效能", "表現", "mAP", "Loss"]
@@ -560,49 +601,86 @@ async def ai_chat(request: ChatRequest):
         has_model_specific = any(k in user_msg for k in model_exclusive_keywords)
         has_general = any(k in user_msg for k in model_general_keywords)
         is_model_request = has_model_specific or (has_general and not is_health_request)
+        # 訓練請求不需要先評估舊模型；兩種意圖都含有「模型／訓練」字眼，必須先區分。
+        train_keywords = ["訓練模型", "訓練一個", "開始訓練", "幫我訓練", "重新訓練", "train a model"]
+        is_train_request = any(kw in user_msg for kw in train_keywords)
 
         
-        if is_health_request:
-            # 找出目標資料集名稱
-            ds_name = final_context.get("activeDataset", "")
-            
-            # 如果 activeDataset 為空或 "None"，嘗試從訊息中匹配
-            if not ds_name or ds_name == "None":
-                for name in summarized_datasets:
-                    if name in user_msg:
-                        ds_name = name
-                        break
-            
-            if ds_name and ds_name != "None":
-                print(f">>> [Health] 正在分析資料集: {ds_name}")
-                health_result = ai_analyzer.analyze_dataset_health(ds_name)
-                if health_result.get("status") == "success":
-                    final_context["health_data"] = health_result
-                    print(f">>> [Health] 分析成功: score={health_result['score']}")
+        # 只要判斷得出使用者在講哪個資料集（訊息點名的優先，否則用前端選取的），就一律
+        # 注入真實健康數據——不再用關鍵字當閘門。原本要命中「健康／品質／體檢」才注入，
+        # 使用者換個說法（例如「現在的資料集狀況如何」）就注入不到，模型手上沒有任何
+        # 數字，只好整段編造圖片數／類別數／標註率，是最容易被誤信的失效模式。掃一次
+        # 資料夾的成本遠低於一次幻覺。
+        ds_name = mentioned_ds or final_context.get("activeDataset", "")
+        if ds_name and ds_name != "None":
+            print(f">>> [Health] 正在分析資料集: {ds_name}")
+            health_result = ai_analyzer.analyze_dataset_health(ds_name)
+            if health_result.get("status") == "success":
+                final_context["health_data"] = health_result
+                # 讓系統提示詞的「當前活動資料集」與診斷摘要標頭顯示正確名稱，
+                # 而不是前端還沒選資料集時的 "None"
+                final_context["activeDataset"] = ds_name
+                print(f">>> [Health] 分析成功: score={health_result['score']}")
                     
         # --- [模型效能診斷] 根據雙軌制判斷結果注入數據 ---
-        if is_model_request:
+        missing_model_record = None
+        auto_selected_model = None
+        no_train_record_at_all = False
+        if is_model_request and not is_train_request:
             try:
                 import pandas as pd
                 runs_dir = BASE_DIR / "runs" / "train"
                 if runs_dir.exists():
-                    # 優先尋找使用者在括號中提到的模型名稱，例如 [花-訓練]
-                    import re
-                    mentioned_models = re.findall(r"\[(.*?)\]", user_msg)
+                    # 直接比對 runs/train 底下的實驗名稱（長名優先，避免「1」搶先誤配到
+                    # 「訓練-1」）。以前只認方括號寫法「[花-訓練]」，使用者直接打
+                    # 「評估模型 花-訓練」就配不到，程式會默默改用「最新的一次訓練」，
+                    # 於是回答的其實是別的模型的數據。stripped_msg 已去掉括號與空白，
+                    # 所以加不加括號都能配到。
+                    # 比對範圍同時包含 runs/train 的實驗名稱與 models/ 的模型檔名——
+                    # 使用者講的可能是模型庫裡但沒有訓練紀錄的模型（例如預訓練權重），
+                    # 那種情況要明確回報「沒有訓練紀錄」，不能悄悄改用別人的數據。
+                    candidates = {d.name for d in runs_dir.iterdir() if d.is_dir()}
+                    for f in MODEL_DIR.glob("*.pt"):
+                        stem = f.stem
+                        candidates.add(stem[:-5] if stem.endswith("_best") else stem)
+
+                    # 「評估剛剛訓練完的模型」這種時間指涉沒有模型名稱可比對，直接視為
+                    # 要用最近一次訓練；先判斷這個意圖，才不會被句子裡的字碎片誤配到
+                    # 某個舊實驗名稱。
+                    latest_ref_keywords = ["剛剛", "剛才", "剛訓練", "剛練", "剛完成",
+                                           "最新", "最近", "上一次", "上次", "這次", "新訓練"]
+                    wants_latest = any(k in user_msg for k in latest_ref_keywords)
+
+                    mentioned_model = None
+                    if not wants_latest:
+                        for name in sorted(candidates, key=len, reverse=True):
+                            # 單字元名稱（如「1」）太容易撞到句子裡的數字，只認完整檔名寫法
+                            if len(name) >= 2 and name in stripped_msg:
+                                mentioned_model = name
+                                break
+                            if f"{name}_best.pt" in stripped_msg:
+                                mentioned_model = name
+                                break
+
                     target_exp = None
-                    
-                    if mentioned_models:
-                        model_name = mentioned_models[0].replace("_best.pt", "").replace(".pt", "")
-                        possible_dir = runs_dir / model_name
-                        if possible_dir.exists():
+                    if mentioned_model:
+                        possible_dir = runs_dir / mentioned_model
+                        if (possible_dir / "results.csv").exists():
                             target_exp = possible_dir
-                    
-                    # 如果沒指定或找不到指定，則找最新的一個
-                    if not target_exp:
+                        else:
+                            # 有明確點名卻沒有訓練紀錄：要講清楚，不能悄悄換成別的模型
+                            missing_model_record = mentioned_model
+                    else:
+                        # 沒點名模型（或講的是「剛剛訓練完的」）就取最近一次有紀錄的訓練。
+                        # 用 results.csv 的修改時間排序：訓練過程中每個 epoch 都會寫入這個
+                        # 檔案，比資料夾的 mtime 更貼近「最後一次真的在訓練」的時間。
                         exps = [d for d in runs_dir.iterdir() if d.is_dir() and (d / "results.csv").exists()]
                         if exps:
-                            target_exp = max(exps, key=lambda x: x.stat().st_mtime)
-                    
+                            target_exp = max(exps, key=lambda d: (d / "results.csv").stat().st_mtime)
+                            auto_selected_model = target_exp.name
+                        else:
+                            no_train_record_at_all = True
+
                     if target_exp:
                         csv_path = target_exp / "results.csv"
                         if csv_path.exists():
@@ -655,6 +733,26 @@ async def ai_chat(request: ChatRequest):
             reply = ai_engine.chat(request.messages, final_context, request.model_type)
         except Exception as chat_err:
             reply = f"[AI 暫時不可用]: {str(chat_err)}"
+
+        # 健康圖卡的數據一律由後端附上：以前是叫 LLM 自己把 health JSON 抄一遍進
+        # [HEALTH_DATA: ...]，它抄錯格式（甚至憑空編數字）就會讓整段標籤裸露在畫面上、
+        # 或畫出假圖卡。這裡先清掉 LLM 自己寫的標籤，再貼上後端的真實數據。
+        reply = _re.sub(r"\[HEALTH_DATA:.*?\]", "", reply, flags=_re.S).rstrip()
+
+        # 使用者點名了某個模型但它沒有訓練紀錄：明講原因，不要讓使用者以為是 AI 壞了
+        if missing_model_record:
+            reply += (f"\n\n⚙️ [系統提示]：找不到模型「{missing_model_record}」的訓練紀錄"
+                      f"（runs/train/{missing_model_record}/results.csv 不存在），因此無法提供效能數據。")
+
+        # 自動挑了「最近一次訓練」時要說是哪一個，使用者才不用猜評估的是哪個模型
+        if auto_selected_model:
+            reply += f"\n\n⚙️ [系統提示]：已自動選用最近一次訓練「{auto_selected_model}」的紀錄進行評估。"
+        elif no_train_record_at_all:
+            reply += "\n\n⚙️ [系統提示]：目前 runs/train 底下沒有任何含 results.csv 的訓練紀錄，無法評估。"
+
+        if is_health_request and final_context.get("health_data"):
+            health_tag = json.dumps(final_context["health_data"], ensure_ascii=False)
+            reply += f"\n\n[HEALTH_DATA: {health_tag}]"
         
         # --- 自動標記觸發邏輯 (雙重驗證) ---
         trigger_ds = None
@@ -725,6 +823,63 @@ async def ai_chat(request: ChatRequest):
                 threading.Thread(target=run_auto_label, daemon=True).start()
                 reply += f"\n\n⚙️ **[系統提示]**：已啟動自動標記引擎，正在為「{trigger_ds}」進行標記..."
 
+        # --- [直接訓練] 舊式關鍵字觸發 ---
+        # 這是「沒有 LangGraph」的行為：訊息中出現訓練意圖＋資料集名稱就直接開始
+        # 訓練——不詢問參數、不跳確認視窗、無視使用者指定的參數，一律吃寫死的預
+        # 設值，練完還會自動把模型塞進模型庫。跟 Manager Agent 的「提案參數→使用
+        # 者確認→參數上鎖→詢問是否存入模型庫」形成對照。
+        if is_train_request and not is_label_request:
+            # 一般模式只能使用使用者在本次專案頁面明確點選的資料集。
+            # 不採用訊息中猜到的名稱，也不使用瀏覽器上一次留下的選取值，避免誤訓練。
+            train_ds = None
+            ctx_ds = selected_dataset_for_training
+            if ctx_ds and ctx_ds != "None" and ctx_ds in summarized_datasets:
+                train_ds = ctx_ds
+
+            if not train_ds:
+                reply += ("\n\n⚙️ [系統提示]：偵測到訓練指令，但目前尚未選擇資料集，未啟動訓練。"
+                          "請先到「資料集管理」點選要使用的資料集，再重新送出訓練要求。")
+            elif trainer.progress.get("status") == "training":
+                reply += "\n\n⚙️ [系統提示]：已有訓練正在進行中，未重複啟動。"
+            else:
+                try:
+                    data_yaml = trainer.prepare_dataset(str(DATASET_DIR / train_ds))
+
+                    # 實驗名稱帶上資料集與時間，避免每次聊天觸發的訓練都覆蓋掉同一份
+                    # runs/train 紀錄與同一個模型檔（原本固定叫 chat_direct，第二次訓練
+                    # 就會把第一次的成果蓋掉，事後也分不出是哪個資料集練的）。
+                    from datetime import datetime
+                    safe_ds = "".join(c for c in train_ds if c.isalnum() or c in "-_") or "ds"
+                    exp_name = f"chat_{safe_ds}_{datetime.now().strftime('%m%d_%H%M')}"
+                    deployed_name = f"{exp_name}_best.pt"
+
+                    def run_direct_train():
+                        trainer.train(
+                            variant="yolov9s.pt",
+                            data_yaml=data_yaml,
+                            epochs=20,
+                            imgsz=320,
+                            batch=4,
+                            patience=50,
+                            model_name=exp_name
+                        )
+                        # 跟 /api/train/start 一樣，練完直接部署到 models/——不問使用者
+                        project_root = Path(__file__).resolve().parent.parent
+                        best_pt = project_root / "runs" / "train" / exp_name / "weights" / "best.pt"
+                        if best_pt.exists():
+                            shutil.copy2(str(best_pt), str(MODEL_DIR / deployed_name))
+                            print(f"Model deployed to models/{deployed_name}")
+                        else:
+                            print(f"Warning: best.pt not found at {best_pt}")
+
+                    threading.Thread(target=run_direct_train, daemon=True).start()
+                    reply += (f"\n\n⚙️ [系統提示]：已直接啟動模型訓練（資料集：{train_ds}；"
+                              "參數採系統預設 yolov9s.pt / epochs 20 / imgsz 320 / batch 4，未經確認）。"
+                              f"完成後會自動存入模型庫，名稱為「{deployed_name}」。"
+                              "進度請到「模型訓練中心」查看，也可在該頁停止訓練。")
+                except Exception as train_err:
+                    reply += f"\n\n⚙️ [系統提示]：訓練啟動失敗：{train_err}"
+
         return {"status": "success", "reply": reply}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -745,6 +900,9 @@ class ManagerAgentResumeRequest(BaseModel):
     thread_id: str
     model_type: str = "gemini"
     approved: bool
+    interrupt_id: str
+    operation_id: Optional[str] = None
+
 
 # 這個伺服器行程啟動時產生一次的識別碼——重開終端機（重啟 server）會換一組新的，
 # 同一個行程一直活著（前端重新整理頁面）則不變。前端拿它來區分「重新整理」跟
@@ -753,6 +911,15 @@ SERVER_BOOT_ID = uuid.uuid4().hex
 
 # 依 model_type 各自快取一份 Graph，換模型（gemini/groq/gemma/local）不用重啟服務
 _manager_agent_graphs = {}
+_manager_agent_thread_locks = {}
+_manager_agent_thread_locks_guard = threading.Lock()
+
+
+def _try_acquire_agent_thread(thread_id: str):
+    """同一個 LangGraph thread 同一時間只允許一條 stream 推進 checkpoint。"""
+    with _manager_agent_thread_locks_guard:
+        lock = _manager_agent_thread_locks.setdefault(thread_id, threading.Lock())
+    return lock if lock.acquire(blocking=False) else None
 
 @app.get("/api/agent/boot")
 async def agent_boot():
@@ -760,8 +927,44 @@ async def agent_boot():
     return {"status": "success", "boot_id": SERVER_BOOT_ID}
 
 
+# Agent 要做推論時需要一個「圖片的絕對路徑」（skill_infer 收的是路徑，不是檔案本身）。
+# 聊天視窗原本沒有上傳功能，使用者只能自己去檔案總管複製路徑貼進來。這個端點單純把
+# 上傳的圖片存進 data/uploads/ 並回傳絕對路徑，前端拿到後填進輸入框即可。
+AGENT_UPLOAD_ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+@app.post("/api/agent/upload")
+async def agent_upload(file: UploadFile = File(...)):
+    try:
+        ext = Path(file.filename or "").suffix.lower()
+        if ext not in AGENT_UPLOAD_ALLOWED_EXTS:
+            return {
+                "status": "error",
+                "message": f"不支援的檔案類型 {ext or '（無副檔名）'}，請上傳圖片（{', '.join(sorted(AGENT_UPLOAD_ALLOWED_EXTS))}）",
+            }
+
+        # 檔名只保留安全字元，並加上時間戳避免互相覆蓋；路徑鎖死在 uploads/ 內
+        stem = "".join(c for c in Path(file.filename or "image").stem if c.isalnum() or c in "-_") or "image"
+        from datetime import datetime
+        safe_name = f"agent_{datetime.now().strftime('%m%d_%H%M%S')}_{stem}{ext}"
+        save_path = (UPLOAD_DIR / safe_name).resolve()
+        if save_path.parent != UPLOAD_DIR.resolve():
+            return {"status": "error", "message": "不合法的檔名"}
+
+        with save_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        return {
+            "status": "success",
+            "filename": safe_name,
+            "path": str(save_path),
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/api/agent/roboflow/readiness")
-async def roboflow_readiness():
+async def roboflow_readiness(dataset_name: Optional[str] = None):
     """回傳 Roboflow 補資料功能的目前資格與原因。
 
     這是純讀取的診斷 API：不會呼叫 Roboflow、建立 Agent graph 或修改資料集，
@@ -773,10 +976,12 @@ async def roboflow_readiness():
         check_dataset_health,
         get_latest_roboflow_operation,
     )
-    from multi_agent import _active_dataset_is_single_class, _active_dataset_name
+    from multi_agent import _active_dataset_name
     from skills import COVERAGE_GATE
 
-    dataset_name = _active_dataset_name()
+    # 面板必須反映前端目前點選的資料集；若沒有傳入名稱，才沿用訓練流程最後
+    # 寫入 workspace_state.json 的資料集，保持既有 Agent 流程相容。
+    dataset_name = dataset_name or _active_dataset_name()
     if not dataset_name:
         return {
             "status": "success",
@@ -786,11 +991,18 @@ async def roboflow_readiness():
             "api_key_configured": bool(_load_roboflow_key()),
         }
 
-    dataset_path = DATASET_DIR / dataset_name
+    dataset_path = (DATASET_DIR / dataset_name).resolve()
+    if dataset_path.parent != DATASET_DIR.resolve() or not dataset_path.is_dir():
+        return {
+            "status": "error",
+            "message": "找不到指定的資料集",
+        }
     image_count = _count_images(dataset_path)
     health = check_dataset_health.invoke({"dataset_name": dataset_name})
     health_ok = health.get("status") == "success" and (health.get("coverage") or 0) >= COVERAGE_GATE
-    single_class = _active_dataset_is_single_class()
+    class_distribution = health.get("class_distribution") or {}
+    used_classes = [item for item in class_distribution.values() if (item.get("count") or 0) > 0]
+    single_class = len(used_classes) == 1
 
     state = {}
     state_path = BASE_DIR / "workspace_state.json"
@@ -831,6 +1043,7 @@ async def roboflow_readiness():
         "latest_operation": get_latest_roboflow_operation(dataset_name),
     }
 
+
 def _get_manager_agent_graph(model_type: str = "gemini"):
     if model_type not in _manager_agent_graphs:
         from manager_agent import get_default_chat_model
@@ -859,10 +1072,28 @@ async def agent_chat(request: ManagerAgentChatRequest):
         return StreamingResponse(stop_stream(), media_type="text/event-stream")
 
     graph = _get_manager_agent_graph(request.model_type)
+    thread_lock = _try_acquire_agent_thread(request.thread_id)
+    if thread_lock is None:
+        raise HTTPException(status_code=409, detail="這個 Agent 任務仍在執行中，請等待目前操作完成。")
+
+    config = {"configurable": {"thread_id": request.thread_id}}
+    try:
+        snapshot = graph.get_state(config)
+        if snapshot.interrupts:
+            raise HTTPException(
+                status_code=409,
+                detail="這個 Agent 任務正在等待確認，請先完成目前的確認操作。",
+            )
+    except Exception:
+        thread_lock.release()
+        raise
 
     def event_stream():
-        for entry in stream_trace(graph, request.thread_id, user_message=request.message):
-            yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+        try:
+            for entry in stream_trace(graph, request.thread_id, user_message=request.message):
+                yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+        finally:
+            thread_lock.release()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -873,10 +1104,32 @@ async def agent_resume(request: ManagerAgentResumeRequest):
     決定（approved）從暫停處恢復（見 multi_agent.stream_trace 的 resume_value）。"""
     from multi_agent import stream_trace
     graph = _get_manager_agent_graph(request.model_type)
+    thread_lock = _try_acquire_agent_thread(request.thread_id)
+    if thread_lock is None:
+        raise HTTPException(status_code=409, detail="這個 Agent 任務仍在執行中，請勿重複送出確認。")
+
+    config = {"configurable": {"thread_id": request.thread_id}}
+    try:
+        snapshot = graph.get_state(config)
+        if not snapshot.interrupts:
+            raise HTTPException(status_code=409, detail="這個確認已處理或已失效，請重新整理狀態。")
+        pending_interrupt = snapshot.interrupts[0]
+        if pending_interrupt.id != request.interrupt_id:
+            raise HTTPException(status_code=409, detail="確認識別碼已過期，未執行任何操作。")
+        payload = pending_interrupt.value if isinstance(pending_interrupt.value, dict) else {}
+        expected_operation_id = payload.get("operation_id")
+        if expected_operation_id and request.operation_id != expected_operation_id:
+            raise HTTPException(status_code=409, detail="操作識別碼不一致，未啟動訓練。")
+    except Exception:
+        thread_lock.release()
+        raise
 
     def event_stream():
-        for entry in stream_trace(graph, request.thread_id, resume_value={"approved": request.approved}):
-            yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+        try:
+            for entry in stream_trace(graph, request.thread_id, resume_value={"approved": request.approved}):
+                yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+        finally:
+            thread_lock.release()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -891,7 +1144,13 @@ async def agent_pending(thread_id: str, model_type: str = "gemini"):
     config = {"configurable": {"thread_id": thread_id}}
     snapshot = graph.get_state(config)
     if snapshot.interrupts:
-        return {"status": "success", "pending": True, "payload": snapshot.interrupts[0].value}
+        pending_interrupt = snapshot.interrupts[0]
+        return {
+            "status": "success",
+            "pending": True,
+            "interrupt_id": pending_interrupt.id,
+            "payload": pending_interrupt.value,
+        }
     return {"status": "success", "pending": False}
 
 @app.get("/api/agent/graph")

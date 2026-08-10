@@ -91,15 +91,30 @@ def _sanitize_name(name: str) -> str:
     return cleaned
 
 
-def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
-    """解壓前先確認每個成員的目標路徑都落在 dest 底下，防止惡意/被竄改的 zip
-    用 ../../ 這種路徑跳出去覆寫任意檔案（zip slip）。"""
+def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path, max_path_len: int = 200) -> None:
+    """安全解壓：擋 zip slip，並在寫檔前把過長的檔名改短。
+
+    兩個都必須在「寫入的當下」處理，不能事後補救：
+    - zip slip：成員路徑用 ../../ 跳出 dest 之外覆寫任意檔案。
+    - Windows 260 字元上限：Roboflow 匯出的檔名是「原始檔名 + 兩段雜湊」，動輒
+      180 字元以上，接在暫存目錄後面就爆掉。以前用 zf.extractall() 一次解完，
+      建檔時就直接丟 ENOENT（訊息看起來像「檔案不存在」，其實是路徑太長建不出來）。
+      這裡逐個成員寫入，過長就把 stem 換成雜湊短名——圖片與標註檔的 stem 本來相同，
+      雜湊後仍然相同，所以 YOLO 的圖片／標註配對關係不會斷。
+    """
     dest_root = dest.resolve()
     for member in zf.infolist():
         target = (dest / member.filename).resolve()
         if target != dest_root and dest_root not in target.parents:
             raise ValueError(f"壓縮檔內含不安全的路徑，已中止解壓：{member.filename}")
-    zf.extractall(dest)
+        if member.is_dir():
+            continue
+        if len(str(target)) > max_path_len:
+            short_stem = hashlib.sha1(target.stem.encode("utf-8", "ignore")).hexdigest()[:12]
+            target = target.with_name(short_stem + target.suffix)
+        os.makedirs(_win_long_path(target.parent), exist_ok=True)
+        with zf.open(member) as source, open(_win_long_path(target), "wb") as out:
+            shutil.copyfileobj(source, out)
 
 
 def _load_roboflow_key() -> Optional[str]:
@@ -155,9 +170,46 @@ def _label_path_for_image(image_path: Path) -> Path:
     return image_path.with_suffix(".txt")
 
 
+def _win_long_path(path: Path) -> str:
+    """回傳可以繞過 Windows 260 字元上限的路徑字串（加上 \\\\?\\ 前綴）。
+
+    超過上限時 Windows API 會直接失敗，而且回報的是 ENOENT——看起來像「檔案不存在」，
+    但檔案其實在那裡（rglob 列得出來、open() 卻打不開）。
+    """
+    text = str(path)
+    if os.name == "nt" and not text.startswith("\\\\?\\"):
+        return "\\\\?\\" + text
+    return text
+
+
+def _shorten_staged_filenames(root: Path, max_len: int = 200) -> int:
+    """把解壓後過長的檔名改短，維持圖片與標註檔的 stem 一致。
+
+    Roboflow 匯出的檔名是「原始檔名 + 兩段雜湊」，動輒 180 字元以上，接在暫存目錄
+    後面就超過 Windows 的路徑上限，導致後面讀圖片算雜湊時整個流程炸掉。這裡在評估
+    前先正規化檔名；改的是暫存區的副本，不影響正式資料集。
+    """
+    renamed = 0
+    images = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+    for image in images:
+        if len(str(image)) <= max_len:
+            continue
+        short_stem = hashlib.sha1(image.stem.encode("utf-8", "ignore")).hexdigest()[:12]
+        label = _label_path_for_image(image)
+        try:
+            os.rename(_win_long_path(image), _win_long_path(image.with_name(short_stem + image.suffix)))
+            # 標註檔的路徑同樣可能過長，exists() 會誤判成 False，一律用長路徑判斷
+            if os.path.exists(_win_long_path(label)):
+                os.rename(_win_long_path(label), _win_long_path(label.with_name(short_stem + label.suffix)))
+            renamed += 1
+        except OSError as exc:
+            print(f"--- [Roboflow] 縮短檔名失敗（略過這張圖）: {exc} ---")
+    return renamed
+
+
 def _image_hash(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open(_win_long_path(path), "rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
@@ -502,7 +554,15 @@ def prepare_roboflow_augmentation(
     if not local_classes:
         return {"status": "error", "message": f"資料集 {dataset_name} 沒有可辨識的類別名稱，無法安全對應"}
 
-    search_query = (query or f"{dataset_name} object detection").strip()
+    # 搜尋關鍵字優先用資料集實際的類別名稱，而不是資料夾名稱：資料夾常被命名成
+    # bear-1（複製出來的）、測試、my_custom_model 這種跟內容無關的名字，拿它去
+    # Roboflow Universe 搜幾乎搜不到東西，於是「找不到候選」被誤解成功能壞掉。
+    # 類別名稱才是真正描述資料內容的字。
+    if query:
+        search_query = query.strip()
+    else:
+        class_terms = " ".join(local_classes[:3]).strip()
+        search_query = f"{class_terms} object detection" if class_terms else f"{dataset_name} object detection"
     search = _search_roboflow_universe(search_query, max(1, min(max_candidates, 10)))
     if search.get("status") != "success":
         return search
@@ -528,7 +588,8 @@ def prepare_roboflow_augmentation(
     existing_hashes = _existing_image_hashes(dataset_root)
 
     for candidate in candidates:
-        proposal_id = uuid.uuid4().hex
+        # 只取 12 個字元：暫存路徑越短，留給 Roboflow 那些超長檔名的空間就越多
+        proposal_id = uuid.uuid4().hex[:12]
         proposal_root = _proposal_path(proposal_id)
         staged_root = proposal_root / "dataset"
         download = _download_roboflow_export(
@@ -540,6 +601,11 @@ def prepare_roboflow_augmentation(
         if download.get("status") != "success":
             shutil.rmtree(proposal_root, ignore_errors=True)
             continue
+
+        # 先把過長的檔名改短，再開始逐張讀圖評估（否則 Windows 會在讀檔時 ENOENT）
+        shortened = _shorten_staged_filenames(staged_root)
+        if shortened:
+            print(f"--- [Roboflow] 已縮短 {shortened} 個過長檔名以符合 Windows 路徑上限 ---")
 
         source_classes = _read_dataset_class_names(staged_root)
         class_mapping = []

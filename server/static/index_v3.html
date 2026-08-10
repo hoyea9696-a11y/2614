@@ -199,12 +199,16 @@
                     <div class="params-grid">
                         <div class="param-item">
                             <label>選用模型</label>
-                            <select id="verify-model-select" class="tech-select model-selector">
-                                <option value="yolov9s.pt">YOLOv9 S</option>
-                                <option value="yolov9m.pt" selected>YOLOv9 M</option>
-                                <option value="yolov9c.pt">YOLOv9 C</option>
-                                <option value="yolov9e.pt">YOLOv9 E</option>
-                            </select>
+                            <div style="display:flex; gap:6px; align-items:stretch;">
+                                <select id="verify-model-select" class="tech-select model-selector" style="flex:1; min-width:0;">
+                                    <option value="yolov9s.pt">YOLOv9 S</option>
+                                    <option value="yolov9m.pt" selected>YOLOv9 M</option>
+                                    <option value="yolov9c.pt">YOLOv9 C</option>
+                                    <option value="yolov9e.pt">YOLOv9 E</option>
+                                </select>
+                                <button onclick="deleteSelectedModel('verify-model-select')" title="刪除選取的訓練模型（僅限 *_best.pt，預訓練權重不可刪）"
+                                    style="border:1px solid rgba(239,68,68,.45); background:rgba(239,68,68,.08); color:#ef4444; border-radius:8px; padding:0 10px; cursor:pointer; font-size:1rem;">🗑️</button>
+                            </div>
                         </div>
                         <div class="param-item">
                             <label>影像解析度</label>
@@ -255,6 +259,9 @@
                         <select id="diagnosis-model-select" class="tech-select" style="min-width: 200px;">
                             <option value="">-- 請選擇要診斷的模型 --</option>
                         </select>
+                        <button onclick="deleteSelectedModel('diagnosis-model-select')"
+                            title="刪除選取的訓練模型（僅限 *_best.pt，預訓練權重不可刪）"
+                            style="border:1px solid rgba(239,68,68,.45); background:rgba(239,68,68,.08); color:#ef4444; border-radius:8px; padding:6px 10px; cursor:pointer; font-size:1rem;">🗑️</button>
                     </div>
                     <button class="btn primary-btn" onclick="loadDiagnosisCharts()" style="font-size: 0.8rem;">載入報告</button>
                 </div>
@@ -326,6 +333,9 @@
     <div id="ai-chat-window"
         style="display: none; position: fixed; bottom: 100px; right: 24px; width: 350px; height: 500px; background: rgba(30, 41, 59, 0.95); backdrop-filter: blur(10px); border: 1px solid rgba(59, 130, 246, 0.3); border-radius: 16px; box-shadow: 0 10px 40px rgba(59, 130, 246, 0.2); z-index: 1000; flex-direction: column; overflow: hidden;">
         <div style="background: linear-gradient(to right, #3b82f6, #8b5cf6); height: 4px; width: 100%;"></div>
+        <div id="ai-chat-resize-handle" title="拖曳調整視窗大小"
+            style="position: absolute; top: 4px; left: 0; width: 22px; height: 22px; cursor: nw-resize; z-index: 10; border-top-left-radius: 16px; background: repeating-linear-gradient(135deg, rgba(148,163,184,.5) 0 2px, transparent 2px 6px); opacity: .55;"
+            onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='.55'"></div>
         <div
             style="background: rgba(30, 41, 59, 0.8); padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;">
             <div style="color: white; font-weight: 700; display: flex; align-items: center; gap: 8px;">
@@ -337,9 +347,8 @@
                 <select id="ai-model-select" onchange="onAiModelSelectChange()"
                     style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; outline: none;">
                     <option value="gemini">Gemini 2.5 Flash</option>
-                    <option value="gemma">Gemma 4</option>
                     <option value="gemini-pro">Gemini 2.5 Pro</option>
-                    <option value="groq">Groq (Llama 3.3)</option>
+                    <option value="groq">GPT-OSS 120B (Groq)</option>
                     <option value="local">Local (Ollama)</option>
                     <option value="manager-agent">Manager Agent（測試版）</option>
                 </select>
@@ -399,8 +408,13 @@
         <div
             style="height: 60px; min-height: 60px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,0.1); background: #1e293b;">
             <div style="display: flex; gap: 8px; height: 100%;">
-                <input type="text" id="ai-chat-input" placeholder="輸入問題..."
-                    style="flex: 1; padding: 0 14px; background: rgba(255,255,255,0.05); border: 1px solid #3b82f6; border-radius: 8px; color: white; outline: none; height: 100%;"
+                <input type="file" id="ai-chat-file-input" accept="image/*" style="display:none;"
+                    onchange="handleAgentImagePick(this.files)">
+                <button onclick="document.getElementById('ai-chat-file-input').click()"
+                    title="上傳圖片給 Agent 做推論（也可以直接把圖片拖進輸入框）"
+                    style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15); color: #94a3b8; padding: 0 12px; border-radius: 8px; cursor: pointer; height: 100%; font-size: 1rem;">📎</button>
+                <input type="text" id="ai-chat-input" placeholder="輸入問題…（可拖曳圖片到這裡）"
+                    style="flex: 1; min-width: 0; padding: 0 14px; background: rgba(255,255,255,0.05); border: 1px solid #3b82f6; border-radius: 8px; color: white; outline: none; height: 100%;"
                     onkeypress="if(event.key === 'Enter') sendChatMessage()">
                 <button onclick="sendChatMessage()"
                     style="background: #3b82f6; border: none; color: white; padding: 0 16px; border-radius: 8px; cursor: pointer; font-weight: 600; height: 100%;">送出</button>
@@ -412,7 +426,7 @@
         <div style="width:min(560px,100%); max-height:88vh; overflow-y:auto; border:1px solid rgba(96,165,250,.4); border-radius:14px; background:#0f172a; box-shadow:0 20px 55px rgba(0,0,0,.45); padding:18px; color:#e2e8f0;">
             <div id="agent-confirm-title" style="font-weight:700; font-size:1rem; color:#f8fafc;"></div>
             <div id="agent-confirm-reason" style="margin-top:10px; color:#cbd5e1; line-height:1.55; font-size:.86rem;"></div>
-            <div id="agent-confirm-meta" style="display:none; margin-top:10px; padding:8px; border-radius:7px; background:rgba(30,41,59,.8); color:#94a3b8; font-size:.74rem; line-height:1.5;"></div>
+            <div id="agent-confirm-meta" style="display:none; margin-top:10px; padding:8px; border-radius:7px; background:rgba(30,41,59,.8); color:#94a3b8; font-size:.74rem; line-height:1.5; white-space:pre-line;"></div>
             <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:16px;">
                 <button id="agent-confirm-cancel" style="background:rgba(148,163,184,.12); border:1px solid rgba(148,163,184,.3); color:#cbd5e1; border-radius:7px; padding:7px 12px; cursor:pointer;">取消</button>
                 <button id="agent-confirm-approve" style="background:#2563eb; border:1px solid #3b82f6; color:white; border-radius:7px; padding:7px 12px; cursor:pointer;">繼續</button>

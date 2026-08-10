@@ -11,6 +11,9 @@ let isPaused = false;
 // 全域狀態與通訊
 // ------------------------------
 let activeDataset = JSON.parse(localStorage.getItem('ai_detector_active_ds') || 'null');
+// 僅供「一般模式」聊天使用：只有本次頁面收到使用者點選資料集的事件才會有值。
+// 不讀 localStorage，避免一般模式把上次工作區誤當成本次訓練的選擇。
+let generalChatDataset = null;
 
 // 監聽來自 iframe 的消息 (跨 Port 通訊)
 window.addEventListener('message', (event) => {
@@ -20,6 +23,7 @@ window.addEventListener('message', (event) => {
     if (data.type === 'DATASET_SELECTED') {
         activeDataset = data.dataset;
         localStorage.setItem('ai_detector_active_ds', JSON.stringify(activeDataset));
+        generalChatDataset = data.dataset;
         
         // 轉發給標記模組 iframe (Port 8002)
         const labelingIframe = document.getElementById('iframe-labeling');
@@ -28,6 +32,13 @@ window.addEventListener('message', (event) => {
                 type: 'DATASET_SELECTED',
                 dataset: activeDataset
             }, '*');
+        }
+
+        // 「目前資料集資訊」應跟著使用者剛點選的卡片更新，而不是停在上一次訓練
+        // 寫入 workspace_state.json 的資料集。
+        const roboflowPanel = document.getElementById('roboflow-status-panel');
+        if (roboflowPanel && roboflowPanel.style.display !== 'none') {
+            refreshRoboflowStatus();
         }
         
         showAlert(`已切換工作區: ${activeDataset.name}`, "success");
@@ -59,7 +70,104 @@ document.addEventListener('DOMContentLoaded', () => {
     switchPage(lastPage);
 
     initManagerAgentSession();
+    initChatWindowResize();
+    initChatImageDrop();
+    resumeTrainingWatchIfRunning();
 });
+
+// Agent 做推論吃的是「圖片的絕對路徑」（skill_infer 的 image_path），不是檔案本身。
+// 這裡把上傳／拖放的圖片存到 data/uploads/，再把回傳的絕對路徑填進輸入框，使用者
+// 就不用自己去檔案總管複製路徑。
+async function handleAgentImagePick(files) {
+    if (!files || !files.length) return;
+    const file = files[0];
+    if (!file.type.startsWith('image/')) {
+        appendMessage('只支援圖片檔案（jpg / png / bmp / webp）', 'error');
+        return;
+    }
+
+    const loadingId = appendMessage(`⏳ 正在上傳 ${file.name}…`, 'ai', true);
+    try {
+        const formData = new FormData();
+        formData.append('file', file);
+        const res = await fetch('/api/agent/upload', { method: 'POST', body: formData });
+        const data = await res.json();
+        removeMessage(loadingId);
+
+        if (data.status !== 'success') {
+            appendMessage(data.message || '上傳失敗', 'error');
+            return;
+        }
+
+        const input = document.getElementById('ai-chat-input');
+        const existing = input.value.trim();
+        // 沒打字時直接補一句可以送出的指令，打過字就只把路徑接在後面
+        input.value = existing
+            ? `${existing} ${data.path}`
+            : `用這張圖片做推論驗證：${data.path}`;
+        input.focus();
+        showAlert(`已上傳 ${data.filename}，路徑已填入輸入框`, 'success');
+    } catch (e) {
+        removeMessage(loadingId);
+        appendMessage('上傳失敗: ' + e.message, 'error');
+    } finally {
+        const picker = document.getElementById('ai-chat-file-input');
+        if (picker) picker.value = '';  // 清掉才能重複選同一個檔案
+    }
+}
+
+// 整個聊天視窗都可以當拖放區（不用精準拖到輸入框那一小條）。dragover 一定要
+// preventDefault，否則瀏覽器會用預設行為「直接開啟圖片」取代我們的處理。
+function initChatImageDrop() {
+    const zone = document.getElementById('ai-chat-window');
+    const input = document.getElementById('ai-chat-input');
+    if (!zone || !input) return;
+
+    const originalBorder = input.style.border;
+    const highlight = on => {
+        input.style.border = on ? '1px dashed #10b981' : originalBorder;
+    };
+
+    zone.addEventListener('dragover', e => { e.preventDefault(); highlight(true); });
+    zone.addEventListener('dragleave', e => {
+        // 只有真正離開整個視窗才取消高亮，避免在子元素之間移動時一直閃
+        if (!zone.contains(e.relatedTarget)) highlight(false);
+    });
+    zone.addEventListener('drop', e => {
+        e.preventDefault();
+        highlight(false);
+        const files = e.dataTransfer && e.dataTransfer.files;
+        if (files && files.length) handleAgentImagePick(files);
+    });
+}
+
+// LLM 聊天視窗固定在右下角，縮放把手放在左上角，往左上拖就是放大。
+// 只改 inline style、不寫入任何儲存，重新整理頁面自然回到 HTML 預設的 350x500。
+function initChatWindowResize() {
+    const chatWindow = document.getElementById('ai-chat-window');
+    const handle = document.getElementById('ai-chat-resize-handle');
+    if (!chatWindow || !handle) return;
+
+    handle.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        handle.setPointerCapture(e.pointerId);
+        const startX = e.clientX, startY = e.clientY;
+        const startW = chatWindow.offsetWidth, startH = chatWindow.offsetHeight;
+
+        const onMove = (ev) => {
+            const w = Math.min(Math.max(startW + (startX - ev.clientX), 320), window.innerWidth - 48);
+            const h = Math.min(Math.max(startH + (startY - ev.clientY), 420), window.innerHeight - 120);
+            chatWindow.style.width = `${w}px`;
+            chatWindow.style.height = `${h}px`;
+        };
+        const onUp = () => {
+            handle.removeEventListener('pointermove', onMove);
+            handle.removeEventListener('pointerup', onUp);
+        };
+        handle.addEventListener('pointermove', onMove);
+        handle.addEventListener('pointerup', onUp);
+    });
+}
 
 // 使用者在 confirm() 彈窗跳出來、還沒按下去之前關掉終端機／重新整理頁面，
 // SSE 連線會直接斷掉、彈窗也隨之消失，但 SqliteSaver 其實還留著暫停在
@@ -78,8 +186,12 @@ async function checkPendingAgentInterrupt() {
         const res = await fetch(`/api/agent/pending?thread_id=${encodeURIComponent(threadId)}&model_type=${encodeURIComponent(modelType)}`);
         const data = await res.json();
         if (data.pending) {
+            const pendingPayload = {
+                ...(data.payload || {}),
+                interrupt_id: data.interrupt_id
+            };
             await finishOrResumeAgentTurn(
-                { traceRefs: null, finalReply: null, sawError: false, interruptPayload: data.payload },
+                { traceRefs: null, finalReply: null, sawError: false, interruptPayload: pendingPayload },
                 threadId,
                 modelType
             );
@@ -262,7 +374,7 @@ function initChart() {
 
 async function loadTrainDatasets() {
     try {
-        const res = await fetch('/api/datasets/list');
+        const res = await fetch('/api/datasets/list', { cache: 'no-store' });
         const data = await res.json();
         const select = document.getElementById('train-dataset-select');
         const current = select.value;
@@ -313,45 +425,71 @@ async function startTraining() {
             return;
         }
 
-        document.getElementById('training-progress-card').style.display = 'block';
-        initChart();
-
-        trainInterval = setInterval(async () => {
-            if (isPaused) return;
-            try {
-                const r = await fetch('/api/train/status');
-                const d = await r.json();
-                
-                const progressBar = document.getElementById('train-progress-bar');
-                const statusText = document.getElementById('train-status-text');
-                
-                if (d.status === "training") {
-                    // 優先用後端算好的細粒度 percent（epoch 內就會動）；舊資料沒有才退回用 epoch 比例
-                    const p = (d.percent != null) ? Math.round(d.percent) : Math.round((d.current_epoch / d.total_epochs) * 100);
-                    progressBar.style.width = `${p}%`;
-                    statusText.innerText = `訓練進行中: 第 ${d.current_epoch} / ${d.total_epochs} 輪 (${p}%)`;
-                    
-                    if (d.metrics && d.metrics.length > 0) {
-                        trainChart.data.labels = d.metrics.map(m => m.epoch);
-                        trainChart.data.datasets[0].data = d.metrics.map(m => m.map);
-                        trainChart.data.datasets[1].data = d.metrics.map(m => m.loss);
-                        trainChart.update();
-                    }
-                } else if (d.status === "completed" || d.status === "error") {
-                    clearInterval(trainInterval);
-                    trainInterval = null;
-                    startBtn.disabled = false;
-                    startBtn.innerText = "啟動訓練";
-                    statusText.innerText = d.status === "completed" ? "訓練已完成" : "訓練發生錯誤";
-                    if (d.status === "completed") finishTraining("訓練成功完成", "success");
-                }
-            } catch (e) { console.error(e); }
-        }, 2000);
+        startTrainingWatch();
     } catch (e) {
         showAlert("啟動訓練失敗: " + e.message, "error");
         startBtn.disabled = false;
         startBtn.innerText = "啟動訓練";
     }
+}
+
+// 進度監看抽成獨立函式：不管訓練是從表單按鈕、聊天視窗關鍵字還是 Manager Agent
+// 啟動的，訓練中心都掛同一套進度圖與終止按鈕，不會再出現「訓練在跑但頁面沒動作、
+// 也沒地方可以終止」的狀況。
+function startTrainingWatch() {
+    if (trainInterval) return; // 已經在監看，不重複掛
+    document.getElementById('training-progress-card').style.display = 'block';
+    initChart();
+
+    trainInterval = setInterval(async () => {
+        if (isPaused) return;
+        try {
+            const r = await fetch('/api/train/status');
+            const d = await r.json();
+
+            const progressBar = document.getElementById('train-progress-bar');
+            const statusText = document.getElementById('train-status-text');
+            const startBtn = document.getElementById('start-train-btn');
+
+            if (d.status === "training") {
+                // 優先用後端算好的細粒度 percent（epoch 內就會動）；舊資料沒有才退回用 epoch 比例
+                const p = (d.percent != null) ? Math.round(d.percent) : Math.round((d.current_epoch / d.total_epochs) * 100);
+                progressBar.style.width = `${p}%`;
+                statusText.innerText = `訓練進行中: 第 ${d.current_epoch} / ${d.total_epochs} 輪 (${p}%)`;
+
+                if (d.metrics && d.metrics.length > 0) {
+                    trainChart.data.labels = d.metrics.map(m => m.epoch);
+                    trainChart.data.datasets[0].data = d.metrics.map(m => m.map);
+                    trainChart.data.datasets[1].data = d.metrics.map(m => m.loss);
+                    trainChart.update();
+                }
+            } else if (d.status === "completed" || d.status === "error" || d.status === "stopped") {
+                clearInterval(trainInterval);
+                trainInterval = null;
+                startBtn.disabled = false;
+                startBtn.innerText = "啟動訓練";
+                statusText.innerText = d.status === "completed" ? "訓練已完成"
+                    : (d.status === "stopped" ? "❌ 訓練已終止" : "訓練發生錯誤");
+                if (d.status === "completed") {
+                    finishTraining("訓練成功完成", "success");
+                    loadModels();  // 剛部署的模型立刻出現在驗證／診斷下拉，不用手動重整
+                }
+            }
+        } catch (e) { console.error(e); }
+    }, 2000);
+}
+
+// 頁面載入（或聊天觸發訓練後）發現後端已有訓練在跑，就把監看掛上去。
+async function resumeTrainingWatchIfRunning() {
+    try {
+        const r = await fetch('/api/train/status');
+        const d = await r.json();
+        if (d.status === 'training') {
+            const startBtn = document.getElementById('start-train-btn');
+            if (startBtn) { startBtn.disabled = true; startBtn.innerText = "訓練進行中..."; }
+            startTrainingWatch();
+        }
+    } catch (e) { /* 後端還沒起來就算了，之後的觸發點會再試 */ }
 }
 
 function finishTraining(msg, type) {
@@ -508,7 +646,10 @@ async function refreshRoboflowStatus() {
     const content = document.getElementById('roboflow-status-content');
     if (content) content.textContent = '讀取中…';
     try {
-        const res = await fetch('/api/agent/roboflow/readiness');
+        const params = activeDataset && activeDataset.name
+            ? `?dataset_name=${encodeURIComponent(activeDataset.name)}`
+            : '';
+        const res = await fetch(`/api/agent/roboflow/readiness${params}`);
         const data = await res.json();
         roboflowReadiness = data;
         renderRoboflowStatus(data);
@@ -522,6 +663,8 @@ async function refreshRoboflowStatus() {
 
 function agentConfirmationTitle(payload) {
     if (payload && payload.action_type === 'roboflow_proposal') return 'Agent 的 Roboflow 評估結果';
+    if (payload && payload.action_type === 'model_save') return '要將模型加入模型庫嗎？';
+    if (payload && payload.action_type === 'training') return '要開始模型訓練嗎？';
     if (payload && payload.model_name) return '要將模型加入模型庫嗎？';
     return '要開始模型訓練嗎？';
 }
@@ -566,15 +709,27 @@ function showAgentConfirmation(payload) {
         const cancel = document.getElementById('agent-confirm-cancel');
         title.textContent = agentConfirmationTitle(payload);
         reason.textContent = (payload && payload.reason) || '此操作需要你的確認。';
+        const isTraining = Boolean(payload && payload.action_type === 'training');
         const isRoboflow = Boolean(payload && payload.action_type === 'roboflow_proposal');
-        if (isRoboflow && payload.proposal) {
+        if (isTraining) {
+            const p = payload.training_params || {};
+            const operationId = payload.operation_id || '—';
+            meta.style.display = 'block';
+            meta.textContent =
+                `操作編號：${operationId}\n` +
+                `資料集：${p.dataset_name || '—'}\n` +
+                `模型權重：${p.variant || '—'}；Epochs：${p.epochs ?? '—'}\n` +
+                `圖片尺寸：${p.imgsz ?? '—'}；Batch：${p.batch ?? '—'}\n` +
+                `實驗名稱：${p.model_name || '—'}\n` +
+                '確認後，Model Agent 只能使用以上參數。';
+        } else if (isRoboflow && payload.proposal) {
             meta.style.display = 'block';
             meta.innerHTML = renderRoboflowProposalMeta(payload.proposal);
         } else {
             meta.style.display = 'none';
             meta.innerHTML = '';
         }
-        approve.textContent = isRoboflow ? '接受並合併' : '繼續';
+        approve.textContent = isRoboflow ? '接受並合併' : (isTraining ? '開始訓練' : '繼續');
         modal.style.display = 'flex';
         const finish = approved => {
             modal.style.display = 'none';
@@ -644,7 +799,7 @@ async function sendChatMessage() {
     
     // Add context if needed (e.g., current dataset info)
     const contextData = {
-        activeDataset: activeDataset ? activeDataset.name : "None",
+        activeDataset: generalChatDataset ? generalChatDataset.name : "None",
         currentTrainEpoch: trainChart && trainChart.data.labels.length > 0 ? trainChart.data.labels[trainChart.data.labels.length-1] : "Not training"
     };
 
@@ -678,10 +833,14 @@ async function sendChatMessage() {
             let reply = data.reply;
 
             // 檢查是否有健康度數據標籤 [HEALTH_DATA: {json}]
-            const healthMatch = reply.match(/\[HEALTH_DATA: ({.*?})\]/);
+            // JSON 內含巢狀物件（class_distribution），要用貪婪匹配吃到最後一個大括號
+            const healthMatch = reply.match(/\[HEALTH_DATA: ({.*})\]/);
+            let healthJson = null;
             if (healthMatch) {
-                const healthJson = JSON.parse(healthMatch[1]);
-                reply = reply.replace(healthMatch[0], ""); // 移除標籤，保留文字
+                try { healthJson = JSON.parse(healthMatch[1]); } catch (e) { console.warn('健康數據解析失敗:', e); }
+            }
+            if (healthJson) {
+                reply = reply.replace(healthMatch[0], "").trimEnd(); // 移除標籤，保留文字
                 appendMessage(reply, 'ai');
                 appendHealthCard(healthJson);
             } else {
@@ -690,6 +849,10 @@ async function sendChatMessage() {
 
             chatMessages.push({ role: 'assistant', content: reply });
             persistChatHistory();
+
+            // 聊天關鍵字直接觸發的訓練：立刻把訓練中心的進度監看掛上，
+            // 使用者切到訓練頁就能看到進度、也能按終止
+            if (reply.includes('已直接啟動模型訓練')) resumeTrainingWatchIfRunning();
         } else {
             appendMessage("發生錯誤: " + data.message, 'error');
         }
@@ -792,7 +955,37 @@ async function initManagerAgentSession() {
 // Plan→Act→Observe→Decide 迴圈跑完才看到東西；中途失敗也能看到已經跑出來的步驟跟
 // 錯誤原因。兩個端點的 SSE frame 格式一樣，解析邏輯抽成這個共用函式，resume 時
 // 沿用同一張決策過程卡片（傳入既有的 traceRefs）繼續往下疊，不會另開一張新卡片。
-async function consumeAgentStream(res, traceRefs) {
+const MANAGER_AGENT_STATUS_AFTER_NODE = {
+    planner: 'Manager 正在評估計畫並安排下一步…',
+    data_agent: 'Observer 正在檢視資料處理結果…',
+    model_agent: 'Observer 正在檢視模型處理結果…',
+    evaluation_agent: 'Observer 正在檢視評估結果…',
+    observer: 'Manager 正在整合觀測結果並決策…'
+};
+
+function updateManagerAgentLoadingMessage(messageId, message) {
+    if (!messageId || !message) return;
+    const messageEl = document.getElementById(messageId);
+    if (!messageEl) return;
+    messageEl.textContent = `⏳ ${message}`;
+    messageEl.style.opacity = '1';
+}
+
+function managerAgentStatusAfterStep(step) {
+    if (step.node === 'manager' && step.decision) {
+        const targetLabels = {
+            data_agent: 'Data Agent 正在檢查資料集與標註…',
+            model_agent: 'Model Agent 正在處理訓練或推論任務…',
+            evaluation_agent: 'Evaluation Agent 正在評估模型結果…',
+            finish: 'Manager 正在整理最終回覆…',
+            ask_user: 'Manager 正在整理需要您確認的事項…'
+        };
+        return targetLabels[step.decision] || 'Manager 正在執行下一個工作階段…';
+    }
+    return MANAGER_AGENT_STATUS_AFTER_NODE[step.node] || '';
+}
+
+async function consumeAgentStream(res, traceRefs, loadingId = null) {
     let finalReply = null;
     let sawError = false;
     let interruptPayload = null;
@@ -813,7 +1006,10 @@ async function consumeAgentStream(res, traceRefs) {
             if (!rawEvent.startsWith('data: ')) continue;
 
             const payload = JSON.parse(rawEvent.slice(6));
-            if (payload.type === 'step') {
+            if (payload.type === 'status') {
+                updateManagerAgentLoadingMessage(loadingId, payload.message);
+            } else if (payload.type === 'step') {
+                updateManagerAgentLoadingMessage(loadingId, managerAgentStatusAfterStep(payload));
                 if (!traceRefs) traceRefs = createTraceCard();
                 appendTraceStep(traceRefs, payload);
             } else if (payload.type === 'final') {
@@ -827,13 +1023,43 @@ async function consumeAgentStream(res, traceRefs) {
                 sawError = true;
                 if (!traceRefs) traceRefs = createTraceCard();
                 appendTraceError(traceRefs, payload.message);
+            } else if (payload.type === 'eval_charts') {
+                appendEvalChartsCard(payload);
+            } else if (payload.type === 'dataset_refresh') {
+                await refreshDatasetViewsAfterAgentMerge(payload);
             } else if (payload.type === 'interrupt') {
-                interruptPayload = payload.payload;
+                interruptPayload = {
+                    ...(payload.payload || {}),
+                    interrupt_id: payload.interrupt_id
+                };
             }
         }
     }
 
     return { traceRefs, finalReply, sawError, interruptPayload };
+}
+
+async function refreshDatasetViewsAfterAgentMerge(payload) {
+    // Roboflow has already committed files on the server when this event arrives.
+    // Refresh both dataset cards and the training selector immediately.
+    const datasetsIframe = document.getElementById('iframe-datasets');
+    if (datasetsIframe && datasetsIframe.contentWindow) {
+        datasetsIframe.contentWindow.postMessage({ type: 'REFRESH_DATASETS' }, '*');
+    }
+    await loadTrainDatasets();
+
+    const datasetName = payload && payload.dataset_name;
+    if (datasetName && activeDataset && activeDataset.name === datasetName) {
+        const refreshed = {
+            ...activeDataset,
+            imgCount: payload.total_images_now ?? activeDataset.imgCount,
+        };
+        activeDataset = refreshed;
+        localStorage.setItem('ai_detector_active_ds', JSON.stringify(refreshed));
+        if (generalChatDataset && generalChatDataset.name === datasetName) {
+            generalChatDataset = refreshed;
+        }
+    }
 }
 
 // 卡在 interrupt()（目前只有訓練前確認會觸發）時，用專案裡既有的瀏覽器原生
@@ -848,8 +1074,18 @@ async function resumeAgentInterruptsWithModal(result, threadId, modelType) {
         const res = await fetch('/api/agent/resume', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ thread_id: threadId, model_type: modelType, approved })
+            body: JSON.stringify({
+                thread_id: threadId,
+                model_type: modelType,
+                approved,
+                interrupt_id: interruptPayload.interrupt_id,
+                operation_id: interruptPayload.operation_id || null
+            })
         });
+        if (!res.ok) {
+            const errorData = await res.json().catch(() => ({}));
+            throw new Error(errorData.detail || '確認已失效，請重新整理後再試。');
+        }
         const next = await consumeAgentStream(res, traceRefs);
         traceRefs = next.traceRefs;
         finalReply = next.finalReply;
@@ -988,17 +1224,55 @@ async function sendManagerAgentMessage(text, loadingId) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(requestBody)
         });
+        if (!res.ok) {
+            const errorData = await res.json().catch(() => ({}));
+            throw new Error(errorData.detail || 'Agent 任務無法啟動');
+        }
 
+        updateManagerAgentLoadingMessage(loadingId, 'Manager 正在連線並準備執行任務…');
+        const result = await consumeAgentStream(res, null, loadingId);
         removeMessage(loadingId);
-
-        const result = await consumeAgentStream(res, null);
         await finishOrResumeAgentTurn(result, threadId, modelType);
     } catch (e) {
         removeMessage(loadingId);
-        appendMessage("連線失敗", 'error');
+        appendMessage(e.message || "連線失敗", 'error');
     } finally {
         stopAgentTrainingWatch();
     }
+}
+
+// Evaluation Agent 評估完就把「模型效能診斷」頁的三張圖直接畫在對話裡（混淆矩陣／
+// F1／P-R 曲線），使用者不用再切到診斷頁自己選模型。圖表路徑來自 skill_eval 的結構化
+// 回傳，不是 LLM 轉述的，所以不會有破圖。
+function appendEvalChartsCard(payload) {
+    const charts = payload.charts || [];
+    if (!charts.length) return;
+    const container = document.getElementById('ai-chat-history');
+    const card = document.createElement('div');
+    card.style.cssText = "align-self: flex-start; background: #0f172a; border: 1px solid #3b82f6; padding: 14px; border-radius: 12px; width: 92%; margin-top: 10px;";
+    const title = payload.model_name ? `模型效能診斷圖表：${payload.model_name}` : '模型效能診斷圖表';
+    card.innerHTML = `
+        <div style="font-size: 0.8rem; color: #93c5fd; font-weight: 700; margin-bottom: 10px;">📊 ${title}</div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+            ${charts.map(c => `
+                <div>
+                    <div style="font-size: 0.7rem; color: #64748b; margin-bottom: 4px;">${c.name}</div>
+                    <img src="${c.url}" alt="${c.name}" loading="lazy"
+                        style="width: 100%; border-radius: 8px; background: #fff; cursor: zoom-in;"
+                        onclick="window.open(this.src, '_blank')">
+                </div>
+            `).join('')}
+        </div>
+        <div style="font-size: 0.65rem; color: #64748b; margin-top: 8px;">點圖可開新視窗放大檢視。</div>
+        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,.08);">
+            <div style="font-size: 0.72rem; color: #cbd5e1; margin-bottom: 6px;">想用實際圖片驗證這個模型嗎？</div>
+            <button onclick="document.getElementById('ai-chat-file-input').click()"
+                style="background: rgba(59,130,246,.18); border: 1px solid rgba(59,130,246,.45); color: #93c5fd; border-radius: 8px; padding: 5px 10px; font-size: 0.72rem; cursor: pointer;">📎 上傳圖片做推論</button>
+            <span style="font-size: 0.65rem; color: #64748b; margin-left: 6px;">也可以直接把圖片拖進對話視窗</span>
+        </div>
+    `;
+    container.appendChild(card);
+    container.scrollTop = container.scrollHeight;
 }
 
 function appendHealthCard(data) {
@@ -1006,7 +1280,8 @@ function appendHealthCard(data) {
     const card = document.createElement('div');
     card.style.cssText = "align-self: flex-start; background: #0f172a; border: 1px solid #3b82f6; padding: 16px; border-radius: 12px; width: 80%; margin-top: 10px;";
     
-    const chartId = 'chat-chart-' + Date.now();
+    // 同上：同一毫秒內畫兩張健康卡會拿到相同的 canvas id，圖表就會畫錯位置
+    const chartId = `chat-chart-${Date.now()}-${++messageSeq}`;
     card.innerHTML = `
         <div style="font-size: 0.8rem; color: #64748b; margin-bottom: 8px; display:flex; align-items:center; gap:5px;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
@@ -1190,10 +1465,17 @@ function finishTraceCard(refs, usage, llmCalls) {
     refs.stepsContainer.appendChild(summaryDiv);
 }
 
+// 對話泡泡的 id 以前是 'msg-' + Date.now()，但 sendChatMessage 會在同一個同步流程裡
+// 連續建立「使用者訊息」跟「載入中訊息」——同一毫秒內就會拿到相同的 id。
+// getElementById 只回傳第一個相符的元素，於是 removeMessage/更新載入文字都會打到
+// 使用者那顆泡泡：訊息憑空消失、或被改寫成「Manager 正在擬訂計畫」。加一個遞增序號
+// 保證唯一。
+let messageSeq = 0;
+
 function appendMessage(text, sender, isLoading = false) {
     const container = document.getElementById('ai-chat-history');
     const msgDiv = document.createElement('div');
-    const id = 'msg-' + Date.now();
+    const id = `msg-${Date.now()}-${++messageSeq}`;
     msgDiv.id = id;
     
     msgDiv.style.padding = '10px 14px';
@@ -1370,6 +1652,26 @@ async function loadModels() {
         }
     } catch (e) {
         console.error('Load models error:', e);
+    }
+}
+
+// 刪除驗證中心目前選取的訓練模型。前端先擋一次非 *_best.pt，後端也會再驗證，
+// 預訓練權重（yolov9s.pt 這類）兩邊都不給刪。
+async function deleteSelectedModel(selectId = 'verify-model-select') {
+    const select = document.getElementById(selectId);
+    const name = select ? select.value : '';
+    if (!name) { showAlert("請先選擇要刪除的模型", "error"); return; }
+    if (!name.endsWith('_best.pt')) { showAlert("只能刪除訓練產出的模型（*_best.pt），預訓練權重不可刪除", "error"); return; }
+    if (!confirm(`確定刪除模型「${name}」？此動作無法復原。`)) return;
+    try {
+        const formData = new FormData();
+        formData.append('model_name', name);
+        const res = await fetch('/api/models/delete', { method: 'POST', body: formData });
+        const data = await res.json();
+        showAlert(data.message, data.status === 'success' ? 'success' : 'error');
+        if (data.status === 'success') loadModels();
+    } catch (e) {
+        showAlert("刪除失敗: " + e.message, "error");
     }
 }
 
