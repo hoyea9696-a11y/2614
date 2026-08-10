@@ -388,6 +388,20 @@ class TrainingParamsReply(BaseModel):
     model_name: Optional[str] = Field(default=None, description="要改成的實驗名稱，沒提到就留空")
 
 
+class TrainingHealthReply(BaseModel):
+    """使用者聽完「這個資料集沒有通過健康檢查」之後那句回覆的結構化解讀。
+
+    健康沒過時系統只先講結論與建議，不列參數；使用者這句話決定了接下來要顯示訓練參數
+    （train_anyway）、轉去 Roboflow 補資料（augment），還是就停在這裡（cancel）。
+    """
+
+    intent: Literal["train_anyway", "augment", "cancel", "unrelated"] = Field(
+        description="train_anyway：知道健康沒過但還是要現在訓練；augment：要先去 Roboflow "
+                    "補資料再訓練；cancel：先不訓練也不補資料；unrelated：這句話不是在回答"
+                    "這個問題，是別的需求"
+    )
+
+
 class AugmentReply(BaseModel):
     """使用者用文字回覆「要不要去 Roboflow 補資料」時的結構化解讀。"""
 
@@ -460,6 +474,10 @@ class SupervisorState(TypedDict):
     # post_augment_eval_required 這類單次任務欄位重置，因此整份 operation 與「補強後
     # 必須自動接評估」的旗標都要存在這裡，下一輪 Manager 解析完回覆才復原。
     pending_param_question: Optional[dict]
+    # 訓練前健康檢查沒過，已經把結論與建議講給使用者，正在等他決定要訓練／補資料／取消。
+    # 內容跟 pending_param_question 同一個道理：整份 operation 存在這裡，才不會被
+    # stream_trace 的單次任務欄位重置洗掉。
+    pending_health_question: Optional[dict]
     # 已經在對話裡建議過「去 Roboflow 補資料」，正在等使用者回文字決定要不要做。
     augment_suggested: bool
 
@@ -711,11 +729,14 @@ def _training_health_summary(dataset_name: str) -> Optional[dict]:
     ]
     thinnest = sorted(counts, key=lambda kv: kv[1])[:3]
 
+    total_images = health.get("total_images") or 0
+    labeled_images = health.get("labeled_images") or 0
+
     concerns = []
     if coverage < COVERAGE_GATE:
         concerns.append(
-            f"標記覆蓋率只有 {coverage}%，低於 {COVERAGE_GATE}% 門檻——這一項會讓訓練在啟動時"
-            f"被 Health Gate 擋下來，必須先補標記"
+            f"標記覆蓋率只有 {coverage}%，低於 {COVERAGE_GATE}% 門檻"
+            f"（還有 {max(0, total_images - labeled_images)} 張圖片沒有標記）"
         )
     if balance < BALANCE_WARN_THRESHOLD:
         detail = "、".join(f"{name} {count} 張" for name, count in thinnest)
@@ -731,8 +752,8 @@ def _training_health_summary(dataset_name: str) -> Optional[dict]:
         "score": score,
         "coverage": coverage,
         "balance": balance,
-        "total_images": health.get("total_images"),
-        "labeled_images": health.get("labeled_images"),
+        "total_images": total_images,
+        "labeled_images": labeled_images,
         "passed": not concerns,
         "blocks_training": coverage < COVERAGE_GATE,
         "concerns": concerns,
@@ -740,36 +761,69 @@ def _training_health_summary(dataset_name: str) -> Optional[dict]:
 
 
 def _format_training_health_block(summary: Optional[dict]) -> str:
-    """把健康摘要寫成問參數時擺在最前面的那段文字：先講結論，再給建議。
+    """健康檢查通過時，擺在訓練參數前面的那一行結論。
 
-    數字一律由 check_dataset_health 算出來後直接帶進字串，不經過 LLM 轉述，避免
-    「建議」講得漂亮但數字是編的。要不要照樣訓練由使用者自己決定。
+    沒通過的情況不走這裡——那會由 train_health_gate 單獨送出完整說明，先問過使用者
+    才顯示參數，所以這裡回空字串。
+    """
+    if not summary or not summary.get("passed"):
+        return ""
+
+    name = summary.get("dataset_name") or "—"
+    return (
+        f"✅ 資料集「{name}」健康檢查：總分 {summary.get('score')} 分、"
+        f"標記覆蓋率 {summary.get('coverage')}%"
+        f"（{summary.get('labeled_images')}/{summary.get('total_images')} 張）、"
+        f"平衡度 {summary.get('balance')} 分。\n\n"
+    )
+
+
+def _format_training_health_warning(summary: Optional[dict]) -> str:
+    """健康檢查沒過時單獨送出的那段話：結論、數字、問題、建議，最後把決定權交回使用者。
+
+    這裡刻意不附訓練參數——一邊說資料集有問題、一邊把參數列好等你按下去，等於系統
+    自己已經決定要訓練了。參數要等使用者明確說「還是要訓練」的下一句話才顯示。
+
+    數字全部由 check_dataset_health 算完直接帶進字串，不經過 LLM 轉述。另外聊天視窗
+    不吃 Markdown 粗體（`**` 會原樣印出來），要強調就用文字本身，不要包星號。
     """
     if not summary:
         return ""
 
     name = summary.get("dataset_name") or "—"
-    head = (
-        f"資料集「{name}」健康檢查：總分 {summary.get('score')} 分、"
-        f"標記覆蓋率 {summary.get('coverage')}%"
-        f"（{summary.get('labeled_images')}/{summary.get('total_images')} 張）、"
-        f"平衡度 {summary.get('balance')} 分。"
-    )
-    if summary.get("passed"):
-        return f"✅ {head}\n\n"
+    lines = [
+        f"⚠️ 資料集「{name}」沒有通過健康檢查。",
+        "",
+        f"・健康總分：{summary.get('score')} 分",
+        f"・標記覆蓋率：{summary.get('coverage')}%"
+        f"（{summary.get('labeled_images')}/{summary.get('total_images')} 張）",
+        f"・類別平衡度：{summary.get('balance')} 分",
+        "",
+    ]
+    lines += [f"問題：{c}" for c in summary.get("concerns") or []]
+    lines.append("")
 
-    lines = [f"⚠️ {head}這個資料集**沒有通過健康檢查**："]
-    lines += [f"・{c}" for c in summary.get("concerns") or []]
     if summary.get("blocks_training"):
+        # 覆蓋率不足是「圖片還沒標記」，去 Roboflow 抓別人的資料填不掉本機這些空標籤，
+        # 所以這個情況不建議補資料，直接講清楚要先標記。
         lines.append(
-            "建議先把沒標記的圖片補完再訓練——現在硬跑會在啟動時被 Health Gate 擋下來，等於白等一輪。"
+            "建議先把沒有標記的圖片標完再訓練。現在硬跑會在啟動時被 Health Gate 擋下來、"
+            "等於白等一輪；去 Roboflow 補資料也解決不了本機這批圖片沒標記的問題。"
         )
+        lines.append("")
+        lines.append("還是要照原訂參數跑一次就說「還是要訓練」；先停下來去補標記就說「取消」。")
     else:
         lines.append(
-            "建議補齊樣本數過少的類別再訓練，效果會好一截；但先跑一輪看基準線也是合理的做法，"
-            "訓練不會被擋下。要不要繼續由你決定。"
+            "標記本身是完整的，問題在類別數量不夠平均。建議去 Roboflow Universe 找公開資料集，"
+            "把樣本太少的類別補起來再訓練——補進來的圖片自帶標記，而且你確認之前不會動到"
+            "正式資料集。"
         )
-    return "\n".join(lines) + "\n\n"
+        lines.append("")
+        lines.append(
+            "要先補資料就說「去補資料」；想直接用現在的資料訓練看基準線就說「還是要訓練」；"
+            "都不做就說「取消」。"
+        )
+    return "\n".join(lines)
 
 
 def _training_fingerprint(step_id: str, params: dict) -> str:
@@ -942,6 +996,9 @@ def build_multi_agent(chat_model):
     param_reply_model = chat_model.with_structured_output(
         TrainingParamsReply, method="function_calling", include_raw=True
     )
+    health_reply_model = chat_model.with_structured_output(
+        TrainingHealthReply, method="function_calling", include_raw=True
+    )
     augment_reply_model = chat_model.with_structured_output(
         AugmentReply, method="function_calling", include_raw=True
     )
@@ -949,7 +1006,11 @@ def build_multi_agent(chat_model):
     def planner_node(state: SupervisorState) -> dict:
         # 使用者這句話是在回答 Manager 上一輪問的問題（訓練參數怎麼設、要不要去補
         # 資料），不是新需求——不要重新規劃，直接交給 Manager 解析那句回覆。
-        if state.get("pending_param_question") or state.get("augment_suggested"):
+        if (
+            state.get("pending_param_question")
+            or state.get("pending_health_question")
+            or state.get("augment_suggested")
+        ):
             return {}
         context = [SystemMessage(content=PLANNER_SYSTEM_PROMPT)] + list(state["messages"])
         try:
@@ -1108,10 +1169,37 @@ def build_multi_agent(chat_model):
                 "status": "pending_confirmation",
                 "health": _training_health_summary(params["dataset_name"]),
             }
+
+        # 健康沒過就先只講健康狀況，不列參數；使用者表明「還是要訓練」之後 operation 會被
+        # 標上 health_ack，重試繞回這裡時不會再問第二次。
+        health = operation.get("health")
+        if health and not health.get("passed") and not operation.get("health_ack"):
+            return {
+                "next": "train_health_gate",
+                "pending_operation": operation,
+                "plan": {**plan, "steps": steps},
+            }
         return {
             "next": "train_params_gate",
             "pending_operation": operation,
             "plan": {**plan, "steps": steps},
+        }
+
+    def train_health_gate(state: SupervisorState) -> dict:
+        """健康檢查沒過時的第一個停頓點：只講結論與建議，等使用者決定要不要訓練。
+
+        跟 train_params_gate 一樣走 ASK_USER 而不是 interrupt()——使用者要回的是一句話
+        （「還是要訓練」／「去補資料」／「取消」），不是按一顆確認鈕。整份 operation 存進
+        pending_health_question，下一輪 decision_engine 解析完回覆才接著往下走。
+        """
+        operation = state.get("pending_operation") or {}
+        return {
+            "next": "ASK_USER",
+            "pending_health_question": {
+                "operation": operation,
+                "post_augment_eval_required": bool(state.get("post_augment_eval_required")),
+            },
+            "messages": [AIMessage(content=_format_training_health_warning(operation.get("health")))],
         }
 
     def train_params_gate(state: SupervisorState) -> dict:
@@ -1283,6 +1371,60 @@ def build_multi_agent(chat_model):
         # 但不能讓旗標留著（否則下一句話又會被當成在回答同一個問題）——stale_updates
         # 帶著這件事一路傳到最後的 return。
         stale_updates: dict = {}
+
+        health_question = state.get("pending_health_question")
+        if health_question:
+            operation = dict(health_question.get("operation") or {})
+            reply, usage = _parse_reply(health_reply_model, (
+                "Manager 剛告訴使用者「這個資料集沒有通過健康檢查」並給了建議，現在要判斷他這句"
+                "回覆的意思：知道了但還是要現在訓練填 train_anyway；要先去 Roboflow Universe 補"
+                "資料再訓練填 augment；先不訓練也不補資料填 cancel；這句話根本不是在回答這個"
+                "問題填 unrelated。"
+            ), state)
+            intent = reply.intent if reply else "unrelated"
+            if intent == "train_anyway":
+                # 使用者已經看過警告還是要跑：標記成已知情，直接顯示參數，不再問一次健康度。
+                operation["health_ack"] = True
+                return {
+                    "next": "train_params_gate",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "pending_operation": operation,
+                    "pending_health_question": None,
+                    "post_augment_eval_required": bool(health_question.get("post_augment_eval_required")),
+                    "usage": usage,
+                }
+            if intent == "augment":
+                # 跟 augment_suggested 的同意分支走同一條路：派 Data Agent 去搜尋並在暫存區
+                # 評估，正式資料集要等使用者最後確認才會被改。
+                ds_name = (operation.get("params") or {}).get("dataset_name") or _active_dataset_name()
+                return {
+                    "next": "data_agent",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "pending_health_question": None,
+                    "augment_offered": True,
+                    "augment_baseline_count": _count_images(DATASET_DIR / ds_name) if ds_name else None,
+                    "usage": usage,
+                    "messages": [HumanMessage(content=(
+                        f"使用者決定先補強資料集「{ds_name}」再訓練。請呼叫 prepare_roboflow_augmentation "
+                        "自動搜尋 Roboflow Universe 候選，下載到暫存區並評估類別對應、重複圖片、"
+                        "可用標註與風險。不要修改正式資料集；完成後把 proposal 結果回報給 Manager，"
+                        "等待使用者最後確認。"
+                    ))],
+                }
+            if intent == "cancel":
+                return {
+                    "next": "FINISH",
+                    "rounds": rounds,
+                    "retry_counters": retry_counters,
+                    "pending_health_question": None,
+                    "usage": usage,
+                    "messages": [AIMessage(content=(
+                        "好，這次先不訓練。補好標記或補完資料之後跟我說，我們再繼續。"
+                    ))],
+                }
+            stale_updates["pending_health_question"] = None
 
         param_question = state.get("pending_param_question")
         if param_question:
@@ -1648,6 +1790,7 @@ def build_multi_agent(chat_model):
     graph.add_node("manager", decision_engine)
     graph.add_node("observer", observer_node)
     graph.add_node("prepare_train_operation", prepare_train_operation)
+    graph.add_node("train_health_gate", train_health_gate)
     graph.add_node("train_params_gate", train_params_gate)
     graph.add_node("train_confirm_gate", train_confirm_gate)
     graph.add_node("save_offer_gate", save_offer_gate)
@@ -1670,6 +1813,9 @@ def build_multi_agent(chat_model):
             # 使用者回覆完訓練參數後直接進最後確認，不必再繞 prepare_train_operation
             # 重新組一份 operation（那會把剛談好的參數蓋掉）。
             "train_confirm_gate": "train_confirm_gate",
+            # 健康沒過但使用者堅持要訓練：這時才顯示參數，同樣不繞回
+            # prepare_train_operation（那會再問一次健康度）。
+            "train_params_gate": "train_params_gate",
             # 這一輪只是停下來等使用者回話，不是任務收尾：不走 save_offer_gate，
             # 免得在等回覆的同時又跳出「要不要把模型存進模型庫」。
             "ASK_USER": END,
@@ -1680,10 +1826,16 @@ def build_multi_agent(chat_model):
         "prepare_train_operation",
         lambda s: s["next"],
         {
+            "train_health_gate": "train_health_gate",
             "train_params_gate": "train_params_gate",
             "model_agent": "model_agent",
             "FINISH": "save_offer_gate",
         },
+    )
+    graph.add_conditional_edges(
+        "train_health_gate",
+        lambda s: s["next"],
+        {"ASK_USER": END},
     )
     graph.add_conditional_edges(
         "train_params_gate",

@@ -39,6 +39,7 @@ from multi_agent import (
     Decision,
     Plan,
     Step,
+    TrainingHealthReply,
     TrainingParamsReply,
     TrainingProposal,
     _build_approved_training_tool,
@@ -99,6 +100,29 @@ def _make_fake_dataset(name: str):
     (ds / "labels").mkdir(parents=True, exist_ok=True)
     (ds / "images" / "a.jpg").write_bytes(b"\xff\xd8\xff\xd9")
     (ds / "labels" / "a.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+
+
+def _make_unlabeled_dataset(name: str):
+    """有圖片但完全沒有標記：coverage=0，會被 Health Gate 擋下的那種資料集。"""
+    ds = DATASET_DIR / name
+    (ds / "images").mkdir(parents=True, exist_ok=True)
+    for i in range(3):
+        (ds / "images" / f"a{i}.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+
+
+def _make_imbalanced_dataset(name: str):
+    """標記完整但類別數量嚴重偏一邊：coverage=100、balance=20，健康分數不到門檻。
+
+    9 張是類別 0、1 張是類別 1 —— 這是「該建議去 Roboflow 補資料」的情況，跟上面
+    完全沒標記的情況要走不一樣的建議。
+    """
+    ds = DATASET_DIR / name
+    (ds / "images").mkdir(parents=True, exist_ok=True)
+    (ds / "labels").mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        (ds / "images" / f"b{i}.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+        cls_id = 1 if i == 9 else 0
+        (ds / "labels" / f"b{i}.txt").write_text(f"{cls_id} 0.5 0.5 0.2 0.2\n")
 
 
 def _report_call(status: str, reason: str, suggestion: str = "", reason_code: str = "", call_id: str = "call"):
@@ -367,6 +391,86 @@ def case_training_tool_rejects_unapproved_params():
         assert accepted["status"] == "completed"
         train_mock.assert_called_once()
     print("[OK] Model Agent 改動未核准參數時，skill_train 會在啟動前阻止執行")
+
+
+def _training_step(dataset_name: str, model_name: str):
+    return Step(
+        id="1",
+        description="訓練模型",
+        agent="model_agent",
+        is_training=True,
+        training_params=TrainingProposal(dataset_name=dataset_name, epochs=1, model_name=model_name),
+    )
+
+
+def case_unhealthy_dataset_asks_before_showing_params():
+    # 健康檢查沒過時只講健康狀況，不要同時把參數列出來——那等於一邊說資料集有問題、
+    # 一邊把訓練流程推到底。參數要等使用者明確表示「還是要訓練」的下一句話才出現。
+    graph = build_multi_agent(FakeMultiAgentModel([
+        Plan(goal="訓練模型", steps=[_training_step("__multi_smoke_unlabeled__", "smoke_unhealthy")]),
+        Decision(action="call_agent", target_agent="model_agent", rationale="使用者要訓練"),
+        TrainingHealthReply(intent="train_anyway"),
+    ]))
+
+    _make_unlabeled_dataset("__multi_smoke_unlabeled__")
+    config = {"configurable": {"thread_id": _thread("smoke_unhealthy_gate")}}
+    try:
+        first = graph.invoke(
+            {"messages": [HumanMessage(content="用 __multi_smoke_unlabeled__ 訓練")]},
+            config=config,
+        )
+        warning = first["messages"][-1].content
+        assert first.get("pending_health_question"), "健康沒過應該停下來等使用者決定"
+        assert not first.get("pending_param_question"), "健康沒過時不該同時丟出參數問題"
+        assert "沒有通過健康檢查" in warning
+        assert "標記覆蓋率：0%（0/3 張）" in warning, f"應該如實顯示覆蓋率，實際：{warning}"
+        assert "epochs" not in warning and "yolov9s.pt" not in warning, (
+            f"上半段不該出現任何訓練參數，實際：{warning}"
+        )
+        assert "去 Roboflow 補資料也解決不了" in warning, "圖片沒標記的情況不該建議去補資料"
+
+        second = graph.invoke({"messages": [HumanMessage(content="還是要訓練")]}, config=config)
+        params_msg = second["messages"][-1].content
+        assert second.get("pending_param_question"), "使用者堅持後才進到問參數"
+        assert "epochs" in params_msg and "yolov9s.pt" in params_msg, (
+            f"下半段才顯示參數，實際：{params_msg}"
+        )
+        assert second["pending_operation"]["health_ack"] is True, (
+            "已經知情的 operation 要標記起來，重試時不該再問一次健康度"
+        )
+    finally:
+        shutil.rmtree(DATASET_DIR / "__multi_smoke_unlabeled__", ignore_errors=True)
+    print("[OK] 資料集健康沒過時只先講健康狀況，使用者堅持要訓練才顯示參數")
+
+
+def case_labeled_but_imbalanced_suggests_roboflow():
+    # 標記是完整的、問題只在類別不平衡：這種缺圖片的情況去 Roboflow 補資料才有解，
+    # 建議內容要跟「圖片根本沒標記」那種情況分開。
+    graph = build_multi_agent(FakeMultiAgentModel([
+        Plan(goal="訓練模型", steps=[_training_step("__multi_smoke_imbalanced__", "smoke_imbalanced")]),
+        Decision(action="call_agent", target_agent="model_agent", rationale="使用者要訓練"),
+    ]))
+
+    _make_imbalanced_dataset("__multi_smoke_imbalanced__")
+    config = {"configurable": {"thread_id": _thread("smoke_imbalanced_gate")}}
+    try:
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="用 __multi_smoke_imbalanced__ 訓練")]},
+            config=config,
+        )
+    finally:
+        shutil.rmtree(DATASET_DIR / "__multi_smoke_imbalanced__", ignore_errors=True)
+
+    warning = result["messages"][-1].content
+    health = result["pending_operation"]["health"]
+    assert health["coverage"] == 100.0 and health["balance"] < 40, (
+        f"這份資料集應該是「標記完整但不平衡」，實際：{health}"
+    )
+    assert health["blocks_training"] is False, "標記完整就不該被 Health Gate 擋下"
+    assert "Roboflow Universe" in warning, f"這種情況要建議去補資料，實際：{warning}"
+    assert "去補資料" in warning and "還是要訓練" in warning, "要把兩個選項都給使用者"
+    assert "epochs" not in warning, "這一段同樣不該出現訓練參數"
+    print("[OK] 標記完整但類別不平衡時，建議去 Roboflow 補資料，且一樣先不顯示參數")
 
 
 def case_roboflow_merge_builds_refresh_and_retrain_transition():
@@ -638,6 +742,8 @@ def run():
     case_manager_hands_off_data_agent_to_model_agent_to_evaluation_agent()
     case_training_confirmation_contains_exact_params_and_operation_id()
     case_training_tool_rejects_unapproved_params()
+    case_unhealthy_dataset_asks_before_showing_params()
+    case_labeled_but_imbalanced_suggests_roboflow()
     case_roboflow_merge_builds_refresh_and_retrain_transition()
     case_roboflow_merge_continues_through_confirm_train_and_eval()
     case_manager_auto_retries_known_gate_without_llm()
