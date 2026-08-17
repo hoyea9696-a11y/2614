@@ -49,7 +49,8 @@ cd 2614
 setup.bat
 ```
 啟動
-```run.bat
+```
+run.bat
 ```
 系統啟動後，可在瀏覽器開啟：
 http://localhost:8000
