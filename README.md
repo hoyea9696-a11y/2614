@@ -26,3 +26,34 @@ AI Detector 是一個以 Python 與 YOLO 為基礎的影像辨識平台，提供
 → 使用者確認後開始訓練
 → 查看模型評估結果
 → 上傳圖片或資料夾進行驗證
+
+使用技術
+Python
+FastAPI
+Ultralytics YOLO
+OpenCV
+Pandas、Matplotlib
+LangGraph
+OpenAI／Gemini 相容的 LLM 整合
+安裝與執行
+環境需求
+Windows
+Python 3.9 以上
+建議使用具備 NVIDIA GPU 的環境進行模型訓練
+
+安裝
+git clone https://github.com/hoyea9696-a11y/2614.git
+cd 2614
+setup.bat
+
+啟動
+run.bat
+系統啟動後，可在瀏覽器開啟：
+http://localhost:8000
+
+專案說明
+本專案以既有開源專案與工具為基礎進行研究、整合與功能調整。開發過程中，我負責規劃使用者操作流程、訓練前確認機制、功能測試與調整，並使用 AI 開發工具協助迭代實作。
+注意事項
+請勿上傳或公開含有機密資訊的影像資料。
+.env、模型權重、訓練資料與訓練結果不應直接提交至 GitHub。
+LLM 功能需要依使用的服務設定對應 API 金鑰。
