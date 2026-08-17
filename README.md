@@ -42,7 +42,8 @@ Python 3.9 以上
 建議使用具備 NVIDIA GPU 的環境進行模型訓練
 
 安裝
-```git clone https://github.com/hoyea9696-a11y/2614.git
+```bash
+git clone https://github.com/hoyea9696-a11y/2614.git
 cd 2614
 setup.bat
 ```
