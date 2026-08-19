@@ -32,6 +32,18 @@ AI Detector 是一個以 Python、YOLO 與 LangGraph 建立的本機影像辨識
 → 單張或批量影像驗證
 ```
 
+## 操作影片
+
+下列影片展示系統在不同情境下的實際操作。點擊縮圖即可開啟 MP4 影片。
+
+| 情境 | 影片 | 說明 |
+| --- | --- | --- |
+| 流程控制模式 | [![流程控制模式操作影片](docs/images/manager-mode-demo.png)](docs/media/manager-mode-demo.mp4) | 使用者提出訓練需求後，系統先詢問資料集、檢查資料與參數，並在訓練前要求確認。 |
+| 一般對話模式 | [![一般對話模式操作影片](docs/images/standard-mode-demo.png)](docs/media/standard-mode-demo.mp4) | 對照未加入完整確認流程時，系統可能直接以預設參數啟動訓練的行為。 |
+| Roboflow 資料匯入與重新訓練 | [![Roboflow 資料匯入與重新訓練操作影片](docs/images/roboflow-import-retrain-demo.png)](docs/media/roboflow-import-retrain-demo.mp4) | 展示匯入 Roboflow 公開資料集後，保留資料處理判斷與使用者確認，再重新訓練模型的流程。 |
+
+> 影片採 H.264 MP4 格式。若 GitHub 頁面未直接預覽，請點擊縮圖開啟影片檔案。
+
 ## LangGraph 在本專案中的用途
 
 LangGraph 是本專案用來管理 AI 工作流程的框架。
