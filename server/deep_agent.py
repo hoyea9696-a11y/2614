@@ -114,6 +114,8 @@ DOMAIN_SUBAGENT_EXCLUDED_TOOLS = frozenset({
 })
 # 實驗分析 subagent 是唯一需要完整讀取能力的角色。
 ANALYST_EXCLUDED_TOOLS = frozenset({"execute"})
+# 通用 worker：任務內容無法事先預定，所以工具給滿（除了 execute）。
+GENERAL_PURPOSE_EXCLUDED_TOOLS = frozenset({"execute"})
 
 
 class DropToolsMiddleware(AgentMiddleware):
@@ -144,11 +146,13 @@ class DropToolsMiddleware(AgentMiddleware):
 DEEP_AGENT_SYSTEM_PROMPT = """你是 AI Detector 系統的協調者，負責把使用者的需求拆解成步驟，
 再交給專責的 subagent 執行。你自己不直接呼叫任何訓練／推論／資料集工具。
 
-你有四個 subagent，用 task 工具派工：
+你有五個 subagent，用 task 工具派工：
 - data_agent：資料集健康檢查、匯入本機圖片、去 Roboflow 搜尋與準備補強提案
 - model_agent：訓練模型（skill_train）、用模型做推論（skill_infer）
 - evaluation_agent：評估「單一個」已訓練模型的最終效果（skill_eval，讀 mAP/loss）
 - experiment_analyst：讀訓練紀錄檔案，做「跨多次實驗」的比較與趨勢判讀
+- general-purpose：通用 worker。子任務不屬於上面任何專門角色時，自己描述一段任務派給它，
+  不需要先把它歸類成某個角色。涉及資料集／訓練／推論／評估的事情不要派給它。
 
 evaluation_agent 與 experiment_analyst 的分工：問「這個模型好不好」派前者，問
 「這幾次訓練哪個好」「參數改了有沒有用」「有沒有過擬合」「之前訓練過哪些東西」
@@ -166,7 +170,13 @@ evaluation_agent 與 experiment_analyst 的分工：問「這個模型好不好�
 工作方式：
 1. 需求需要兩個步驟以上時，先用 write_todos 列出計畫，每完成一步就更新狀態。
    單一步驟的請求（例如「檢查一下資料集」）不用列 todo，直接派工，也不要先探查環境。
-2. 一次只派一個 subagent，看它回報什麼再決定下一步，不要一次把三個都叫起來。
+2. 派工的並行規則——同一則回覆裡發出多個 task 呼叫，它們會「同時」執行：
+   - 子任務彼此獨立、而且都只是讀取或查詢時，一次把它們全部派出去比較快。
+     例如「比較 A 和 B 兩個資料集的健康度」就同時派兩個 data_agent 任務。
+   - 子任務有先後依賴時（要先確認資料集健康、才決定要不要訓練），一次只派一個，
+     看回報再決定下一步。
+   - 「絕對不可以」同時派出兩個以上會啟動訓練的任務：這台機器同時只能跑一個訓練，
+     第二個會直接被擋掉（already_training）。訓練永遠一次一個。
 3. subagent 回報卡關時，判斷是「換個做法還能繼續」還是「需要使用者補資訊」。
    同一個 subagent 用同樣的方式連續失敗兩次就不要再試第三次，改成把狀況講給使用者。
 
@@ -280,6 +290,19 @@ ANALYST_SUBAGENT_PROMPT = """你是 Experiment Analyst，負責從訓練紀錄�
 
 你不負責啟動訓練、推論或修改資料集。你也不能寫入 /runs（那是唯讀的，寫入會被拒絕）。"""
 
+GENERAL_PURPOSE_SUBAGENT_PROMPT = """你是通用 worker，處理那些不屬於任何專門角色的臨時子任務。
+
+派給你的任務是呼叫方臨時描述出來的，沒有固定形狀——可能是「找出 /runs 底下有幾次訓練
+沒跑完」、「把 /workspace 裡那份比較報告濃縮成三行」、「確認 /memories 有沒有記過這個
+資料集的問題」這類。照著描述做完，然後回報結果。
+
+你的檔案系統只有三個地方，其他路徑不存在：/runs（唯讀）、/workspace、/memories。
+
+重要：呼叫方只看得到你最後那一則訊息，看不到你中間的推理與工具回傳。所以最後一則
+訊息必須是完整、可以直接使用的答案，不要寫「已完成」或「詳見上面」。
+
+沒辦法完成時就明講卡在哪裡，不要編造內容填答案。"""
+
 
 def _build_backend():
     """CompositeBackend：只開三條路由，其餘落到 StateBackend（不落地）。
@@ -365,6 +388,31 @@ def _build_subagents(chat_model):
             "tools": [],
             "model": chat_model,
             "middleware": [DropToolsMiddleware(ANALYST_EXCLUDED_TOOLS)],
+        },
+        {
+            # 這個 spec 的名稱必須正好是 "general-purpose"：create_deep_agent 預設會自動
+            # 加一個同名的通用 subagent，而它判斷「呼叫方是不是自己宣告了」就是比對名稱，
+            # 所以同名 spec 會蓋掉預設值（graph.py 的註解：an explicit spec is how callers
+            # override the default）。
+            #
+            # 為什麼要蓋掉而不是沿用預設：預設那一份用的是 harness profile 的排除清單
+            # （空的），不是我們的 DropToolsMiddleware，所以它連 execute 都拿得到——雖然
+            # CompositeBackend 不是 SandboxBackend、execute 只會回錯誤訊息，但那是每次
+            # 呼叫多 831 tokens 的浪費，也可能讓模型一直去試一個永遠不會成功的工具。
+            #
+            # 為什麼要保留這個角色：它是「subtask 不必事先定義成某個專門角色」的載體，
+            # 也就是 LangChain 文件對 orchestrator-worker 的分界條件（Routing 是導向
+            # predetermined 的流程，orchestrator-worker 是動態拆出 unpredictable 的
+            # subtask）。少了它，這個模式就退回四個固定角色的 Routing。
+            "name": "general-purpose",
+            "description": "通用 worker，處理不屬於上述任何專門角色的臨時子任務——需要翻找"
+                           "檔案、彙整資料、做多步驟的雜項查證時派給它。任務內容由你自己描述，"
+                           "不需要事先定義成某個角色。涉及資料集／訓練／推論／評估的事情請派"
+                           "給對應的專門 subagent，不要派給它。",
+            "system_prompt": GENERAL_PURPOSE_SUBAGENT_PROMPT,
+            "tools": [],
+            "model": chat_model,
+            "middleware": [DropToolsMiddleware(GENERAL_PURPOSE_EXCLUDED_TOOLS)],
         },
     ]
 
