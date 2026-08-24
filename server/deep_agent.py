@@ -70,21 +70,50 @@ EVAL_TOOLS = [skill_eval]
 # train_confirm_gate 對齊：跑之前一定要人工確認。工具名稱就是 @tool 函式名。
 TRAIN_TOOL_NAME = "skill_train"
 
-# create_deep_agent 內建 FilesystemMiddleware 的 7 個工具，這個模式一個都用不到：
-# 它的職責是「協調三個 subagent 去操作資料集與模型」，不需要讀寫檔案，execute 在
-# 預設的 StateBackend 上本來就只會回傳錯誤訊息。
+# ---- 檔案系統的可見範圍與權限 ----
 #
-# 為什麼要主動拿掉：實測第一次呼叫的 input 就有 6466 tokens，而這 7 個工具的 schema
-# 佔了約 2547（read_file 611、execute 831、grep 344…），每一次 LLM 呼叫都要重送一遍。
-# 而且模型真的會被它們帶偏——第一個問題「檢查一下 車 這個資料集」時，模型的第一個
-# 動作是 ls({"path": "/"})，回傳空陣列，整整浪費一次 LLM 往返。
+# deepagents 的 FilesystemBackend 文件明確警告它「不適合用在 web server / HTTP API」，
+# 因為 agent 能讀到機密（.env 的 API key）。這個專案就是 FastAPI server，所以刻意
+# 不把 root_dir 設在專案根目錄，而是用 CompositeBackend 只開三條路由——.env、venv、
+# .git、models、data/datasets 在 agent 眼中根本不存在，是構造上不可達，不是靠黑名單
+# 擋掉的（黑名單漏一條就破功）。
 #
-# 之後階段 B 要做「讀 runs/train/*/results.csv 自己比較多次實驗」時會把這些工具加回來
-# （搭配 FilesystemBackend 與 FilesystemPermission 限制根目錄），現在拿掉只是因為
-# 階段 A 的目標是跟 Manager 模式能力對等，用不到的東西不該讓模型每次都看到。
-EXCLUDED_BUILTIN_TOOLS = frozenset({
-    "ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute",
+# 三條路由：
+#   /runs      -> runs/（訓練紀錄，只准讀）
+#   /memories  -> data/deep_agent_memory/（跨 session 長期記憶，可讀寫）
+#   /workspace -> data/deep_agent_workspace/（實驗比較報告的暫存區，可讀寫）
+# 其餘路徑落到 StateBackend（存在對話 state 裡，不落地，寫壞了也只影響這一輪）。
+#
+# 每個 FilesystemBackend 都要 virtual_mode=True：文件說預設的 False「即使設了
+# root_dir 也不提供任何安全性」，True 才會封鎖 ..／~ 與跳出 root_dir 的絕對路徑。
+RUNS_DIR = PROJECT_ROOT / "runs"
+MEMORY_DIR = PROJECT_ROOT / "data" / "deep_agent_memory"
+WORKSPACE_DIR = PROJECT_ROOT / "data" / "deep_agent_workspace"
+MEMORY_FILE_VPATH = "/memories/AGENTS.md"
+
+# 訓練紀錄是判斷模型好壞的唯一依據，agent 只准讀不准改——被改掉就再也分不清哪些
+# 數字是真的跑出來的。permission 規則是「依宣告順序比對、第一個命中的生效、都沒命中
+# 就是 allow」，所以只需要宣告這一條 deny，/memories 與 /workspace 自然可寫。
+FILESYSTEM_PERMISSIONS = [
+    {"operations": ["write"], "paths": ["/runs", "/runs/**"], "mode": "deny"},
+]
+
+# execute（跑 shell 指令）永遠不開：FilesystemBackend 不是 SandboxBackend，而唯一支援
+# execute 的 LocalShellBackend 官方描述是「unrestricted local shell command execution，
+# 沒有任何 sandbox、行程隔離或安全限制」。要 agent 讀訓練紀錄不需要 shell。
+#
+# 主 agent 只留 read_file／edit_file：它要能讀寫 /memories/AGENTS.md 來維護長期記憶
+# （MemoryMiddleware 就是叫模型用 edit_file 存新知識的），但「翻目錄找檔案」是
+# experiment_analyst 的工作，主 agent 不需要 ls／glob／grep，少 3 個 schema 少一些 token。
+MAIN_AGENT_EXCLUDED_TOOLS = frozenset({"ls", "glob", "grep", "write_file", "execute"})
+# 三個原本的 subagent 只操作資料集與模型，完全不需要檔案系統。順便也拿掉 write_todos：
+# subagent 的 base stack 一律含 TodoListMiddleware，但這三個角色each 都是「呼叫一兩個
+# Skill 然後回報」的單一目的任務，不需要自己維護待辦清單，而那個 schema 是 1091 tokens。
+DOMAIN_SUBAGENT_EXCLUDED_TOOLS = frozenset({
+    "ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute", "write_todos",
 })
+# 實驗分析 subagent 是唯一需要完整讀取能力的角色。
+ANALYST_EXCLUDED_TOOLS = frozenset({"execute"})
 
 
 class DropToolsMiddleware(AgentMiddleware):
@@ -101,7 +130,7 @@ class DropToolsMiddleware(AgentMiddleware):
     清單，所以三個 SubAgent 的 middleware 欄位也要各自掛一份（見 _build_subagents）。
     """
 
-    def __init__(self, excluded=EXCLUDED_BUILTIN_TOOLS):
+    def __init__(self, excluded):
         super().__init__()
         self._excluded = frozenset(excluded)
 
@@ -115,13 +144,24 @@ class DropToolsMiddleware(AgentMiddleware):
 DEEP_AGENT_SYSTEM_PROMPT = """你是 AI Detector 系統的協調者，負責把使用者的需求拆解成步驟，
 再交給專責的 subagent 執行。你自己不直接呼叫任何訓練／推論／資料集工具。
 
-你有三個 subagent，用 task 工具派工：
+你有四個 subagent，用 task 工具派工：
 - data_agent：資料集健康檢查、匯入本機圖片、去 Roboflow 搜尋與準備補強提案
 - model_agent：訓練模型（skill_train）、用模型做推論（skill_infer）
-- evaluation_agent：評估已訓練模型的效果（skill_eval，讀 mAP/loss）
+- evaluation_agent：評估「單一個」已訓練模型的最終效果（skill_eval，讀 mAP/loss）
+- experiment_analyst：讀訓練紀錄檔案，做「跨多次實驗」的比較與趨勢判讀
 
-你「沒有」檔案系統工具（ls／read_file／write_file／glob／grep／execute 都已停用），
-所有實際操作都必須透過 task 交給 subagent。不要試圖自己去看目錄或讀檔案。
+evaluation_agent 與 experiment_analyst 的分工：問「這個模型好不好」派前者，問
+「這幾次訓練哪個好」「參數改了有沒有用」「有沒有過擬合」「之前訓練過哪些東西」
+派後者——後者會去翻 /runs 底下每次訓練的 results.csv 與 args.yaml，看的是歷程不是單點。
+
+你自己只有 read_file 與 edit_file 兩個檔案工具，用途只有一個：維護 /memories/AGENTS.md
+這份長期記憶。翻目錄、找檔案、讀訓練紀錄都是 experiment_analyst 的工作，不要自己做。
+
+【長期記憶】
+系統提示裡的 <agent_memory> 就是 /memories/AGENTS.md 的內容，跨對話、跨伺服器重啟都留著。
+使用者透露了「以後也用得到」的資訊時，用 edit_file 寫進去，例如：他慣用的訓練參數、
+他在意哪個指標、某個資料集已知的問題、他明確拒絕過的做法。
+不要記一次性的任務內容（「幫我訓練一下」），也絕對不要記任何 API key 或密碼。
 
 工作方式：
 1. 需求需要兩個步驟以上時，先用 write_todos 列出計畫，每完成一步就更新狀態。
@@ -215,6 +255,65 @@ EVAL_SUBAGENT_PROMPT = """你是 Evaluation Agent，只負責用 skill_eval 評�
 
 你不負責訓練模型或處理資料集。"""
 
+ANALYST_SUBAGENT_PROMPT = """你是 Experiment Analyst，負責從訓練紀錄檔案裡挖出「跨多次實驗的
+趨勢」，這是其他 subagent 做不到的事——evaluation_agent 的 skill_eval 一次只看一個模型的
+最終數字，你看的是所有實驗的完整歷程。
+
+你的檔案系統只有三個地方，其他路徑不存在：
+- /runs：訓練紀錄，**唯讀**。每次訓練是一個資料夾 /runs/train/<實驗名稱>/，裡面通常有
+  results.csv（逐 epoch 的 loss 與 mAP，這是最有價值的檔案）、args.yaml（那次用的參數）、
+  weights/。先用 ls 或 glob 看有哪些實驗，再 read_file 讀進來。
+- /workspace：可讀寫，把整理好的比較報告寫成 markdown 放這裡（例如
+  /workspace/實驗比較_20260824.md），下次要引用就不用重讀一遍原始檔。
+- /memories：可讀寫，長期記憶。
+
+做法：
+1. 先 glob 或 ls 確認有哪些實驗資料夾，不要憑印象猜實驗名稱。
+2. read_file 讀 results.csv 與 args.yaml。results.csv 可能很長，重點是「最後幾個 epoch 的
+   數值」與「整條曲線的走勢」，不要把整份原文貼回去。
+3. 交叉比對參數與結果，找出可解讀的因果：哪個參數改了之後 mAP 有進步、哪次是過擬合
+  （train loss continue 下降但 val mAP 停滯或下滑）、哪次根本沒跑完。
+4. 把比較結果寫成一份 markdown 存進 /workspace，然後在回報裡直接給結論。
+
+回報內容必須具體：實驗名稱、關鍵參數、mAP50、最終 loss、跑了幾個 epoch，以及你的判讀。
+只寫「已分析完成」等於沒有回報。找不到任何訓練紀錄就明講 /runs 底下是空的，不要編數字。
+
+你不負責啟動訓練、推論或修改資料集。你也不能寫入 /runs（那是唯讀的，寫入會被拒絕）。"""
+
+
+def _build_backend():
+    """CompositeBackend：只開三條路由，其餘落到 StateBackend（不落地）。
+
+    三個實體目錄先建出來——FilesystemBackend 的 root_dir 不存在時，ls／glob 會直接
+    失敗，而「目錄還沒建」不是 agent 該自己想辦法解決的問題。
+    """
+    from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+
+    for d in (RUNS_DIR, MEMORY_DIR, WORKSPACE_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # 長期記憶檔第一次啟動時要存在，MemoryMiddleware 才讀得到東西。
+    memory_file = MEMORY_DIR / "AGENTS.md"
+    if not memory_file.exists():
+        memory_file.write_text(
+            "# Deep Agent 的長期記憶\n\n"
+            "這個檔案跨對話、跨伺服器重啟都會保留。記錄使用者的偏好與這個專案的既有事實，\n"
+            "不要記一次性的任務內容，也絕對不要記任何 API key 或密碼。\n\n"
+            "## 使用者偏好\n\n（還沒有記錄）\n\n"
+            "## 這個專案的既有事實\n\n"
+            "- 這台機器是 CPU-only、記憶體有限，訓練預設用低資源組合。\n",
+            encoding="utf-8",
+        )
+
+    return CompositeBackend(
+        default=StateBackend(),
+        routes={
+            "/runs": FilesystemBackend(root_dir=RUNS_DIR, virtual_mode=True),
+            "/memories": FilesystemBackend(root_dir=MEMORY_DIR, virtual_mode=True),
+            "/workspace": FilesystemBackend(root_dir=WORKSPACE_DIR, virtual_mode=True),
+        },
+    )
+
 
 def _build_subagents(chat_model):
     """三個宣告式 SubAgent。model 明確指定成跟主 agent 同一個 chat_model，
@@ -228,7 +327,7 @@ def _build_subagents(chat_model):
             "system_prompt": DATA_SUBAGENT_PROMPT,
             "tools": DATA_TOOLS,
             "model": chat_model,
-            "middleware": [DropToolsMiddleware()],
+            "middleware": [DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
         },
         {
             "name": "model_agent",
@@ -236,7 +335,7 @@ def _build_subagents(chat_model):
             "system_prompt": MODEL_SUBAGENT_PROMPT,
             "tools": MODEL_TOOLS,
             "model": chat_model,
-            "middleware": [DropToolsMiddleware()],
+            "middleware": [DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
         },
         {
             "name": "evaluation_agent",
@@ -245,7 +344,27 @@ def _build_subagents(chat_model):
             "system_prompt": EVAL_SUBAGENT_PROMPT,
             "tools": EVAL_TOOLS,
             "model": chat_model,
-            "middleware": [DropToolsMiddleware()],
+            "middleware": [DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
+        },
+        {
+            # 階段 B 新增的角色，也是 Manager 模式做不到的那件事：它不綁任何領域工具，
+            # 只用內建的檔案系統工具去讀 /runs 的訓練紀錄，做跨實驗的比較與判讀。
+            # 放在 subagent 而不是主 agent，是因為讀檔會塞進大量原始內容（results.csv
+            # 動輒上百行），關在自己的 context 裡跑完只回摘要，主 agent 的對話才不會被
+            # 這些中間資料撐爆——這正是 deepagents 的 task 工具最有價值的地方。
+            "name": "experiment_analyst",
+            "description": "讀 /runs 底下的訓練紀錄（results.csv／args.yaml），做跨多次實驗的"
+                           "比較與趨勢判讀，並把報告寫進 /workspace。使用者問「這幾次訓練哪個"
+                           "比較好」「參數改了有沒有用」「有沒有過擬合」「之前訓練過什麼」這類"
+                           "需要回顧歷史實驗的問題時派給它。單一模型的最終指標請改派"
+                           "evaluation_agent。",
+            "system_prompt": ANALYST_SUBAGENT_PROMPT,
+            # 明確給空清單：SubAgent 沒有 tools 這個 key 時會「繼承主 agent 的 tools」，
+            # 而主 agent 根本沒傳 tools（None），繼承 None 反而多一條不必要的路徑。
+            # 它要用的是 FilesystemMiddleware 注入的內建工具，不是領域工具。
+            "tools": [],
+            "model": chat_model,
+            "middleware": [DropToolsMiddleware(ANALYST_EXCLUDED_TOOLS)],
         },
     ]
 
@@ -268,9 +387,17 @@ def build_deep_agent(chat_model):
         # 頂層設定會被宣告式 SubAgent 繼承，所以 model_agent 裡的 skill_train
         # 也會先暫停等確認，不用在 subagent 上再設一次。
         interrupt_on={TRAIN_TOOL_NAME: True},
+        # 檔案系統只開 /runs（唯讀）、/memories、/workspace 三條路由，其餘落到
+        # StateBackend。.env／venv／.git／models 在 agent 眼中不存在。
+        backend=_build_backend(),
+        permissions=FILESYSTEM_PERMISSIONS,
+        # 跨 session 長期記憶：啟動時把這個檔案的內容注入系統提示，模型要記新東西時
+        # 用 edit_file 寫回去。因為它是 /memories 路由下的「真實檔案」，所以跨對話、
+        # 跨伺服器重啟都留著，不需要另外接 Store。
+        memory=[MEMORY_FILE_VPATH],
         # 使用者 middleware 會插在 base stack（Todo/Filesystem/SubAgent 等注入工具的
         # middleware）之後，所以這裡拿得到、也拿得掉它們注入的工具。
-        middleware=[DropToolsMiddleware()],
+        middleware=[DropToolsMiddleware(MAIN_AGENT_EXCLUDED_TOOLS)],
         checkpointer=SqliteSaver(conn),
     )
 

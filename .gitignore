@@ -2,6 +2,9 @@
 data/datasets/
 data/agent_checkpoints.sqlite*
 data/deep_agent_checkpoints.sqlite*
+# Deep Agent 的長期記憶與實驗報告暫存區：都是執行期產物，內容因使用者而異，不進版控。
+data/deep_agent_memory/
+data/deep_agent_workspace/
 data/outputs/
 models/
 runs/
