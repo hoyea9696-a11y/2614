@@ -29,16 +29,17 @@ MANAGER_SYSTEM_PROMPT = """你是 AI Detector 系統的 Manager Agent，系統�
 你的職責：
 - 理解使用者需求，判斷任務類型
 - 選擇適合的 Tool 呼叫（check_dataset_health / train_yolo_model /
-  evaluate_yolo_model / run_yolo_inference / download_roboflow_dataset）
+  evaluate_yolo_model / run_yolo_inference / search_roboflow_universe /
+  prepare_roboflow_augmentation / download_roboflow_dataset）
 - 不需要用 Tool 就能回答的問題，直接回答，不要硬套工具
 
 補資料規則：
 - 如果 train_yolo_model 回傳 status="dataset_not_found"，代表本機沒有這個資料集，
-  不要直接放棄或回問使用者要不要自己找資料。你要自己根據資料集名稱／使用者描述的關鍵字，
-  猜一個最可能符合的 Roboflow Universe workspace 與 project slug，呼叫
-  download_roboflow_dataset 下載；如果回傳 status="not_found"，換一個猜測再試，
-  最多嘗試 3 次不同猜測，全部失敗才回報使用者需要提供正確的資料集網址。
+  先用 search_roboflow_universe 依資料集名稱／使用者描述搜尋真實候選，再把搜尋結果的
+  workspace、project 與 version 傳給 download_roboflow_dataset，不要自行猜 slug。
 - 下載成功後，用同一個 dataset_name 重新呼叫 train_yolo_model 繼續原本的任務。
+- 補強既有資料集時只可呼叫 prepare_roboflow_augmentation 產生暫存 proposal；
+  正式合併必須由 Multi-Agent LangGraph 的人工確認 Gate 處理，你不能自行套用。
 
 你不負責：
 - 實際的模型訓練、推論、資料處理邏輯（那些都在 Tool 裡面，你只負責決定呼叫哪個）
@@ -54,6 +55,12 @@ def _load_env():
                 if "=" in line and not line.startswith("#"):
                     k, v = line.split("=", 1)
                     os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+# LLM 呼叫（Planner/Decision Engine/子 Agent 的 ReAct 迴圈）沒有這層上限的話，
+# provider 端網路卡頓或無回應時 .invoke() 會不斷等下去，_invoke_with_retry 的
+# 重試也只是再等一次同樣沒上限的呼叫，使用者只能整個關掉伺服器才能脫困。
+LLM_REQUEST_TIMEOUT_SECONDS = 60
 
 
 def get_default_chat_model(model_type: str = "gemini"):
@@ -83,7 +90,11 @@ def get_default_chat_model(model_type: str = "gemini"):
         from langchain_google_genai import ChatGoogleGenerativeAI
 
         model_name = conf.get("gemini_pro_model") if platform == "gemini-pro" else conf.get("gemini_flash_model", "gemini-2.5-flash")
-        return ChatGoogleGenerativeAI(model=model_name, google_api_key=conf.get("gemini_api_key"))
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=conf.get("gemini_api_key"),
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        )
 
     from langchain_openai import ChatOpenAI
 
@@ -91,6 +102,7 @@ def get_default_chat_model(model_type: str = "gemini"):
         return ChatOpenAI(
             model=conf.get("openai_model", "gpt-4.1-mini"),
             api_key=conf.get("openai_api_key"),
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     if platform in ("gpt-oss", "llama4-scout", "llama-4-scout"):
@@ -98,6 +110,7 @@ def get_default_chat_model(model_type: str = "gemini"):
             model=conf.get("gpt_oss_model", "openai/gpt-oss-120b"),
             api_key=conf.get("groq_api_key"),
             base_url="https://api.groq.com/openai/v1",
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     raise ValueError(f"Manager Agent 不支援的 model_type：{model_type}")

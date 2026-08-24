@@ -22,6 +22,10 @@ from agent_tools import (
     evaluate_yolo_model,
     run_yolo_inference,
     download_roboflow_dataset,
+    search_roboflow_universe,
+    prepare_roboflow_augmentation,
+    apply_roboflow_proposal,
+    discard_roboflow_proposal,
 )
 
 
@@ -112,6 +116,113 @@ def case_download_roboflow_dataset_success():
         shutil.rmtree(DATASET_DIR / "__tool_smoke_download__", ignore_errors=True)
 
 
+def case_search_roboflow_universe_uses_real_search_shape():
+    response = MagicMock(status_code=200, ok=True)
+    response.json.return_value = {
+        "query": "bear object detection",
+        "results": [{
+            "name": "Bear",
+            "url": "https://universe.roboflow.com/demo-workspace/bear-demo",
+            "workspace": {"name": "Demo", "url": "demo-workspace"},
+            "type": "object-detection",
+            "classes": ["Bear"],
+            "images": 120,
+            "license": "CC BY 4.0",
+            "stars": 2,
+            "latestVersion": 3,
+        }],
+    }
+    with patch("agent_tools._load_roboflow_key", return_value="fake_key"), \
+         patch("agent_tools.requests.get", return_value=response) as mock_get:
+        result = search_roboflow_universe.invoke({"query": "bear object detection"})
+    assert result["status"] == "success"
+    assert result["candidates"][0]["workspace"] == "demo-workspace"
+    assert result["candidates"][0]["project"] == "bear-demo"
+    assert result["candidates"][0]["version"] == 3
+    assert mock_get.call_args.kwargs["params"]["q"] == "bear object detection"
+    print("[OK] Roboflow Universe 搜尋會解析官方 Search API 的 workspace/project/version")
+
+
+def case_prepare_then_confirmed_apply_keeps_formal_dataset_unchanged_until_apply():
+    dataset_name = "__tool_smoke_proposal__"
+    dataset_root = DATASET_DIR / dataset_name
+    history_path = DATASET_DIR / "__tool_smoke_roboflow_history__.json"
+    _make_fake_dataset(dataset_name)
+    (dataset_root / "data.yaml").write_text(
+        "names: ['Bear', 'Brown-bear']\n",
+        encoding="utf-8",
+    )
+    candidate = {
+        "name": "Bear Mix",
+        "workspace": "demo-workspace",
+        "project": "bear-mix",
+        "version": 2,
+        "url": "https://universe.roboflow.com/demo-workspace/bear-mix",
+        "type": "object-detection",
+        "classes": ["Bear", "Brown-bear", "Polar-bear"],
+        "images": 4,
+        "license": "CC BY 4.0",
+        "stars": 1,
+        "downloads": 10,
+    }
+
+    def fake_download(_workspace, _project, _version, destination):
+        (destination / "train" / "images").mkdir(parents=True, exist_ok=True)
+        (destination / "train" / "labels").mkdir(parents=True, exist_ok=True)
+        (destination / "data.yaml").write_text(
+            "names: ['Bear', 'Brown-bear', 'Polar-bear']\n",
+            encoding="utf-8",
+        )
+        samples = [
+            ("new_bear", b"new-bear", "0 0.5 0.5 0.2 0.2\n"),
+            ("new_brown", b"new-brown", "1 0.5 0.5 0.2 0.2\n"),
+            ("unmapped", b"polar", "2 0.5 0.5 0.2 0.2\n"),
+            ("duplicate", b"\xff\xd8\xff\xd9", "0 0.5 0.5 0.2 0.2\n"),
+        ]
+        for stem, image_bytes, label in samples:
+            (destination / "train" / "images" / f"{stem}.jpg").write_bytes(image_bytes)
+            (destination / "train" / "labels" / f"{stem}.txt").write_text(label, encoding="utf-8")
+        return {"status": "success"}
+
+    proposal_id = None
+    try:
+        with patch(
+            "agent_tools._search_roboflow_universe",
+            return_value={"status": "success", "query": "bear", "candidates": [candidate]},
+        ), patch("agent_tools._download_roboflow_export", side_effect=fake_download), \
+             patch("agent_tools.ROBOFLOW_HISTORY_PATH", history_path):
+            proposal = prepare_roboflow_augmentation.invoke({
+                "dataset_name": dataset_name,
+                "query": "bear",
+            })
+            proposal_id = proposal.get("proposal_id")
+            assert proposal["status"] == "proposal_ready"
+            assert proposal["usable_images"] == 2
+            assert proposal["unmapped_images"] == 1
+            assert proposal["duplicate_images"] == 1
+            assert len(proposal["class_mapping"]) == 2
+            assert len(list((dataset_root / "images").glob("*.jpg"))) == 1, (
+                "評估完成但尚未確認時，正式資料集不能增加圖片"
+            )
+
+            applied = apply_roboflow_proposal.invoke({"proposal_id": proposal_id})
+            assert applied["status"] == "success"
+            assert applied["added_images"] == 2
+            assert applied["total_images_now"] == 3
+            labels = [
+                path.read_text(encoding="utf-8").split()[0]
+                for path in (dataset_root / "labels").glob("bear-mix_*.txt")
+            ]
+            assert sorted(labels) == ["0", "1"], "多類別資料必須依明確類別名稱映射，不能全部改成 class 0"
+        print("[OK] Agent 先暫存評估；使用者確認後才合併，並安全保留多類別 mapping")
+    finally:
+        if proposal_id:
+            discard_roboflow_proposal(proposal_id)
+        shutil.rmtree(dataset_root, ignore_errors=True)
+        if history_path.exists():
+            history_path.unlink()
+
+
 def case_train_yolo_model_blocks_path_traversal():
     # _sanitize_name 會把路徑元件全部拆掉，只留下最後一段檔名，
     # 所以帶 ../ 的 dataset_name 會被當成單純的 "__escaped_dataset__" 處理，
@@ -185,6 +296,8 @@ def run():
     case_train_yolo_model_blocks_path_traversal()
     case_download_roboflow_dataset_not_found()
     case_download_roboflow_dataset_success()
+    case_search_roboflow_universe_uses_real_search_shape()
+    case_prepare_then_confirmed_apply_keeps_formal_dataset_unchanged_until_apply()
     case_download_roboflow_dataset_blocks_zip_slip()
     case_evaluate_yolo_model_no_data()
     case_run_yolo_inference_mocked()

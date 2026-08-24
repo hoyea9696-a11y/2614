@@ -25,8 +25,11 @@
 執行方式：python multi_agent_smoke_test.py
 """
 import shutil
+import uuid
+from unittest.mock import patch
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.types import Command
 
 from agent_tools import DATASET_DIR
 from multi_agent import (
@@ -36,6 +39,11 @@ from multi_agent import (
     Decision,
     Plan,
     Step,
+    TrainingHealthReply,
+    TrainingParamsReply,
+    TrainingProposal,
+    _build_approved_training_tool,
+    _build_post_augment_training_transition,
     RETRY_LIMITS,
     STALL_ROUNDS_BEFORE_REPLAN,
 )
@@ -48,19 +56,42 @@ class FakeMultiAgentModel:
     Planner／Manager 的結構化輸出（with_structured_output）跟子 Agent 的一般
     ReAct 呼叫（bind_tools）共用同一個腳本佇列，依實際呼叫順序依序取用——這樣
     才能同時驗證「該問 LLM 的時候有問」跟「不該問的時候完全沒問」（腳本項目
-    不夠就會直接因為 pop 到空 list 或型別不對而讓測試失敗）。"""
+    不夠就會直接因為 pop 到空 list 或型別不對而讓測試失敗）。
+
+    bind_tools／with_structured_output 回傳的包裝物件不同：production code
+    對 decision_model/planner_model 用 include_raw=True，取的是
+    result["parsed"]/result["raw"]；對子 Agent 的 model_with_tools 則直接用
+    invoke() 回傳值當 AIMessage。腳本裡放的都是裸的 Plan/Decision/AIMessage，
+    由包裝物件依角色決定要不要包成 {"parsed", "raw"}，不用每個測試案例自己包。"""
 
     def __init__(self, script):
         self._script = list(script)
 
     def bind_tools(self, tools):
-        return self
+        return _FakeBoundModel(self._script)
 
-    def with_structured_output(self, schema, method=None):
-        return self
+    def with_structured_output(self, schema, method=None, include_raw=False):
+        return _FakeStructuredModel(self._script, include_raw)
+
+
+class _FakeBoundModel:
+    def __init__(self, script):
+        self._script = script
 
     def invoke(self, messages):
         return self._script.pop(0)
+
+
+class _FakeStructuredModel:
+    def __init__(self, script, include_raw):
+        self._script = script
+        self._include_raw = include_raw
+
+    def invoke(self, messages):
+        item = self._script.pop(0)
+        if self._include_raw:
+            return {"parsed": item, "raw": AIMessage(content="")}
+        return item
 
 
 def _make_fake_dataset(name: str):
@@ -69,6 +100,29 @@ def _make_fake_dataset(name: str):
     (ds / "labels").mkdir(parents=True, exist_ok=True)
     (ds / "images" / "a.jpg").write_bytes(b"\xff\xd8\xff\xd9")
     (ds / "labels" / "a.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+
+
+def _make_unlabeled_dataset(name: str):
+    """有圖片但完全沒有標記：coverage=0，會被 Health Gate 擋下的那種資料集。"""
+    ds = DATASET_DIR / name
+    (ds / "images").mkdir(parents=True, exist_ok=True)
+    for i in range(3):
+        (ds / "images" / f"a{i}.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+
+
+def _make_imbalanced_dataset(name: str):
+    """標記完整但類別數量嚴重偏一邊：coverage=100、balance=20，健康分數不到門檻。
+
+    9 張是類別 0、1 張是類別 1 —— 這是「該建議去 Roboflow 補資料」的情況，跟上面
+    完全沒標記的情況要走不一樣的建議。
+    """
+    ds = DATASET_DIR / name
+    (ds / "images").mkdir(parents=True, exist_ok=True)
+    (ds / "labels").mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        (ds / "images" / f"b{i}.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+        cls_id = 1 if i == 9 else 0
+        (ds / "labels" / f"b{i}.txt").write_text(f"{cls_id} 0.5 0.5 0.2 0.2\n")
 
 
 def _report_call(status: str, reason: str, suggestion: str = "", reason_code: str = "", call_id: str = "call"):
@@ -84,6 +138,62 @@ def _report_call(status: str, reason: str, suggestion: str = "", reason_code: st
 
 def _tool_call(name: str, args: dict, call_id: str = "call"):
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
+
+
+def _thread(name: str) -> str:
+    """build_multi_agent 用真的 SqliteSaver（跟 production 共用同一個 data/agent_checkpoints.sqlite），
+    固定字串當 thread_id 會讓這次執行讀到上一次跑測試留下的舊訊息，導致斷言誤判——每次跑都
+    加一段隨機字尾，確保每個測試案例、每次執行都是全新的一份記憶。"""
+    return f"{name}_{uuid.uuid4().hex[:8]}"
+
+
+def _resume_param_question(graph, config, result):
+    """回答 train_params_gate 問的訓練參數，讓流程往下走到確認 Gate。
+
+    這個 Gate 刻意不用 interrupt()：它走 ASK_USER，也就是「這一輪直接結束、等使用者
+    在聊天視窗回一句話」。所以測試不能用 Command(resume=...) 恢復，必須真的再送一則
+    HumanMessage 進去，模擬使用者回「就用這些」。腳本裡要對應放一筆
+    TrainingParamsReply，那是 Manager 解析這句回覆時會消耗的一格。
+    """
+    if not result.get("pending_param_question"):
+        return result
+    return graph.invoke({"messages": [HumanMessage(content="就用這些")]}, config=config)
+
+
+def _is_training_interrupt(result) -> bool:
+    """這次 interrupt 是不是「要不要開始訓練」的確認框。
+
+    結束時還有另一個 interrupt 會問「要不要把模型存進模型庫」，那個不該由測試代答，
+    所以要能分辨——只有訓練確認才自動按下同意。
+    """
+    interrupts = result.get("__interrupt__") or []
+    if not interrupts:
+        return False
+    payload = getattr(interrupts[0], "value", None) or {}
+    return payload.get("action_type") == "training" or "training_params" in payload
+
+
+def _invoke_confirming_training(graph, initial_input, config, max_stops=12):
+    """跑到底：訓練前有兩個停頓點，兩個都答掉才走得到 model_agent/skill_train。
+
+    1. train_params_gate 用 ASK_USER 問參數 —— 補送一句「就用這些」（見
+       _resume_param_question）。
+    2. train_confirm_gate 用 interrupt() 等最後確認 —— 模擬使用者按下確認
+       （approved=True），跟 stream_trace() 對 interrupt 的處理邏輯一樣。
+
+    訓練失敗後 Manager 重試會再繞回這兩個 Gate 一次，所以這裡用迴圈處理到不再停下來
+    為止，不是只答一次；max_stops 只是避免測試在接線出錯時無限迴圈的保險絲。
+    """
+    result = graph.invoke(initial_input, config=config)
+    for _ in range(max_stops):
+        if result.get("pending_param_question"):
+            result = _resume_param_question(graph, config, result)
+            continue
+        if _is_training_interrupt(result):
+            result = graph.invoke(Command(resume={"approved": True}), config=config)
+            continue
+        break
+    return result
 
 
 def case_extract_text_handles_gemini_content_blocks():
@@ -117,7 +227,10 @@ def case_manager_routes_to_data_agent_then_finish():
 
     _make_fake_dataset("__multi_smoke_ds__")
     try:
-        result = graph.invoke({"messages": [HumanMessage(content="幫我看一下資料集健康度")]})
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="幫我看一下資料集健康度")]},
+            config={"configurable": {"thread_id": _thread("smoke_data_agent")}},
+        )
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_ds__", ignore_errors=True)
 
@@ -137,13 +250,25 @@ def case_manager_hands_off_data_agent_to_model_agent_to_evaluation_agent():
     script = [
         Plan(goal="訓練並評估模型", steps=[
             Step(id="1", description="確認/補齊資料", agent="data_agent"),
-            Step(id="2", description="訓練模型", agent="model_agent"),
+            Step(
+                id="2",
+                description="訓練模型",
+                agent="model_agent",
+                is_training=True,
+                training_params=TrainingProposal(
+                    dataset_name="__multi_smoke_train__",
+                    epochs=1,
+                    model_name="smoke_exp",
+                ),
+            ),
             Step(id="3", description="評估模型", agent="evaluation_agent"),
         ]),
         Decision(action="call_agent", target_agent="data_agent", rationale="需要先確認/補齊資料"),
         _tool_call("download_roboflow_dataset", {"workspace": "ws", "project": "proj", "dataset_name": "__multi_smoke_train__"}, "call_1"),
         _report_call("success", "已從 Roboflow 補齊資料，共 1 張圖片。", call_id="call_2"),
         Decision(action="call_agent", target_agent="model_agent", rationale="資料備妥，開始訓練"),
+        # train_params_gate 先用對話問一次參數，使用者回「就用這些」的解析結果
+        TrainingParamsReply(intent="use_suggested"),
         _tool_call("skill_train", {"dataset_name": "__multi_smoke_train__", "epochs": 1, "model_name": "smoke_exp"}, "call_3"),
         _report_call("success", "模型訓練完成，接下來幫你評估效果。", call_id="call_4"),
         Decision(action="call_agent", target_agent="evaluation_agent", rationale="訓練完成，評估效果"),
@@ -179,7 +304,11 @@ def case_manager_hands_off_data_agent_to_model_agent_to_evaluation_agent():
              patch("agent_tools.YOLOTrainer.prepare_dataset", return_value="fake.yaml"), \
              patch("agent_tools.YOLOTrainer.train", return_value=None), \
              patch("skills.evaluate_yolo_model", fake_eval):
-            result = graph.invoke({"messages": [HumanMessage(content="幫我用 __multi_smoke_train__ 訓練並評估一個模型")]})
+            result = _invoke_confirming_training(
+                graph,
+                {"messages": [HumanMessage(content="幫我用 __multi_smoke_train__ 訓練並評估一個模型")]},
+                config={"configurable": {"thread_id": _thread("smoke_full_pipeline")}},
+            )
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_train__", ignore_errors=True)
         if state_backup is not None:
@@ -203,70 +332,332 @@ def case_manager_hands_off_data_agent_to_model_agent_to_evaluation_agent():
           "Evaluation Agent，Observer 逐步把 Plan Step 標成 done")
 
 
-def case_manager_auto_retries_known_gate_without_llm():
-    # 模擬 Evaluation Agent 剛回報 eval_gate_failed（reason_code 落在 GATE_ROUTING），
-    # Manager 應該直接靠規則轉給 model_agent 重新訓練，完全不必問 LLM。Planner 在每次
-    # graph.invoke() 一開始一定會先跑一次（產生/沿用一份 Plan），所以腳本第一項還是
-    # Plan，但決策本身（要轉給誰）不會消耗任何 Decision 項目。
-    script = [
-        Plan(goal="重新訓練模型", steps=[]),
-        _tool_call("skill_train", {"dataset_name": "__multi_smoke_retry__", "epochs": 1, "model_name": "smoke_exp2"}, "call_1"),
-        _report_call("success", "重新訓練完成", call_id="call_2"),
-        Decision(action="finish", rationale="重新訓練後已成功", final_reply="已重新訓練完成，可以使用。"),
-    ]
-    graph = build_multi_agent(FakeMultiAgentModel(script))
+def case_training_confirmation_contains_exact_params_and_operation_id():
+    proposal = TrainingProposal(
+        dataset_name="__multi_smoke_confirm__",
+        variant="yolov9s.pt",
+        epochs=3,
+        imgsz=320,
+        batch=2,
+        model_name="confirm_exp",
+    )
+    graph = build_multi_agent(FakeMultiAgentModel([
+        Plan(goal="確認後訓練", steps=[Step(
+            id="1",
+            description="使用指定低資源參數訓練",
+            agent="model_agent",
+            is_training=True,
+            training_params=proposal,
+        )]),
+        Decision(action="call_agent", target_agent="model_agent", rationale="參數已完整，等待確認"),
+        TrainingParamsReply(intent="use_suggested"),
+    ]))
 
-    _make_fake_dataset("__multi_smoke_retry__")
+    _make_fake_dataset("__multi_smoke_confirm__")
+    config = {"configurable": {"thread_id": _thread("smoke_exact_confirmation")}}
     try:
-        result = graph.invoke({
-            "messages": [HumanMessage(content="模型評估沒過，麻煩處理")],
-            "last_report": {
-                "agent": "evaluation_agent",
-                "status": "blocked",
-                "reason": "mAP50 0.3 未達標",
-                "suggestion": "增加訓練資料",
-                "reason_code": "eval_gate_failed",
-            },
-            # 跟 last_report 對應的 Evaluation 也要一起 seed，不然 Manager 第一輪會看到
-            # evaluation 是空的、reason_code 判斷也還是照走，這裡主要是避免不小心被
-            # 誤判成 plan_invalid（見 case_manager_replans_after_repeated_stall）。
-            "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": True},
-        })
+        first = graph.invoke(
+            {"messages": [HumanMessage(content="用指定參數訓練")]},
+            config=config,
+        )
+        # 確認框不是第一個停頓點：先問參數（ASK_USER），回答完才進 train_confirm_gate。
+        assert first.get("pending_param_question"), "訓練前應該先用對話問一次參數"
+        result = _resume_param_question(graph, config, first)
     finally:
-        shutil.rmtree(DATASET_DIR / "__multi_smoke_retry__", ignore_errors=True)
+        shutil.rmtree(DATASET_DIR / "__multi_smoke_confirm__", ignore_errors=True)
+
+    assert "__interrupt__" in result, "具體訓練方案準備完成後應停在確認 Gate"
+    pending = result["__interrupt__"][0]
+    payload = pending.value
+    assert pending.id and payload["operation_id"].startswith("train-")
+    assert payload["training_params"] == proposal.model_dump()
+    snapshot = graph.get_state(config)
+    assert snapshot.values["pending_operation"]["operation_id"] == payload["operation_id"]
+    print("[OK] 訓練確認包含唯一 operation_id 與完整參數，且已先寫入 checkpoint")
+
+
+def case_training_tool_rejects_unapproved_params():
+    params = TrainingProposal(dataset_name="bear", epochs=3, batch=2).model_dump()
+    guarded_tool = _build_approved_training_tool(params, "train-guard-test")
+    with patch(
+        "multi_agent.skill_train.func",
+        return_value={"status": "completed", "model_name": "exp"},
+    ) as train_mock:
+        rejected = guarded_tool.invoke({**params, "epochs": 99})
+        assert rejected["status"] == "approval_mismatch"
+        train_mock.assert_not_called()
+
+        accepted = guarded_tool.invoke(params)
+        assert accepted["status"] == "completed"
+        train_mock.assert_called_once()
+    print("[OK] Model Agent 改動未核准參數時，skill_train 會在啟動前阻止執行")
+
+
+def _training_step(dataset_name: str, model_name: str):
+    return Step(
+        id="1",
+        description="訓練模型",
+        agent="model_agent",
+        is_training=True,
+        training_params=TrainingProposal(dataset_name=dataset_name, epochs=1, model_name=model_name),
+    )
+
+
+def case_unhealthy_dataset_asks_before_showing_params():
+    # 健康檢查沒過時只講健康狀況，不要同時把參數列出來——那等於一邊說資料集有問題、
+    # 一邊把訓練流程推到底。參數要等使用者明確表示「還是要訓練」的下一句話才出現。
+    graph = build_multi_agent(FakeMultiAgentModel([
+        Plan(goal="訓練模型", steps=[_training_step("__multi_smoke_unlabeled__", "smoke_unhealthy")]),
+        Decision(action="call_agent", target_agent="model_agent", rationale="使用者要訓練"),
+        TrainingHealthReply(intent="train_anyway"),
+    ]))
+
+    _make_unlabeled_dataset("__multi_smoke_unlabeled__")
+    config = {"configurable": {"thread_id": _thread("smoke_unhealthy_gate")}}
+    try:
+        first = graph.invoke(
+            {"messages": [HumanMessage(content="用 __multi_smoke_unlabeled__ 訓練")]},
+            config=config,
+        )
+        warning = first["messages"][-1].content
+        assert first.get("pending_health_question"), "健康沒過應該停下來等使用者決定"
+        assert not first.get("pending_param_question"), "健康沒過時不該同時丟出參數問題"
+        assert "沒有通過健康檢查" in warning
+        assert "標記覆蓋率：0%（0/3 張）" in warning, f"應該如實顯示覆蓋率，實際：{warning}"
+        assert "epochs" not in warning and "yolov9s.pt" not in warning, (
+            f"上半段不該出現任何訓練參數，實際：{warning}"
+        )
+        assert "去 Roboflow 補資料也解決不了" in warning, "圖片沒標記的情況不該建議去補資料"
+
+        second = graph.invoke({"messages": [HumanMessage(content="還是要訓練")]}, config=config)
+        params_msg = second["messages"][-1].content
+        assert second.get("pending_param_question"), "使用者堅持後才進到問參數"
+        assert "epochs" in params_msg and "yolov9s.pt" in params_msg, (
+            f"下半段才顯示參數，實際：{params_msg}"
+        )
+        assert second["pending_operation"]["health_ack"] is True, (
+            "已經知情的 operation 要標記起來，重試時不該再問一次健康度"
+        )
+    finally:
+        shutil.rmtree(DATASET_DIR / "__multi_smoke_unlabeled__", ignore_errors=True)
+    print("[OK] 資料集健康沒過時只先講健康狀況，使用者堅持要訓練才顯示參數")
+
+
+def case_labeled_but_imbalanced_suggests_roboflow():
+    # 標記是完整的、問題只在類別不平衡：這種缺圖片的情況去 Roboflow 補資料才有解，
+    # 建議內容要跟「圖片根本沒標記」那種情況分開。
+    graph = build_multi_agent(FakeMultiAgentModel([
+        Plan(goal="訓練模型", steps=[_training_step("__multi_smoke_imbalanced__", "smoke_imbalanced")]),
+        Decision(action="call_agent", target_agent="model_agent", rationale="使用者要訓練"),
+    ]))
+
+    _make_imbalanced_dataset("__multi_smoke_imbalanced__")
+    config = {"configurable": {"thread_id": _thread("smoke_imbalanced_gate")}}
+    try:
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="用 __multi_smoke_imbalanced__ 訓練")]},
+            config=config,
+        )
+    finally:
+        shutil.rmtree(DATASET_DIR / "__multi_smoke_imbalanced__", ignore_errors=True)
+
+    warning = result["messages"][-1].content
+    health = result["pending_operation"]["health"]
+    assert health["coverage"] == 100.0 and health["balance"] < 40, (
+        f"這份資料集應該是「標記完整但不平衡」，實際：{health}"
+    )
+    assert health["blocks_training"] is False, "標記完整就不該被 Health Gate 擋下"
+    assert "Roboflow Universe" in warning, f"這種情況要建議去補資料，實際：{warning}"
+    assert "去補資料" in warning and "還是要訓練" in warning, "要把兩個選項都給使用者"
+    assert "epochs" not in warning, "這一段同樣不該出現訓練參數"
+    print("[OK] 標記完整但類別不平衡時，建議去 Roboflow 補資料，且一樣先不顯示參數")
+
+
+def case_roboflow_merge_builds_refresh_and_retrain_transition():
+    state = {
+        "pending_operation": {
+            "operation_id": "train-before-augment",
+            "type": "training",
+            "status": "completed",
+            "params": {
+                "dataset_name": "bear",
+                "variant": "yolov9s.pt",
+                "epochs": 3,
+                "imgsz": 320,
+                "batch": 2,
+                "model_name": "bear_exp",
+            },
+        },
+        "plan": {"goal": "改善模型", "steps": []},
+    }
+    merge_result = {
+        "status": "success",
+        "dataset_name": "bear",
+        "added_images": 12,
+        "total_images_now": 42,
+    }
+    transition = _build_post_augment_training_transition(
+        state,
+        merge_result,
+        {"status": "success", "coverage": 95.0},
+    )
+    # 補強後的重訓也是先問參數（train_params_gate），不是直接跳確認框
+    assert transition["next"] == "train_params_gate"
+    assert transition["dataset_refresh"]["total_images_now"] == 42
+    assert transition["post_augment_eval_required"] is True
+    assert transition["pending_operation"]["operation_id"] != "train-before-augment"
+    assert transition["pending_operation"]["params"]["model_name"].startswith("bear_exp_aug_")
+    assert [s["agent"] for s in transition["plan"]["steps"][-2:]] == ["model_agent", "evaluation_agent"]
+
+    blocked = _build_post_augment_training_transition(
+        state,
+        merge_result,
+        {"status": "success", "coverage": 60.0},
+    )
+    assert blocked["next"] == "FINISH"
+    assert blocked["dataset_refresh"]["dataset_name"] == "bear"
+    assert blocked["post_augment_eval_required"] is False
+    print("[OK] Roboflow 合併後會立即刷新資料集；健康檢查通過才建立新的訓練確認與評估步驟")
+
+
+def case_roboflow_merge_continues_through_confirm_train_and_eval():
+    graph = build_multi_agent(FakeMultiAgentModel([
+        Plan(goal="補強後重訓並評估", steps=[]),
+        # 補強後的重訓一樣要先經過 train_params_gate 問一次參數
+        TrainingParamsReply(intent="use_suggested"),
+        _tool_call("skill_train", {}, "call_aug_train"),
+        _report_call("success", "補強後模型訓練完成。", call_id="call_aug_train_report"),
+        _tool_call("skill_eval", {"model_name": "bear_aug_test"}, "call_aug_eval"),
+        _report_call("success", "mAP50=0.72，已通過 0.5 門檻。", call_id="call_aug_eval_report"),
+    ]))
+    config = {"configurable": {"thread_id": _thread("smoke_post_augment_pipeline")}}
+    proposal = {
+        "status": "proposal_ready",
+        "proposal_id": "smoke-post-augment",
+        "dataset_name": "bear",
+        "candidate_count": 1,
+        "candidate": {"name": "Bear Mix"},
+    }
+    initial = {
+        "messages": [HumanMessage(content="接受補強後重新訓練並評估")],
+        "roboflow_proposal": proposal,
+        "roboflow_proposal_handled": False,
+        "pending_operation": {
+            "operation_id": "train-before-augment",
+            "type": "training",
+            "status": "completed",
+            "params": TrainingProposal(dataset_name="bear", epochs=1, model_name="bear_exp").model_dump(),
+        },
+    }
+
+    with patch("multi_agent.apply_roboflow_proposal.func", return_value={
+        "status": "success",
+        "dataset_name": "bear",
+        "source": "Bear Mix",
+        "added_images": 12,
+        "before_images": 30,
+        "total_images_now": 42,
+    }), patch("multi_agent.check_dataset_health.func", return_value={
+        "status": "success", "coverage": 95.0,
+    }), patch("multi_agent.skill_train.func", return_value={
+        "status": "completed", "model_name": "bear_aug_test",
+    }), patch("multi_agent.skill_eval.func", return_value={
+        "status": "success",
+        "gate_passed": True,
+        "resolved_model_name": "bear_aug_test",
+        "final_map50": 0.72,
+        "final_loss": 0.8,
+        "charts": [],
+    }):
+        first = graph.invoke(initial, config=config)
+        assert first["__interrupt__"][0].value["action_type"] == "roboflow_proposal"
+
+        after_merge = graph.invoke(Command(resume={"approved": True}), config=config)
+        assert after_merge.get("pending_param_question"), "補強後的重新訓練也要先問一次參數"
+        assert after_merge["dataset_refresh"]["total_images_now"] == 42
+
+        second = _resume_param_question(graph, config, after_merge)
+        assert second["__interrupt__"][0].value["action_type"] == "training"
+
+        third = graph.invoke(Command(resume={"approved": True}), config=config)
+        assert third["__interrupt__"][0].value["action_type"] == "model_save"
+
+        result = graph.invoke(Command(resume={"approved": False}), config=config)
 
     tool_names = [m.name for m in result["messages"] if isinstance(m, ToolMessage)]
-    assert tool_names == ["skill_train", "report_to_manager"], (
-        f"預期 Manager 直接靠固定規則轉給 model_agent 重新訓練，不呼叫 LLM：{tool_names}"
+    assert "skill_train" in tool_names and "skill_eval" in tool_names
+    assert result["post_augment_eval_required"] is False
+    assert any("重新訓練與評估已完成" in getattr(m, "content", "") for m in result["messages"])
+    print("[OK] Roboflow 接受合併後會依序刷新、重新確認訓練、執行訓練並自動評估")
+
+
+def case_manager_auto_retries_known_gate_without_llm():
+    # Data Agent 已經完成暫存評估時，Manager 必須直接進入 proposal 確認 Gate，
+    # 不再自動重訓，也不讓 LLM 有機會提早 FINISH。拒絕後正式資料集不會變。
+    graph = build_multi_agent(FakeMultiAgentModel([Plan(goal="評估 Roboflow 補強資料", steps=[])]))
+    config = {"configurable": {"thread_id": _thread("smoke_proposal_gate")}}
+    proposal = {
+        "status": "proposal_ready",
+        "proposal_id": "smoke-proposal",
+        "dataset_name": "__multi_smoke_retry__",
+        "candidate_count": 3,
+        "candidate": {
+            "name": "Bear Mix",
+            "workspace": "demo",
+            "project": "bear-mix",
+            "version": 2,
+            "url": "https://universe.roboflow.com/demo/bear-mix",
+            "license": "CC BY 4.0",
+        },
+        "class_mapping": [{"source_name": "Bear", "target_name": "Bear"}],
+        "usable_images": 20,
+        "baseline_images": 10,
+        "estimated_total_images": 30,
+        "risks": [],
+    }
+    first = graph.invoke(
+        {
+            "messages": [HumanMessage(content="評估完再讓我確認")],
+            "roboflow_proposal": proposal,
+            "roboflow_proposal_handled": False,
+        },
+        config=config,
     )
-    assert result["retry_counters"].get("eval_gate_failed") == 1, "應該記錄這是 eval_gate_failed 的第 1 次重試"
-    assert result["messages"][-1].content == "已重新訓練完成，可以使用。"
-    print("[OK] Manager 收到已知 Gate 失敗（eval_gate_failed）時，直接用固定規則轉給 model_agent 重試，不呼叫 LLM")
+    assert "__interrupt__" in first, "有 proposal 時必須停在最後確認 Gate"
+    payload = first["__interrupt__"][0].value
+    assert payload["action_type"] == "roboflow_proposal"
+    assert payload["proposal"]["proposal_id"] == "smoke-proposal"
+
+    result = graph.invoke(Command(resume={"approved": False}), config=config)
+    assert result["roboflow_proposal_handled"] is True
+    assert "正式資料集沒有變更" in result["messages"][-1].content
+    print("[OK] Data Agent 完成暫存評估後，Manager 一定顯示最終 proposal；拒絕時不修改正式資料集")
 
 
 def case_manager_gives_up_after_retry_limit():
-    # retry_counters 已經到達 RETRY_LIMITS 上限，Manager 應該直接放棄、回報使用者，
-    # 不會再呼叫任何子 Agent 或額外的 LLM 決策——腳本只放 Planner 這一定會跑的一次，
-    # 如果 decision_engine 還多問了一次 LLM，會直接因為 pop 到空 list 而丟例外。
-    graph = build_multi_agent(FakeMultiAgentModel([Plan(goal="重新評估模型", steps=[])]))
-    limit = RETRY_LIMITS["eval_gate_failed"]
+    # 已經搜尋過但沒有產生相容 proposal 時，固定規則應直接停止，不會無限搜尋、
+    # 自動重訓或再問一次 LLM。
+    graph = build_multi_agent(FakeMultiAgentModel([Plan(goal="搜尋 Roboflow 候選", steps=[])]))
 
-    result = graph.invoke({
-        "messages": [HumanMessage(content="模型還是沒過")],
-        "last_report": {
-            "agent": "evaluation_agent",
-            "status": "blocked",
-            "reason": "mAP50 仍未達標",
-            "suggestion": "",
-            "reason_code": "eval_gate_failed",
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="模型還是沒過")],
+            "last_report": {
+                "agent": "evaluation_agent",
+                "status": "blocked",
+                "reason": "mAP50 仍未達標",
+                "suggestion": "",
+                "reason_code": "eval_gate_failed",
+            },
+            "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": False},
+            "augment_offered": True,
         },
-        "evaluation": {"verdict": "step_failed", "reason_code": "eval_gate_failed", "progress_since_last_round": False},
-        "retry_counters": {"eval_gate_failed": limit},
-    })
+        config={"configurable": {"thread_id": _thread("smoke_retry_limit")}},
+    )
 
     assert not any(isinstance(m, ToolMessage) for m in result["messages"]), "不該再呼叫任何子 Agent"
-    assert "重試" in result["messages"][-1].content
-    print(f"[OK] eval_gate_failed 重試達到上限（{limit} 次）後，Manager 直接停止並回報使用者，不再繼續重試")
+    assert "沒有找到" in result["messages"][-1].content
+    print("[OK] Roboflow 已搜尋但沒有相容 proposal 時，Manager 直接停止，不會無限搜尋或重訓")
 
 
 def case_manager_replans_after_repeated_stall():
@@ -280,18 +671,29 @@ def case_manager_replans_after_repeated_stall():
     # 進展；第 3 次跟第 2 次相同才算第 2 次沒進展，觸發 plan_invalid）。
     assert STALL_ROUNDS_BEFORE_REPLAN == 2, "這個測試的輪數是照 STALL_ROUNDS_BEFORE_REPLAN=2 設計的，改了門檻要一起調整這裡"
 
-    stalled_leg = [
-        _tool_call("skill_train", {"dataset_name": "__multi_smoke_stall__", "epochs": 1, "model_name": "smoke_exp3"}, "call_x"),
-        _report_call("blocked", "訓練時遇到未知錯誤", suggestion="重試一次", call_id="call_y"),
-    ]
     script = [
-        Plan(goal="訓練模型", steps=[Step(id="1", description="訓練模型", agent="model_agent")]),
+        Plan(goal="訓練模型", steps=[Step(
+            id="1",
+            description="訓練模型",
+            agent="model_agent",
+            is_training=True,
+            training_params=TrainingProposal(
+                dataset_name="__multi_smoke_stall__",
+                epochs=1,
+                model_name="smoke_exp3",
+            ),
+        )]),
+        # 每一輪重試都會重新繞過 train_params_gate 問一次參數，所以三輪各要一筆
+        # TrainingParamsReply；少一筆的話 Manager 會把下一個腳本項目誤當成參數回覆。
         Decision(action="call_agent", target_agent="model_agent", rationale="開始訓練"),
-        *stalled_leg,  # 第 1 次卡住
+        TrainingParamsReply(intent="use_suggested"),
+        _report_call("blocked", "訓練時遇到未知錯誤", suggestion="重試一次", call_id="call_y1"),
         Decision(action="call_agent", target_agent="model_agent", rationale="再試一次"),
-        *stalled_leg,  # 第 2 次卡住（跟第 1 次同樣訊號，stall_count=1）
+        TrainingParamsReply(intent="use_suggested"),
+        _report_call("blocked", "訓練時遇到未知錯誤", suggestion="重試一次", call_id="call_y2"),
         Decision(action="call_agent", target_agent="model_agent", rationale="再試最後一次"),
-        *stalled_leg,  # 第 3 次卡住（跟第 2 次同樣訊號，stall_count=2 -> plan_invalid）
+        TrainingParamsReply(intent="use_suggested"),
+        _report_call("blocked", "訓練時遇到未知錯誤", suggestion="重試一次", call_id="call_y3"),
         Plan(goal="訓練模型（改用其他方式排查）", steps=[Step(id="1", description="請使用者確認環境設定", agent="model_agent")]),
         Decision(action="ask_user", rationale="重新規劃後判斷需要使用者提供更多資訊", final_reply="訓練一直卡在同樣的錯誤，能否提供更多環境或資料細節？"),
     ]
@@ -299,11 +701,17 @@ def case_manager_replans_after_repeated_stall():
 
     _make_fake_dataset("__multi_smoke_stall__")
     try:
-        result = graph.invoke({"messages": [HumanMessage(content="幫我訓練模型")]})
+        result = _invoke_confirming_training(
+            graph,
+            {"messages": [HumanMessage(content="幫我訓練模型")]},
+            config={"configurable": {"thread_id": _thread("smoke_replan_stall")}},
+        )
     finally:
         shutil.rmtree(DATASET_DIR / "__multi_smoke_stall__", ignore_errors=True)
 
-    assert result["evaluation"]["verdict"] != "plan_invalid", "重新規劃後 evaluation 應該被清掉，不會停在 plan_invalid"
+    assert not result.get("evaluation") or result["evaluation"]["verdict"] != "plan_invalid", (
+        "重新規劃後 evaluation 應該被清掉，不會停在 plan_invalid"
+    )
     assert result["plan"]["goal"] == "訓練模型（改用其他方式排查）", "應該是重新規劃後的第二份 Plan，不是原本那份"
     assert result["messages"][-1].content == "訓練一直卡在同樣的錯誤，能否提供更多環境或資料細節？"
     print("[OK] Observer 連續偵測到同一種未知失敗沒有進展，Manager 繞回 Planner 重新規劃，"
@@ -318,7 +726,10 @@ def case_manager_answers_directly_without_sub_agent():
         Decision(action="finish", rationale="使用者只是打招呼", final_reply="你好，我可以幫你訓練、推論或評估模型。"),
     ]
     graph = build_multi_agent(FakeMultiAgentModel(script))
-    result = graph.invoke({"messages": [HumanMessage(content="你好")]})
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="你好")]},
+        config={"configurable": {"thread_id": _thread("smoke_greeting")}},
+    )
     assert len(result["messages"]) == 2, "不需要任何子 Agent 時，不該多繞一圈，但也不能沒有回覆內容"
     assert result["messages"][-1].content == "你好，我可以幫你訓練、推論或評估模型。"
     print("[OK] 不需要子 Agent 時，Planner 給空計畫、Manager 直接回答，不會回傳空白內容給使用者")
@@ -329,6 +740,12 @@ def run():
     case_parse_tool_content_handles_json_string_and_dict()
     case_manager_routes_to_data_agent_then_finish()
     case_manager_hands_off_data_agent_to_model_agent_to_evaluation_agent()
+    case_training_confirmation_contains_exact_params_and_operation_id()
+    case_training_tool_rejects_unapproved_params()
+    case_unhealthy_dataset_asks_before_showing_params()
+    case_labeled_but_imbalanced_suggests_roboflow()
+    case_roboflow_merge_builds_refresh_and_retrain_transition()
+    case_roboflow_merge_continues_through_confirm_train_and_eval()
     case_manager_auto_retries_known_gate_without_llm()
     case_manager_gives_up_after_retry_limit()
     case_manager_replans_after_repeated_stall()

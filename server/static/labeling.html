@@ -285,14 +285,20 @@
             bindCanvasEvents();
         });
 
+        // 每一次切換都建立新的請求序號；較早送出的讀取即使較晚回來，
+        // 也不能把使用者剛選好的資料集（例如 bear 以外的資料集）覆寫掉。
+        let datasetLoadRequestId = 0;
+
         async function loadDatasetFromServer(ds, startIdx = 0) {
             if (!ds || !ds.name) return;
+            const requestId = ++datasetLoadRequestId;
             console.log("正在從伺服器載入資料集:", ds.name);
             currentDs = ds; annotations = [];
             try {
                 // 強制使用 8000 埠的 API
                 const res = await fetch(`http://127.0.0.1:8000/api/datasets/files?name=${encodeURIComponent(ds.name)}`);
                 const data = await res.json();
+                if (requestId !== datasetLoadRequestId) return;
                 if (data.status === 'success') {
                     if (data.classes) customClasses = data.classes.map((n, i) => ({ id: i, name: n, color: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4'][i % 7] }));
                     if (data.files && data.files.length > 0) {

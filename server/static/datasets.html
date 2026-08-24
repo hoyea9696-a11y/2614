@@ -373,7 +373,7 @@
         }
         async function loadDatasetsFromServer(retryCount = 0) {
             try {
-                const res = await fetch('http://127.0.0.1:8000/api/datasets/list');
+                const res = await fetch('http://127.0.0.1:8000/api/datasets/list', { cache: 'no-store' });
                 const data = await res.json();
                 if (data.status === 'success') { datasets = data.datasets; saveDatasets(); render(); }
             } catch (e) {

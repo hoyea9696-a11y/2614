@@ -10,8 +10,17 @@ class YOLOInferencer:
             base_dir = Path(__file__).resolve().parent.parent
             model_path = str(base_dir / "models" / "yolov9m.pt")
         self.model_path = model_path
-        self.model = None
-        self.load_model()
+        self._model = None  # 延遲載入：只有真的用到推論/訓練相關功能時才載入權重，
+        # 不要在建構子就載入——main.py 用 run_multi_port.py 開 4 個埠口時，每個埠口
+        # 都各自 import 一次 main.py 就會各自建立一個 inferencer，若在這裡就載入權重，
+        # 4 個埠口（其中只有推論頁真的需要模型）就會各自載入一次 YOLO，白白拖慢啟動、
+        # 佔用 4 倍記憶體。
+
+    @property
+    def model(self):
+        if self._model is None:
+            self.load_model()
+        return self._model
 
     def load_model(self):
         # Force directory creation
@@ -43,7 +52,7 @@ class YOLOInferencer:
                     shutil.move(model_name, abs_path)
         
         try:
-            self.model = YOLO(self.model_path)
+            self._model = YOLO(self.model_path)
             print(f"Model loaded successfully from: {self.model_path}")
         except Exception as e:
             print(f"Error loading model: {e}")

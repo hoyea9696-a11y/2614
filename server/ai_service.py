@@ -61,14 +61,6 @@ class AIService:
         if platform == "gemini-pro":
             gemini_model = conf.get("gemini_pro_model", "gemini-2.5-pro")
             platform = "gemini"
-        elif platform == "gemma":
-            # Gemma 2 系列在 Groq 上更穩定，如果沒 Groq 則走 Ollama
-            if conf.get("groq_api_key"):
-                platform = "groq"
-            else:
-                platform = "local"
-        else:
-            gemini_model = conf.get("gemini_flash_model", "gemini-2.5-flash")
         
         # 從 context_data 讀取已由 main.py 準備好的健康數據
         health_info = ""
@@ -92,7 +84,7 @@ class AIService:
         model_info = ""
         if context_data and "model_eval_data" in context_data:
             m = context_data["model_eval_data"]
-            model_info = f"\n【最新模型訓練效能數據 - 模型名稱: {m.get('model_name', '未知')}】\n"
+            model_info = f"\n【歷史訓練紀錄（最近一次已完成的訓練，非正在進行）- 模型名稱: {m.get('model_name', '未知')}】\n"
             model_info += f"- 已訓練輪次: {m['epoch']}\n"
             model_info += f"- 精準度 (mAP50): {m['map50']*100:.2f}%\n"
             model_info += f"- 嚴格精準度 (mAP50-95): {m['map50_95']*100:.2f}%\n"
@@ -107,18 +99,25 @@ class AIService:
 {model_info}
 
 【對話準則】
+0. **【絕對禁止臆測數據】**：所有具體數字（圖片張數、類別數、標註率、解析度、mAP、Loss…）
+   只能引用上面【】區塊裡真的出現的數值，一個字都不能改。上面沒有提供的數據，就直接說
+   「我目前沒有拿到這個資料集／模型的實際數據」，**絕對不可以自己估算、舉例或編造**。
+   你也不可以自行輸出 `[HEALTH_DATA: ...]` 標籤——那是系統用來畫健康圖卡的專用標記，
+   你冒用會讓使用者看到假數據。
 1. **【診斷優先級】**：如果同時提供了 [健康數據] 與 [模型效能數據]，且使用者詢問的是「模型」或「診斷」，請**務必優先分析模型效能**。不要在模型診斷時夾雜過多的資料集健康資訊，除非使用者特別要求。
-2. **【詳細報告要求】**：如果提供了 [模型效能數據]，請評論 mAP 的高低，並觀察 Loss 趨勢（若訓練與驗證 Loss 差距大，代表 Overfitting）。給出具體的優化步驟（例如：增加背景圖片、增加標記數量等）。
-3. **【標籤處理】**：如果提供了健康數據且你在回覆中分析了它，請在最末尾加上 `[HEALTH_DATA: ...]`。
-4. **【長度要求】**：請提供充實的內容，不要過於簡短。
+2. **【詳細報告要求】**：如果提供了 [歷史訓練紀錄]，請評論 mAP 的高低，並觀察 Loss 趨勢（若訓練與驗證 Loss 差距大，代表 Overfitting）。注意那是過去已完成的訓練結果，不是正在進行的訓練。
+3. **【標籤處理】**：健康圖卡由系統自行附加，你只要用文字說明即可，不要輸出任何 `[HEALTH_DATA: ...]`。
+4. **【長度要求】**：回答要精簡：先講結論，再用條列補充重點，全文以 300 字內為原則；只有使用者明確要求詳細說明時才展開。這是聊天視窗，不是技術文件。
+5. **【能力邊界】**：使用者要求訓練模型時，簡短回應即可（一兩句話），不要輸出長篇訓練教學。訓練是否真的啟動由系統自行判斷並告知使用者；你「絕對不要」自己輸出「[系統提示]」或「⚙️」這類字樣，那是系統保留的專用標記，你冒用會讓使用者混淆。
 """
 
         try:
             if platform == "gemini":
                 reply = self._chat_gemini_rest(messages, system_prompt, conf["gemini_api_key"], gemini_model)
             elif platform == "groq":
+                # 跟 Manager Agent 的 gpt-oss 引擎用同一顆模型，方便做有無 LangGraph 的對比
                 client = OpenAI(api_key=conf["groq_api_key"], base_url="https://api.groq.com/openai/v1")
-                reply = self._chat_openai(client, conf["groq_model"], messages, system_prompt)
+                reply = self._chat_openai(client, conf.get("gpt_oss_model", "openai/gpt-oss-120b"), messages, system_prompt)
             else:
                 client = OpenAI(api_key="ollama", base_url=conf["ollama_base_url"])
                 reply = self._chat_openai(client, conf["ollama_model"], messages, system_prompt)
@@ -142,7 +141,9 @@ class AIService:
             role = "user" if msg["role"] == "user" else "model"
             contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-        payload = {"contents": contents, "generationConfig": {"temperature": 0.8, "maxOutputTokens": 1000}}
+        # Gemini 2.5 是思考型模型，思考 token 也計入 maxOutputTokens；設太低會讓
+        # 正文在思考耗掉額度後被硬生生截斷（finishReason=MAX_TOKENS）。
+        payload = {"contents": contents, "generationConfig": {"temperature": 0.8, "maxOutputTokens": 8192}}
         headers = {"Content-Type": "application/json"}
         response = requests.post(url, json=payload, headers=headers)
         res_data = response.json()

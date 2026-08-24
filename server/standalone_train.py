@@ -11,7 +11,7 @@ def diagnostic_train():
     print("="*60)
 
     # 1. 設定路徑 (請確認此路徑正確)
-    dataset_path = r"C:\Users\freddy_huang\OneDrive - ASUS\Desktop\AI-project\data\datasets\my_custom_model\Flowers Detection.v1-roboflow-instant-1--eval-.yolov8"
+    dataset_path = r"D:\AI-project\data\datasets\my_custom_model\Flowers Detection.v1-roboflow-instant-1--eval-.yolov8"
     ds_root = Path(dataset_path)
     
     print(f"[*] 檢查資料集根目錄: {ds_root}")

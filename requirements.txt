@@ -11,6 +11,7 @@ openai
 python-dotenv
 google-generativeai
 langgraph
+langgraph-checkpoint-sqlite
 langchain-core
 langchain-google-genai
 langchain-openai
