@@ -34,7 +34,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
-from deepagents import create_deep_agent
+from deepagents import FilesystemPermission, create_deep_agent
 
 SERVER_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SERVER_DIR.parent
@@ -94,8 +94,11 @@ MEMORY_FILE_VPATH = "/memories/AGENTS.md"
 # 訓練紀錄是判斷模型好壞的唯一依據，agent 只准讀不准改——被改掉就再也分不清哪些
 # 數字是真的跑出來的。permission 規則是「依宣告順序比對、第一個命中的生效、都沒命中
 # 就是 allow」，所以只需要宣告這一條 deny，/memories 與 /workspace 自然可寫。
+# FilesystemPermission 是 dataclass、不是 TypedDict——deepagents 內部用 rule.mode／
+# rule.paths 這種屬性存取（見 middleware/_fs_interrupt.py 與 middleware/filesystem.py），
+# 傳 dict 進去會在 create_deep_agent 建圖時就炸 AttributeError，不是執行期才發現。
 FILESYSTEM_PERMISSIONS = [
-    {"operations": ["write"], "paths": ["/runs", "/runs/**"], "mode": "deny"},
+    FilesystemPermission(operations=["write"], paths=["/runs", "/runs/**"], mode="deny"),
 ]
 
 # execute（跑 shell 指令）永遠不開：FilesystemBackend 不是 SandboxBackend，而唯一支援
