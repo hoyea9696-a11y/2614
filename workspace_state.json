@@ -3,16 +3,17 @@
   "last_updated": "2026-07-09T15:40:00+08:00",
   "dataset": {
     "imported": true,
-    "name": "花",
-    "path": "C:\\Users\\freddy_huang\\OneDrive - ASUS\\Desktop\\AI-project\\data\\datasets\\花",
-    "image_count": 514,
-    "label_count": 514,
+    "name": "車",
+    "path": "D:\\AI-project\\data\\datasets\\車",
+    "image_count": 584,
+    "label_count": 517,
     "health_analysis": {
       "passed": true,
-      "score": 83.5,
-      "coverage": 100.0,
-      "balance": 72.4,
-      "last_checked": "2026-07-15T10:45:20.739917+08:00"
+      "score": 95.4,
+      "coverage": 88.5,
+      "balance": 100,
+      "balance_warning": null,
+      "last_checked": "2026-08-13T14:18:56.358103+08:00"
     }
   },
   "annotation": {
@@ -22,16 +23,16 @@
   },
   "model": {
     "trained": true,
-    "exp_name": "manager_agent_test4",
-    "best_model_path": "C:\\Users\\freddy_huang\\OneDrive - ASUS\\Desktop\\AI-project\\runs\\train\\manager_agent_test4\\weights\\best.pt",
+    "exp_name": "exp_aug_632de0",
+    "best_model_path": "D:\\AI-project\\runs\\train\\exp_aug_632de0\\weights\\best.pt",
     "last_training_metrics": {
-      "mAP50": 0.8629,
-      "final_loss": 1.735,
-      "total_epochs": 15
+      "mAP50": 0.934,
+      "final_loss": 2.0484,
+      "total_epochs": 3
     },
     "evaluation": {
       "passed": true,
-      "last_evaluated": "2026-07-15T13:55:41.249995+08:00"
+      "last_evaluated": "2026-08-13T14:29:45.213936+08:00"
     }
   }
 }
