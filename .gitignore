@@ -1,6 +1,7 @@
 .env
 data/datasets/
 data/agent_checkpoints.sqlite*
+data/deep_agent_checkpoints.sqlite*
 data/outputs/
 models/
 runs/

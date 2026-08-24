@@ -16,3 +16,11 @@ langchain-core
 langchain-google-genai
 langchain-openai
 requests
+
+# Deep Agent 模式（server/deep_agent.py）。版本刻意釘住：不釘的話 pip 會抓最新的
+# deepagents，連帶把 langchain-core 從 1.4.9 拉到 1.6.0——Manager Agent 的 structured
+# output 與 tool calling 全都靠 langchain-core，為了一個還在評估中的模式去升 core
+# 版本不值得。0.6.12 實測與現有相依零衝突（既有套件版本全部不變）。
+deepagents==0.6.12
+# 本來就是 langchain-core 的相依，寫明是因為 .env 的 LANGSMITH_TRACING 直接用到它。
+langsmith

@@ -1165,6 +1165,147 @@ async def agent_graph(model_type: str = "gemini"):
         return {"status": "error", "message": str(e)}
 
 # ------------------------------
+# Deep Agent 模式（聊天視窗的第三個模式）
+# ------------------------------
+# 刻意另開一組 /api/agent/deep/* 端點，不在 /api/agent/chat 裡用 model_type 分岔：
+# 分岔等於動到現有 Manager 模式的程式碼路徑，而兩個模式的 state schema 完全不同
+# （SupervisorState vs DeepAgentState），任何共用都會變成之後除錯的來源。
+#
+# 唯一共用的是 _try_acquire_agent_thread 的 thread 鎖登記簿——它以 thread_id 為
+# key，而兩個模式的 thread_id 由前端各自用不同的 sessionStorage key 產生（都是
+# uuid，不會相撞），所以共用是安全的，也省得再開一套一模一樣的鎖。
+_deep_agent_graphs = {}
+
+
+def _get_deep_agent_graph(model_type: str = "gemini"):
+    if model_type not in _deep_agent_graphs:
+        from manager_agent import get_default_chat_model
+        from deep_agent import build_deep_agent
+        _deep_agent_graphs[model_type] = build_deep_agent(get_default_chat_model(model_type))
+    return _deep_agent_graphs[model_type]
+
+
+@app.post("/api/agent/deep/chat")
+async def deep_agent_chat(request: ManagerAgentChatRequest):
+    from deep_agent import stream_deep_trace
+    from agent_tools import shared_trainer, is_stop_training_message
+
+    # 跟 /api/agent/chat 同一個理由：訓練中途要終止時，Agent 正卡在 skill_train
+    # 的同步呼叫裡，同一個 thread 的 graph.stream() 插不進新訊息，所以終止指令
+    # 直接短路掉 LLM 與 Graph，對 shared_trainer 下 stop()。shared_trainer 是
+    # 全域單一實例，兩個模式共用同一個訓練器，這裡的處理必須跟 Manager 模式一致。
+    if shared_trainer.progress.get("status") == "training" and is_stop_training_message(request.message):
+        shared_trainer.stop()
+
+        def stop_stream():
+            reply = "已送出終止指令，訓練會在目前批次結束後停止（不是立即中斷，請稍候幾秒）。"
+            yield f"data: {json.dumps({'type': 'final', 'reply': reply, 'usage': {}, 'llm_calls': 0}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(stop_stream(), media_type="text/event-stream")
+
+    graph = _get_deep_agent_graph(request.model_type)
+    thread_lock = _try_acquire_agent_thread(request.thread_id)
+    if thread_lock is None:
+        raise HTTPException(status_code=409, detail="這個 Deep Agent 任務仍在執行中，請等待目前操作完成。")
+
+    config = {"configurable": {"thread_id": request.thread_id}}
+    try:
+        snapshot = graph.get_state(config)
+        if snapshot.interrupts:
+            raise HTTPException(
+                status_code=409,
+                detail="這個 Deep Agent 任務正在等待確認，請先完成目前的確認操作。",
+            )
+    except Exception:
+        thread_lock.release()
+        raise
+
+    def event_stream():
+        try:
+            for entry in stream_deep_trace(graph, request.thread_id, user_message=request.message):
+                yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+        finally:
+            thread_lock.release()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/api/agent/deep/resume")
+async def deep_agent_resume(request: ManagerAgentResumeRequest):
+    """訓練前的 tool 層級 HITL 暫停後，使用者按確認/取消時呼叫這裡接著跑。
+
+    跟 /api/agent/resume 的差別只在恢復值的格式：Manager 模式的 interrupt() 收的是
+    自訂的 {"approved": bool}，deepagents 的 HumanInTheLoopMiddleware 收的是
+    HITLResponse（{"decisions": [{"type": "approve"}]}），由 build_resume_value 轉換。
+    """
+    from deep_agent import build_resume_value, normalize_interrupt_payload, stream_deep_trace
+    graph = _get_deep_agent_graph(request.model_type)
+    thread_lock = _try_acquire_agent_thread(request.thread_id)
+    if thread_lock is None:
+        raise HTTPException(status_code=409, detail="這個 Deep Agent 任務仍在執行中，請勿重複送出確認。")
+
+    config = {"configurable": {"thread_id": request.thread_id}}
+    try:
+        snapshot = graph.get_state(config)
+        if not snapshot.interrupts:
+            raise HTTPException(status_code=409, detail="這個確認已處理或已失效，請重新整理狀態。")
+        pending_interrupt = snapshot.interrupts[0]
+        if pending_interrupt.id != request.interrupt_id:
+            raise HTTPException(status_code=409, detail="確認識別碼已過期，未執行任何操作。")
+        # operation_id 是從「中斷 id + 這次的訓練參數」算出來的，所以這裡重算一次
+        # 就能確認使用者按下確認的是當下這一次訓練，不是上一個已經失效的中斷。
+        expected = normalize_interrupt_payload(pending_interrupt.id, pending_interrupt.value)
+        expected_operation_id = expected.get("operation_id")
+        if expected_operation_id and request.operation_id != expected_operation_id:
+            raise HTTPException(status_code=409, detail="操作識別碼不一致，未啟動訓練。")
+    except Exception:
+        thread_lock.release()
+        raise
+
+    def event_stream():
+        try:
+            for entry in stream_deep_trace(
+                graph, request.thread_id, resume_value=build_resume_value(request.approved)
+            ):
+                yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
+        finally:
+            thread_lock.release()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/agent/deep/pending")
+async def deep_agent_pending(thread_id: str, model_type: str = "gemini"):
+    """跟 /api/agent/pending 同一個用途：頁面重新載入後，用同一個 thread_id 檢查
+    是否還卡在某個等待確認的中斷上，卡著就把正規化後的 payload 吐回去，讓前端
+    重新問一次使用者再送 /api/agent/deep/resume。"""
+    from deep_agent import normalize_interrupt_payload
+    graph = _get_deep_agent_graph(model_type)
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = graph.get_state(config)
+    if snapshot.interrupts:
+        pending_interrupt = snapshot.interrupts[0]
+        return {
+            "status": "success",
+            "pending": True,
+            "interrupt_id": pending_interrupt.id,
+            "payload": normalize_interrupt_payload(pending_interrupt.id, pending_interrupt.value),
+        }
+    return {"status": "success", "pending": False}
+
+
+@app.get("/api/agent/deep/graph")
+async def deep_agent_graph(model_type: str = "gemini"):
+    """觀測層：回傳 Deep Agent 的靜態拓樸（Mermaid 語法），用途跟 /api/agent/graph
+    一樣，方便跟 Manager 模式的圖並排比較兩者結構差異。"""
+    try:
+        graph = _get_deep_agent_graph(model_type)
+        return {"status": "success", "mermaid": graph.get_graph().draw_mermaid()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ------------------------------
 # 靜態檔案掛載 (使用絕對路徑以確保多埠啟動正常)
 # ------------------------------
 app.mount("/static", NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")

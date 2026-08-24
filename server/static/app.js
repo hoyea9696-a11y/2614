@@ -201,6 +201,35 @@ async function checkPendingAgentInterrupt() {
     }
 }
 
+// Deep Agent 模式的同一件事，查的是自己的 thread_id 與 /api/agent/deep/pending。
+// 兩個模式各自有可能卡著一個等待確認的中斷，所以進頁面時兩邊都要查一次。
+async function checkPendingDeepAgentInterrupt() {
+    const threadId = sessionStorage.getItem(DEEP_AGENT_THREAD_KEY);
+    if (!threadId) return;
+
+    const modelTypeEl = document.getElementById('manager-agent-engine-select');
+    const modelType = modelTypeEl ? modelTypeEl.value : 'gemini';
+
+    try {
+        const res = await fetch(`/api/agent/deep/pending?thread_id=${encodeURIComponent(threadId)}&model_type=${encodeURIComponent(modelType)}`);
+        const data = await res.json();
+        if (data.pending) {
+            const pendingPayload = {
+                ...(data.payload || {}),
+                interrupt_id: data.interrupt_id
+            };
+            await finishOrResumeAgentTurn(
+                { traceRefs: null, finalReply: null, sawError: false, interruptPayload: pendingPayload },
+                threadId,
+                modelType,
+                '/api/agent/deep/resume'
+            );
+        }
+    } catch (e) {
+        console.error('檢查未完成的 Deep Agent 確認狀態失敗:', e);
+    }
+}
+
 let lastAutoLabelStatus = "idle";
 async function checkAutoLabelStatus() {
     try {
@@ -770,7 +799,10 @@ function onAiModelSelectChange() {
     const modelType = document.getElementById('ai-model-select').value;
     const engineBar = document.getElementById('manager-agent-engine-bar');
     const roboflowPanel = document.getElementById('roboflow-status-panel');
-    engineBar.style.display = modelType === 'manager-agent' ? 'flex' : 'none';
+    // 推理引擎選單兩個 Agent 模式都要顯示（Deep Agent 底層同樣是這三個 LLM 之一）；
+    // Roboflow 面板只有 Manager 模式有對應的後端狀態端點，維持只給它看。
+    const isAgentMode = modelType === 'manager-agent' || modelType === 'deep-agent';
+    engineBar.style.display = isAgentMode ? 'flex' : 'none';
     roboflowPanel.style.display = modelType === 'manager-agent' ? 'block' : 'none';
     if (modelType === 'manager-agent') refreshRoboflowStatus();
 }
@@ -814,6 +846,14 @@ async function sendChatMessage() {
     // 跟一般聊天視窗的 modelType 是兩件事，不要混在一起。
     if (modelType === 'manager-agent') {
         await sendManagerAgentMessage(text, loadingId);
+        return;
+    }
+
+    // Deep Agent 模式走第三條路徑 /api/agent/deep/chat（deepagents preset）。
+    // 這個 return 一定要在下面 /api/ai/chat 的 fetch 之前——漏掉的話 model_type
+    // 會被當成一般聊天的平台名稱送去 ai_service.py，那邊不認識就直接報錯。
+    if (modelType === 'deep-agent') {
+        await sendDeepAgentMessage(text, loadingId);
         return;
     }
 
@@ -874,11 +914,27 @@ const MANAGER_AGENT_THREAD_KEY = 'manager_agent_thread_id';
 const MANAGER_AGENT_BOOT_KEY = 'manager_agent_server_boot';
 const MANAGER_AGENT_HISTORY_KEY = 'manager_agent_chat_history';
 
+// Deep Agent 模式一定要用「自己的」thread_id，不能跟 Manager 模式共用一把：
+// LangGraph 的 checkpointer 以 thread_id 為主鍵，Manager 模式存進去的是
+// SupervisorState、Deep Agent 存的是 DeepAgentState，兩種 schema 輪流寫同一個
+// thread 會在 resume 時讀到不匹配的欄位——而且症狀通常不是乾脆報錯，是靜默的
+// 錯誤行為。後端的 checkpoint sqlite 檔也是分開的（deep_agent_checkpoints.sqlite）。
+const DEEP_AGENT_THREAD_KEY = 'deep_agent_thread_id';
+
 function getOrCreateThreadId() {
     let threadId = sessionStorage.getItem(MANAGER_AGENT_THREAD_KEY);
     if (!threadId) {
         threadId = crypto.randomUUID();
         sessionStorage.setItem(MANAGER_AGENT_THREAD_KEY, threadId);
+    }
+    return threadId;
+}
+
+function getOrCreateDeepThreadId() {
+    let threadId = sessionStorage.getItem(DEEP_AGENT_THREAD_KEY);
+    if (!threadId) {
+        threadId = crypto.randomUUID();
+        sessionStorage.setItem(DEEP_AGENT_THREAD_KEY, threadId);
     }
     return threadId;
 }
@@ -905,6 +961,10 @@ function renderChatHistory() {
 
 function resetManagerAgentThread() {
     sessionStorage.setItem(MANAGER_AGENT_THREAD_KEY, crypto.randomUUID());
+    // 「開新對話」按鈕清的是整個聊天視窗（對話泡泡是三個模式共用的），所以兩個
+    // Agent 模式的 thread_id 要一起換掉——只換一個會變成畫面清空了、但另一個模式
+    // 的後端記憶還接著上一段對話。
+    sessionStorage.setItem(DEEP_AGENT_THREAD_KEY, crypto.randomUUID());
     sessionStorage.removeItem(MANAGER_AGENT_HISTORY_KEY);
     chatMessages.length = 0;
     document.getElementById('ai-chat-history').innerHTML = '';
@@ -948,6 +1008,7 @@ async function initManagerAgentSession() {
     }
 
     checkPendingAgentInterrupt();
+    checkPendingDeepAgentInterrupt();
 }
 
 // /api/agent/chat、/api/agent/resume 回應都是 SSE 串流（text/event-stream），逐個
@@ -1066,12 +1127,15 @@ async function refreshDatasetViewsAfterAgentMerge(payload) {
 // confirm() 慣例（跟「終止訓練」「清空快取」同一套模式，不另外做卡片式按鈕 UI）
 // 問使用者要不要繼續，答案立刻送去 /api/agent/resume 接著跑；用迴圈是為了以後
 // 如果同一輪內有不只一個 interrupt 點，也能一樣接住，不用另外改這段邏輯。
-async function resumeAgentInterruptsWithModal(result, threadId, modelType) {
+// resumeUrl 有預設值是為了讓 Manager 模式的呼叫端一行都不用改；Deep Agent 模式
+// 傳 '/api/agent/deep/resume' 進來，走的是同一套「彈確認視窗→送回答→接續串流」
+// 流程，差別只在端點與後端恢復值的格式（後端 build_resume_value 負責轉換）。
+async function resumeAgentInterruptsWithModal(result, threadId, modelType, resumeUrl = '/api/agent/resume') {
     let { traceRefs, finalReply, sawError, interruptPayload } = result;
     while (interruptPayload) {
         if (interruptPayload.dataset_name) await refreshRoboflowStatus();
         const approved = await showAgentConfirmation(interruptPayload);
-        const res = await fetch('/api/agent/resume', {
+        const res = await fetch(resumeUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1095,8 +1159,8 @@ async function resumeAgentInterruptsWithModal(result, threadId, modelType) {
     return { traceRefs, finalReply, sawError, interruptPayload };
 }
 
-async function finishOrResumeAgentTurn(result, threadId, modelType) {
-    result = await resumeAgentInterruptsWithModal(result, threadId, modelType);
+async function finishOrResumeAgentTurn(result, threadId, modelType, resumeUrl = '/api/agent/resume') {
+    result = await resumeAgentInterruptsWithModal(result, threadId, modelType, resumeUrl);
     let { traceRefs, finalReply, sawError, interruptPayload } = result;
 
     if (finalReply !== null) {
@@ -1233,6 +1297,40 @@ async function sendManagerAgentMessage(text, loadingId) {
         const result = await consumeAgentStream(res, null, loadingId);
         removeMessage(loadingId);
         await finishOrResumeAgentTurn(result, threadId, modelType);
+    } catch (e) {
+        removeMessage(loadingId);
+        appendMessage(e.message || "連線失敗", 'error');
+    } finally {
+        stopAgentTrainingWatch();
+    }
+}
+
+// Deep Agent 模式：跟 sendManagerAgentMessage 是兩條各自獨立的路徑，只共用
+// consumeAgentStream／finishOrResumeAgentTurn 這些「解析 SSE、彈確認視窗」的顯示層
+// ——後端刻意讓 /api/agent/deep/chat 產生跟 /api/agent/chat 完全相同的事件形狀
+// （status／step／interrupt／error／final），所以這一層不用為第三個模式再寫一套。
+// thread_id 用 getOrCreateDeepThreadId()，理由見 DEEP_AGENT_THREAD_KEY 的註解。
+async function sendDeepAgentMessage(text, loadingId) {
+    const modelType = document.getElementById('manager-agent-engine-select').value;
+    const threadId = getOrCreateDeepThreadId();
+    const requestBody = { message: text, model_type: modelType, thread_id: threadId };
+
+    startAgentTrainingWatch();
+    try {
+        const res = await fetch('/api/agent/deep/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+        });
+        if (!res.ok) {
+            const errorData = await res.json().catch(() => ({}));
+            throw new Error(errorData.detail || 'Deep Agent 任務無法啟動');
+        }
+
+        updateManagerAgentLoadingMessage(loadingId, 'Deep Agent 正在連線並準備執行任務…');
+        const result = await consumeAgentStream(res, null, loadingId);
+        removeMessage(loadingId);
+        await finishOrResumeAgentTurn(result, threadId, modelType, '/api/agent/deep/resume');
     } catch (e) {
         removeMessage(loadingId);
         appendMessage(e.message || "連線失敗", 'error');
