@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
@@ -69,6 +70,47 @@ EVAL_TOOLS = [skill_eval]
 # train_confirm_gate 對齊：跑之前一定要人工確認。工具名稱就是 @tool 函式名。
 TRAIN_TOOL_NAME = "skill_train"
 
+# create_deep_agent 內建 FilesystemMiddleware 的 7 個工具，這個模式一個都用不到：
+# 它的職責是「協調三個 subagent 去操作資料集與模型」，不需要讀寫檔案，execute 在
+# 預設的 StateBackend 上本來就只會回傳錯誤訊息。
+#
+# 為什麼要主動拿掉：實測第一次呼叫的 input 就有 6466 tokens，而這 7 個工具的 schema
+# 佔了約 2547（read_file 611、execute 831、grep 344…），每一次 LLM 呼叫都要重送一遍。
+# 而且模型真的會被它們帶偏——第一個問題「檢查一下 車 這個資料集」時，模型的第一個
+# 動作是 ls({"path": "/"})，回傳空陣列，整整浪費一次 LLM 往返。
+#
+# 之後階段 B 要做「讀 runs/train/*/results.csv 自己比較多次實驗」時會把這些工具加回來
+# （搭配 FilesystemBackend 與 FilesystemPermission 限制根目錄），現在拿掉只是因為
+# 階段 A 的目標是跟 Manager 模式能力對等，用不到的東西不該讓模型每次都看到。
+EXCLUDED_BUILTIN_TOOLS = frozenset({
+    "ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute",
+})
+
+
+class DropToolsMiddleware(AgentMiddleware):
+    """把指定工具在「送給模型之前」從請求裡移除，省掉它們的 schema token。
+
+    deepagents 官方的做法是 register_harness_profile() 註冊帶 excluded_tools 的
+    HarnessProfile，但那是寫進全域 registry 的 beta API，還要自己推算 provider key
+    （pre-built model 走的是 provider:identifier 的查表邏輯）。這裡用公開的
+    middleware 介面做同一件事——wrap_model_call 裡 request.override(tools=...)，
+    跟 deepagents 內部的 _ToolExclusionMiddleware 完全一樣的機制——作用範圍只限
+    我們自己建的這個 agent，不會影響同一個 process 裡其他人建的 deep agent。
+
+    注意：頂層 middleware 只作用在主 agent 上，subagent 會自己組一份 middleware
+    清單，所以三個 SubAgent 的 middleware 欄位也要各自掛一份（見 _build_subagents）。
+    """
+
+    def __init__(self, excluded=EXCLUDED_BUILTIN_TOOLS):
+        super().__init__()
+        self._excluded = frozenset(excluded)
+
+    def wrap_model_call(self, request, handler):
+        if self._excluded:
+            kept = [t for t in request.tools if getattr(t, "name", None) not in self._excluded]
+            request = request.override(tools=kept)
+        return handler(request)
+
 
 DEEP_AGENT_SYSTEM_PROMPT = """你是 AI Detector 系統的協調者，負責把使用者的需求拆解成步驟，
 再交給專責的 subagent 執行。你自己不直接呼叫任何訓練／推論／資料集工具。
@@ -78,9 +120,12 @@ DEEP_AGENT_SYSTEM_PROMPT = """你是 AI Detector 系統的協調者，負責把�
 - model_agent：訓練模型（skill_train）、用模型做推論（skill_infer）
 - evaluation_agent：評估已訓練模型的效果（skill_eval，讀 mAP/loss）
 
+你「沒有」檔案系統工具（ls／read_file／write_file／glob／grep／execute 都已停用），
+所有實際操作都必須透過 task 交給 subagent。不要試圖自己去看目錄或讀檔案。
+
 工作方式：
 1. 需求需要兩個步驟以上時，先用 write_todos 列出計畫，每完成一步就更新狀態。
-   單一步驟的請求（例如「檢查一下資料集」）不用列 todo，直接派工。
+   單一步驟的請求（例如「檢查一下資料集」）不用列 todo，直接派工，也不要先探查環境。
 2. 一次只派一個 subagent，看它回報什麼再決定下一步，不要一次把三個都叫起來。
 3. subagent 回報卡關時，判斷是「換個做法還能繼續」還是「需要使用者補資訊」。
    同一個 subagent 用同樣的方式連續失敗兩次就不要再試第三次，改成把狀況講給使用者。
@@ -183,6 +228,7 @@ def _build_subagents(chat_model):
             "system_prompt": DATA_SUBAGENT_PROMPT,
             "tools": DATA_TOOLS,
             "model": chat_model,
+            "middleware": [DropToolsMiddleware()],
         },
         {
             "name": "model_agent",
@@ -190,6 +236,7 @@ def _build_subagents(chat_model):
             "system_prompt": MODEL_SUBAGENT_PROMPT,
             "tools": MODEL_TOOLS,
             "model": chat_model,
+            "middleware": [DropToolsMiddleware()],
         },
         {
             "name": "evaluation_agent",
@@ -198,6 +245,7 @@ def _build_subagents(chat_model):
             "system_prompt": EVAL_SUBAGENT_PROMPT,
             "tools": EVAL_TOOLS,
             "model": chat_model,
+            "middleware": [DropToolsMiddleware()],
         },
     ]
 
@@ -220,6 +268,9 @@ def build_deep_agent(chat_model):
         # 頂層設定會被宣告式 SubAgent 繼承，所以 model_agent 裡的 skill_train
         # 也會先暫停等確認，不用在 subagent 上再設一次。
         interrupt_on={TRAIN_TOOL_NAME: True},
+        # 使用者 middleware 會插在 base stack（Todo/Filesystem/SubAgent 等注入工具的
+        # middleware）之後，所以這裡拿得到、也拿得掉它們注入的工具。
+        middleware=[DropToolsMiddleware()],
         checkpointer=SqliteSaver(conn),
     )
 
@@ -315,7 +366,20 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
         else:
             stream_input = {"messages": [HumanMessage(content=user_message)]}
 
-        for step in graph.stream(stream_input, config=config, stream_mode="updates"):
+        # subgraphs=True：subagent 是透過 task 工具跑起來的「嵌套子圖」，不開這個參數
+        # 的話它內部的 LLM 呼叫完全不會出現在 stream 裡——結果是決策過程只看得到外層的
+        # 三個步驟，回報的 token 數嚴重低估（實測外層報 20323，但真正的成本還要加上
+        # subagent 自己那一輪 ReAct 迴圈）。使用者看不到真實成本就沒辦法跟 Manager
+        # 模式比較，所以這裡把嵌套層一起串出來。
+        #
+        # 開了之後每個 chunk 從 {node: update} 變成 (namespace, {node: update})，
+        # namespace 是空 tuple 代表最外層，非空代表在某個 subagent 裡面。
+        for chunk in graph.stream(stream_input, config=config, stream_mode="updates", subgraphs=True):
+            if isinstance(chunk, tuple) and len(chunk) == 2:
+                namespace, step = chunk
+            else:
+                namespace, step = (), chunk
+
             if "__interrupt__" in step:
                 interrupt_obj = step["__interrupt__"][0]
                 yield {
@@ -326,13 +390,17 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
                 interrupted = True
                 continue
 
+            # namespace 的元素長得像 "task:<uuid>"，uuid 對使用者沒有意義，只保留
+            # 「這一步發生在 subagent 裡」這個資訊，讓決策過程看得出層次。
+            depth_prefix = "subagent/" if namespace else ""
+
             for node_name, node_output in step.items():
                 if not node_output:
                     # 跟 stream_trace 同一個坑：節點沒有欄位要更新時，
                     # stream_mode="updates" 這一格可能是 None，直接做 "in" 判斷會炸。
                     continue
 
-                entry = {"type": "step", "node": node_name}
+                entry = {"type": "step", "node": f"{depth_prefix}{node_name}"}
                 new_messages = node_output.get("messages") or []
 
                 tool_calls = []
@@ -375,7 +443,11 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
                     entry["tool_calls"] = tool_calls
                 if last_text:
                     entry["text"] = last_text
-                    last_reply = last_text
+                    # 給使用者的最終回覆只能取最外層主 agent 的最後一段文字——subagent
+                    # 的結論是寫給主 agent 看的中間產物（而且是英文的），拿它當回覆會
+                    # 蓋掉主 agent 整理過的版本。
+                    if not namespace:
+                        last_reply = last_text
                 if node_usage:
                     entry["usage"] = node_usage
                 yield entry
