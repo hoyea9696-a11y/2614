@@ -722,6 +722,11 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
     llm_calls = 0
     last_reply = ""
     saw_empty_generation = False
+    # 「派了幾個 subagent」要能一眼看到，不然使用者得自己去數最外層有幾個 task 呼叫。
+    # 兩個都記：dispatched 是主 agent 發出的 task 呼叫數，namespaces 是實際跑起來的
+    # 巢狀子圖數量。正常兩者相等；不相等就代表有 task 沒真的跑起來，那本身是個訊號。
+    task_dispatched = 0
+    subagent_namespaces = set()
 
     def _add_usage(usage):
         nonlocal llm_calls
@@ -768,7 +773,15 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
 
             # namespace 的元素長得像 "task:<uuid>"，uuid 對使用者沒有意義，只保留
             # 「這一步發生在 subagent 裡」這個資訊，讓決策過程看得出層次。
-            depth_prefix = "subagent/" if namespace else ""
+            # namespace 的元素長得像 "task:<uuid>"。完整 uuid 對使用者沒有意義，但並行
+            # 派工時「哪一步屬於哪個任務」只能靠它區分——原本整段丟掉的結果是兩個
+            # subagent 的步驟都標成 "subagent/model"，同時跑的時候完全分不出來。
+            # 保留前 4 碼就夠了：目的只是「同一個 id 就是同一個 subagent」。
+            depth_prefix = ""
+            if namespace:
+                short = str(namespace[-1]).split(":")[-1][:4]
+                depth_prefix = f"subagent#{short}/" if short else "subagent/"
+                subagent_namespaces.add(str(namespace[-1]))
 
             for node_name, node_output in step.items():
                 if not node_output:
@@ -787,6 +800,10 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
                     calls = getattr(m, "tool_calls", None)
                     if calls:
                         tool_calls.extend([{"tool": c["name"], "args": c["args"]} for c in calls])
+                        # 只算主 agent 發出的：subagent 之間不會互相派工，但萬一以後
+                        # 開了巢狀，這裡也不該把它算進「主 agent 派了幾個」。
+                        if not namespace:
+                            task_dispatched += sum(1 for c in calls if c["name"] == "task")
                     elif isinstance(m, ToolMessage):
                         tool_calls.append({"tool_result": m.name, "output": m.content})
                     else:
@@ -868,7 +885,8 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
         # reply 給 None 而不是空字串：前端的 finishOrResumeAgentTurn 對 null 才會走
         # sawError 分支顯示錯誤提示。照樣送 final 是為了讓決策過程卡片正常收尾、
         # 該顯示的 token 統計不會因為這條路徑而消失。
-        yield {"type": "final", "reply": None, "usage": total_usage, "llm_calls": llm_calls}
+        yield {"type": "final", "reply": None, "usage": total_usage, "llm_calls": llm_calls,
+               "subagents_dispatched": task_dispatched, "subagents_ran": len(subagent_namespaces)}
         return
 
     if saw_empty_generation:
@@ -882,4 +900,5 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
                        "或是模型在沒有實際結果的情況下自己編出來的。請展開決策過程確認每一步。",
         }
 
-    yield {"type": "final", "reply": last_reply, "usage": total_usage, "llm_calls": llm_calls}
+    yield {"type": "final", "reply": last_reply, "usage": total_usage, "llm_calls": llm_calls,
+               "subagents_dispatched": task_dispatched, "subagents_ran": len(subagent_namespaces)}

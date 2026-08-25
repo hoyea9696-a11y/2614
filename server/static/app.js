@@ -1075,7 +1075,10 @@ async function consumeAgentStream(res, traceRefs, loadingId = null) {
                 appendTraceStep(traceRefs, payload);
             } else if (payload.type === 'final') {
                 finalReply = payload.reply;
-                if (traceRefs) finishTraceCard(traceRefs, payload.usage, payload.llm_calls);
+                if (traceRefs) finishTraceCard(traceRefs, payload.usage, payload.llm_calls, {
+                    dispatched: payload.subagents_dispatched,
+                    ran: payload.subagents_ran,
+                });
                 // 這回合 agent 可能把新訓練的模型存進了模型庫（save_offer_gate），重載一次
                 // 下拉選單，剛存的模型不用手動重整頁面就會出現。loadModels 內含 null 防護，
                 // 不在驗證中心頁面時會直接跳過。
@@ -1569,11 +1572,21 @@ function appendTraceError(refs, message) {
 
 // 跑完後在卡片底部補一行總計，讓使用者不用自己把每一步的 token 加起來。
 // usage/llmCalls 可能是 undefined（模型沒填 usage_metadata，例如本機 Ollama）。
-function finishTraceCard(refs, usage, llmCalls) {
+function finishTraceCard(refs, usage, llmCalls, subagents) {
     if (!usage || !usage.total_tokens) return;
     const summaryDiv = document.createElement('div');
     summaryDiv.style.cssText = "margin-top:8px; padding-top:8px; border-top:1px solid rgba(148,163,184,0.15); color:#64748b;";
-    summaryDiv.textContent = `📊 共 ${llmCalls || 0} 次 LLM 呼叫，${usage.total_tokens} tokens（input ${usage.input_tokens} / output ${usage.output_tokens}）`;
+    let text = `📊 共 ${llmCalls || 0} 次 LLM 呼叫，${usage.total_tokens} tokens（input ${usage.input_tokens} / output ${usage.output_tokens}）`;
+    // 派了幾個 subagent 要能一眼看到，不用自己去數最外層有幾個 task 呼叫。
+    // dispatched（主 agent 發出的 task 數）跟 ran（實際跑起來的巢狀子圖數）不相等時
+    // 兩個都印出來——那代表有 task 沒真的執行，本身就是要注意的訊號。
+    // Manager 模式不送這兩個欄位，所以整段是可選的。
+    if (subagents && typeof subagents.dispatched === 'number' && subagents.dispatched > 0) {
+        text += subagents.dispatched === subagents.ran
+            ? `，派出 ${subagents.dispatched} 個 subagent`
+            : `，派出 ${subagents.dispatched} 個 subagent（實際跑起來 ${subagents.ran} 個）`;
+    }
+    summaryDiv.textContent = text;
     refs.stepsContainer.appendChild(summaryDiv);
 }
 
