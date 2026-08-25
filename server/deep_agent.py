@@ -121,6 +121,22 @@ ANALYST_EXCLUDED_TOOLS = frozenset({"execute"})
 # 通用 worker：任務內容無法事先預定，所以工具給滿（除了 execute）。
 GENERAL_PURPOSE_EXCLUDED_TOOLS = frozenset({"execute"})
 
+# Gemini 吃不下的工具。langchain-google-genai 把工具轉成 Gemini function declaration
+# 時會丟掉 $defs（轉換過程會印 "Key '$defs' is not supported in schema, ignoring"），
+# 而 write_todos 的 todos 參數正是用 $defs 定義陣列元素的型別。Gemini 收到這種殘缺的
+# 宣告不會報錯，是回一個「finish_reason=STOP、output_tokens=0」的空 candidate——模型
+# 一個字都不生成，ReAct 迴圈判定沒有下一步就結束，整輪對話靜默失敗。
+#
+# 這是實測二分出來的，不是推測。同一份請求、只改工具清單：
+#   有 write_todos：input 5942 空／input 6804 空（重現 3 次）
+#   無 write_todos：input 5815 正常／input 6830 正常（重現 2 次）
+# 體積更大卻正常，所以不是請求太大，就是這個工具的 schema。
+#
+# 只對 Gemini 排除，不寫死在 MAIN_AGENT_EXCLUDED_TOOLS：這是 provider 的相容性問題，
+# OpenAI 那條路沒有這個毛病，等它有額度時 write_todos 還是該留著（規劃能力是跟
+# Manager 模式做能力對等比較的一部分）。
+GEMINI_UNSUPPORTED_TOOLS = frozenset({"write_todos"})
+
 
 # FilesystemMiddleware 注入的標題長這樣（實測原文）：
 #   ## Filesystem Tools `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`
@@ -200,6 +216,14 @@ class DropToolsMiddleware(AgentMiddleware):
         return handler(request)
 
 
+# 規劃那一步的說法要跟「這個引擎到底有沒有 write_todos」一致。少了這個切換，主 agent
+# 會被教去呼叫一個沒有宣告的工具——那正是 _strip_excluded_tool_docs 要防的那個坑。
+_PLANNING_STEP_WITH_TODOS = """1. 需求需要兩個步驟以上時，先用 write_todos 列出計畫，每完成一步就更新狀態。
+   單一步驟的請求（例如「檢查一下資料集」）不用列 todo，直接派工，也不要先探查環境。"""
+_PLANNING_STEP_NO_TODOS = """1. 需求需要兩個步驟以上時，先在回覆裡用一兩句話講清楚你打算怎麼拆解，再開始派工。
+   這個引擎沒有 write_todos 可用，不要嘗試呼叫它。單一步驟的請求（例如「檢查一下資料集」）
+   直接派工，也不要先探查環境。"""
+
 DEEP_AGENT_SYSTEM_PROMPT = """你是 AI Detector 系統的協調者，負責把使用者的需求拆解成步驟，
 再交給專責的 subagent 執行。你自己不直接呼叫任何訓練／推論／資料集工具。
 
@@ -225,8 +249,7 @@ evaluation_agent 與 experiment_analyst 的分工：問「這個模型好不好�
 不要記一次性的任務內容（「幫我訓練一下」），也絕對不要記任何 API key 或密碼。
 
 工作方式：
-1. 需求需要兩個步驟以上時，先用 write_todos 列出計畫，每完成一步就更新狀態。
-   單一步驟的請求（例如「檢查一下資料集」）不用列 todo，直接派工，也不要先探查環境。
+{PLANNING_STEP}
 2. 派工的並行規則——同一則回覆裡發出多個 task 呼叫，它們會「同時」執行：
    - 子任務彼此獨立、而且都只是讀取或查詢時，一次把它們全部派出去比較快。
      例如「比較 A 和 B 兩個資料集的健康度」就同時派兩個 data_agent 任務。
@@ -474,8 +497,12 @@ def _build_subagents(chat_model):
     ]
 
 
-def build_deep_agent(chat_model):
+def build_deep_agent(chat_model, unsupported_tools=frozenset()):
     """chat_model 用依賴注入傳進來，跟 build_multi_agent 同一個慣例，方便測試時換假模型。
+
+    unsupported_tools 是「這個 provider 吃不下的內建工具」，由呼叫端依 model_type 決定
+    （見 GEMINI_UNSUPPORTED_TOOLS）。它會併進主 agent 的排除清單，同時把系統提示裡對應
+    的說法一起換掉——兩邊必須一致，不然就是在教模型呼叫沒有宣告的工具。
 
     checkpointer 用自己的 sqlite 檔（不是 Manager 模式那個 agent_checkpoints.sqlite），
     理由見模組開頭。連線的建立方式跟 multi_agent.py 一致：SqliteSaver 要的是
@@ -485,9 +512,17 @@ def build_deep_agent(chat_model):
     DEEP_CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DEEP_CHECKPOINT_DB_PATH), check_same_thread=False)
 
+    excluded = MAIN_AGENT_EXCLUDED_TOOLS | frozenset(unsupported_tools)
+    planning_step = (
+        _PLANNING_STEP_NO_TODOS if "write_todos" in excluded else _PLANNING_STEP_WITH_TODOS
+    )
+    # 用 replace 而不是 format：提示文字裡有中文全角括號與各種符號，format 會把它們
+    # 當成欄位語法而炸掉。
+    system_prompt = DEEP_AGENT_SYSTEM_PROMPT.replace("{PLANNING_STEP}", planning_step)
+
     return create_deep_agent(
         model=chat_model,
-        system_prompt=DEEP_AGENT_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         subagents=_build_subagents(chat_model),
         # 頂層設定會被宣告式 SubAgent 繼承，所以 model_agent 裡的 skill_train
         # 也會先暫停等確認，不用在 subagent 上再設一次。
@@ -502,7 +537,7 @@ def build_deep_agent(chat_model):
         memory=[MEMORY_FILE_VPATH],
         # 使用者 middleware 會插在 base stack（Todo/Filesystem/SubAgent 等注入工具的
         # middleware）之後，所以這裡拿得到、也拿得掉它們注入的工具。
-        middleware=[DropToolsMiddleware(MAIN_AGENT_EXCLUDED_TOOLS)],
+        middleware=[DropToolsMiddleware(excluded)],
         checkpointer=SqliteSaver(conn),
     )
 

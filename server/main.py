@@ -1189,11 +1189,15 @@ DEEP_AGENT_REQUESTS_PER_SECOND = float(os.getenv("DEEP_AGENT_RPS", "0.5"))
 def _get_deep_agent_graph(model_type: str = "gemini"):
     if model_type not in _deep_agent_graphs:
         from manager_agent import get_default_chat_model
-        from deep_agent import build_deep_agent
+        from deep_agent import build_deep_agent, GEMINI_UNSUPPORTED_TOOLS
+        # Gemini 吃不下 write_todos（$defs 被轉換器丟掉，模型會回空 candidate），
+        # 理由與實測數據見 deep_agent.GEMINI_UNSUPPORTED_TOOLS 的註解。
+        unsupported = GEMINI_UNSUPPORTED_TOOLS if (model_type or "").lower().startswith("gemini") else frozenset()
         # 主 agent 與五個 subagent 共用同一個 chat_model 實例（見 deep_agent
         # ._build_subagents），所以一個 rate limiter 就管到整張圖。
         _deep_agent_graphs[model_type] = build_deep_agent(
-            get_default_chat_model(model_type, requests_per_second=DEEP_AGENT_REQUESTS_PER_SECOND)
+            get_default_chat_model(model_type, requests_per_second=DEEP_AGENT_REQUESTS_PER_SECOND),
+            unsupported_tools=unsupported,
         )
     return _deep_agent_graphs[model_type]
 
