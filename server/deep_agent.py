@@ -25,13 +25,14 @@ Tool／Skill 兩層完全重用（agent_tools.py / skills.py），只有協調�
 """
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Optional
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from deepagents import FilesystemPermission, create_deep_agent
@@ -121,6 +122,12 @@ ANALYST_EXCLUDED_TOOLS = frozenset({"execute"})
 GENERAL_PURPOSE_EXCLUDED_TOOLS = frozenset({"execute"})
 
 
+# FilesystemMiddleware 注入的標題長這樣（實測原文）：
+#   ## Filesystem Tools `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`
+# 只有這一行是「一串工具名」的格式，逐條說明是下面的 "- <工具>: ..." 條目。
+_TOOL_DOC_HEADING_RE = re.compile(r"^(#{2,3} Filesystem Tools )(`.+)$", re.M)
+
+
 class DropToolsMiddleware(AgentMiddleware):
     """把指定工具在「送給模型之前」從請求裡移除，省掉它們的 schema token。
 
@@ -139,10 +146,57 @@ class DropToolsMiddleware(AgentMiddleware):
         super().__init__()
         self._excluded = frozenset(excluded)
 
+    def _strip_excluded_tool_docs(self, prompt: str) -> str:
+        """把被排除工具的說明從注入的 system prompt 裡拿掉，並補一句明確的禁用宣告。
+
+        為什麼需要：override(tools=...) 只換掉工具清單，動不到 FilesystemMiddleware
+        這類 middleware 注入的說明文字。實測主 agent 的 system prompt 裡有一整段
+        「## Filesystem Tools `ls`, `read_file`, `write_file`, `edit_file`, `glob`,
+        `grep`」連同逐條用法，但那六個裡有四個已經被這個 middleware 拿掉了。結果是
+        模型被教去呼叫沒有宣告的 function——Gemini 碰到這種情況會生出不合法的
+        function call（finish_reason=MALFORMED_FUNCTION_CALL），回一則空訊息，
+        ReAct 迴圈認定沒有下一步就靜默結束。
+
+        分兩層做，因為兩層各自都可能失效：
+        1. 刪掉「- <工具>: 說明」條目，並把標題那串工具名裡被排除的拿掉。這層省 token，
+           但依賴 deepagents 的措辭，它改版就會靜默變成 no-op。
+        2. 補一句明確的禁用宣告。這層才是真正防止模型呼叫不存在工具的部分，不依賴措辭，
+           也涵蓋散在句子中間、沒辦法乾淨刪掉的提及（例如 Large Tool Results 那段叫
+           模型去 /large_tool_results/ 底下 grep）。
+
+        淨 token 大致打平——刪掉的跟補上的差不多。這是修正確性，不是省 token。
+        """
+        lines = [
+            line for line in prompt.split("\n")
+            if not any(line.startswith(f"- {name}:") for name in self._excluded)
+        ]
+
+        def _prune_heading(m):
+            kept = [t for t in m.group(2).split(", ") if t.strip("`") not in self._excluded]
+            return m.group(1) + ", ".join(kept) if kept else m.group(1).rstrip()
+
+        result = _TOOL_DOC_HEADING_RE.sub(_prune_heading, "\n".join(lines))
+
+        # 明確列出是哪幾個，不要只說「有些工具不能用」——模型要知道名字才不會去試。
+        banned = "、".join(sorted(self._excluded))
+        return (
+            f"{result}\n\n## 這個 session 沒有的工具\n"
+            f"上面某些段落可能提到 {banned}。這些工具在這個 session 裡沒有宣告，"
+            f"呼叫它們一定會失敗。不要呼叫它們，也不要照那些段落的指示行動。"
+        )
+
     def wrap_model_call(self, request, handler):
         if self._excluded:
             kept = [t for t in request.tools if getattr(t, "name", None) not in self._excluded]
-            request = request.override(tools=kept)
+            overrides = {"tools": kept}
+            # system_prompt 是從 system_message 衍生的唯讀 property，要改只能換
+            # system_message（override 的 docstring 也是這樣建議）。
+            prompt = request.system_prompt
+            if prompt:
+                overrides["system_message"] = SystemMessage(
+                    content=self._strip_excluded_tool_docs(prompt)
+                )
+            request = request.override(**overrides)
         return handler(request)
 
 
