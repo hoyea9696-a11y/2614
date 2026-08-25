@@ -1163,7 +1163,10 @@ async function finishOrResumeAgentTurn(result, threadId, modelType, resumeUrl = 
     result = await resumeAgentInterruptsWithModal(result, threadId, modelType, resumeUrl);
     let { traceRefs, finalReply, sawError, interruptPayload } = result;
 
-    if (finalReply !== null) {
+    // 空字串也要當成「沒有回覆」：直接 appendMessage('') 會畫出一顆空氣泡，使用者
+    // 看不出是跑完了還是靜默失敗。Deep Agent 後端已經改成回 null + error 事件，這裡
+    // 再擋一層是為了 Manager 模式（共用這個函式）也一併受益。
+    if (finalReply !== null && String(finalReply).trim()) {
         let reply = finalReply;
         const healthMatch = reply.match(/\[HEALTH_DATA: ({.*?})\]/);
         if (healthMatch) {
@@ -1178,6 +1181,8 @@ async function finishOrResumeAgentTurn(result, threadId, modelType, resumeUrl = 
         persistChatHistory();
     } else if (sawError) {
         appendMessage("執行中發生錯誤，詳情請展開上方決策過程", 'error');
+    } else {
+        appendMessage("這一輪沒有產生任何回覆，展開上方決策過程可以看到實際執行到哪一步。", 'error');
     }
 }
 
@@ -1503,6 +1508,10 @@ function renderTraceStepHtml(step, index) {
     }
     if (step.text) {
         inner += `<div>💬 ${escapeHtml(step.text)}</div>`;
+    }
+    // 模型回空訊息這種「provider 回 200 但實際上失敗了」的狀況，只有這裡看得到。
+    if (step.warning) {
+        inner += `<div style="color:#fbbf24; word-break:break-all;">⚠️ ${escapeHtml(step.warning)}</div>`;
     }
     if (step.usage) {
         inner += `<div style="color:#64748b;">🔢 tokens：input ${step.usage.input_tokens} / output ${step.usage.output_tokens}</div>`;

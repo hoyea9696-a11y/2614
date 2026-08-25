@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from deepagents import FilesystemPermission, create_deep_agent
@@ -507,6 +507,34 @@ def build_resume_value(approved: bool) -> dict:
     return {"decisions": [{"type": "reject", "message": "使用者在確認視窗選擇取消，不要執行這個操作，也不要重試。"}]}
 
 
+def _describe_empty_generation(m) -> str:
+    """模型回了一則「既沒有文字也沒有 tool call」的訊息時，把 provider 真正的收尾原因
+    撈出來。
+
+    為什麼需要這個：這種回應在 HTTP 層是成功的（200），LangChain 不會拋例外，所以
+    stream_deep_trace 的 except 完全不會觸發。ReAct 迴圈拿到一則沒有 tool call 的
+    AIMessage 就認定「沒有下一步」直接走到 END，整輪對話靜默結束、使用者只看到一個
+    空回覆，trace 上只剩 input tokens 跟 output 0。
+
+    Gemini 是最常見的來源：工具 schema 一大一巢狀（deepagents 的 task 工具帶著所有
+    subagent 描述）就可能生出不合法的 function call，SDK 回一個空 candidate、
+    finish_reason 是 MALFORMED_FUNCTION_CALL。其他可能是 safety 過濾或 MAX_TOKENS
+    （thinking 把輸出額度吃光）。這些線索只寫在 response_metadata／invalid_tool_calls
+    裡，不主動撈就永遠看不到。
+    """
+    meta = getattr(m, "response_metadata", None) or {}
+    reason = meta.get("finish_reason") or meta.get("stop_reason") or meta.get("done_reason")
+    parts = [f"finish_reason={reason}" if reason else "finish_reason=（provider 沒提供）"]
+    if meta.get("safety_ratings"):
+        parts.append(f"safety_ratings={json.dumps(meta['safety_ratings'], ensure_ascii=False, default=str)}")
+    # 不合法的 function call 會被 LangChain 收在這裡而不是 tool_calls，正是
+    # MALFORMED_FUNCTION_CALL 這類問題最直接的證據。
+    invalid = getattr(m, "invalid_tool_calls", None)
+    if invalid:
+        parts.append(f"invalid_tool_calls={json.dumps(invalid, ensure_ascii=False, default=str)}")
+    return "；".join(parts)
+
+
 def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None, resume_value: Optional[dict] = None):
     """觀測層，刻意產生跟 multi_agent.stream_trace 完全相同的 SSE 事件形狀
     （status／step／interrupt／error／final），前端的 trace 渲染器與確認視窗才能
@@ -524,6 +552,7 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     llm_calls = 0
     last_reply = ""
+    saw_empty_generation = False
 
     def _add_usage(usage):
         nonlocal llm_calls
@@ -584,14 +613,21 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
                 tool_calls = []
                 last_text = None
                 node_usage = None
+                empty_generations = []
                 for m in new_messages:
                     calls = getattr(m, "tool_calls", None)
                     if calls:
                         tool_calls.extend([{"tool": c["name"], "args": c["args"]} for c in calls])
                     elif isinstance(m, ToolMessage):
                         tool_calls.append({"tool_result": m.name, "output": m.content})
-                    elif getattr(m, "content", None):
-                        last_text = _extract_text(m.content)
+                    else:
+                        text = _extract_text(getattr(m, "content", None))
+                        if text:
+                            last_text = text
+                        elif isinstance(m, AIMessage):
+                            # 模型什麼都沒給。原本這裡是 elif content 的一條死路——
+                            # 訊息被靜默丟掉，trace 上只剩 token 數，看不出發生了什麼。
+                            empty_generations.append(_describe_empty_generation(m))
 
                     msg_usage = _usage_from_message(m)
                     if msg_usage:
@@ -617,6 +653,14 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
                         ],
                     }
 
+                if empty_generations:
+                    detail = " ｜ ".join(empty_generations)
+                    entry["warning"] = f"模型沒有產生任何文字或工具呼叫（{detail}）"
+                    # 也印到 server console：使用者不一定會展開 trace，而這個訊息是
+                    # 判斷「換模型還是縮 schema」的唯一依據。
+                    print(f"[deep_agent] 空回應 node={depth_prefix}{node_name} {detail}", flush=True)
+                    saw_empty_generation = True
+
                 if tool_calls:
                     entry["tool_calls"] = tool_calls
                 if last_text:
@@ -636,6 +680,23 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
         return
 
     if interrupted:
+        return
+
+    if not last_reply.strip():
+        # 主 agent 一個字都沒給。最常見的原因就是上面抓到的空回應：ReAct 迴圈拿到
+        # 沒有 tool call 的訊息就收工了。這裡一定要明講，不然前端拿到空字串會走
+        # appendMessage("") 畫出一顆空氣泡，使用者分不出「跑完了」跟「靜默失敗」。
+        if saw_empty_generation:
+            message = ("模型回了空訊息（既沒有文字也沒有工具呼叫）而提前結束。"
+                       "展開上方決策過程看 finish_reason：MALFORMED_FUNCTION_CALL 代表模型"
+                       "生不出合法的工具呼叫，換一個 function calling 較穩的引擎會比較實在。")
+        else:
+            message = "Deep Agent 沒有產生任何回覆，展開上方決策過程可以看到實際執行到哪一步。"
+        yield {"type": "error", "message": message}
+        # reply 給 None 而不是空字串：前端的 finishOrResumeAgentTurn 對 null 才會走
+        # sawError 分支顯示錯誤提示。照樣送 final 是為了讓決策過程卡片正常收尾、
+        # 該顯示的 token 統計不會因為這條路徑而消失。
+        yield {"type": "final", "reply": None, "usage": total_usage, "llm_calls": llm_calls}
         return
 
     yield {"type": "final", "reply": last_reply, "usage": total_usage, "llm_calls": llm_calls}

@@ -1176,12 +1176,25 @@ async def agent_graph(model_type: str = "gemini"):
 # uuid，不會相撞），所以共用是安全的，也省得再開一套一模一樣的鎖。
 _deep_agent_graphs = {}
 
+# Deep Agent 一輪對話的 LLM 呼叫數遠高於 Manager 模式（主 agent 多輪 ＋ 每個 subagent
+# 自己一整圈 ReAct 迴圈），而且主 agent 做並行 fan-out 時會在同一秒打出多個請求——
+# 這是 provider 回 429（每分鐘上限）的直接原因，不是總量太大，是瞬間尖峰。所以這裡
+# 統一節流；Manager 模式不傳這個參數，行為完全不變。
+#
+# 預設 0.5 rps = 30 RPM。還是會 429 就把 DEEP_AGENT_RPS 調小（免費方案的 RPM 通常
+# 更低），嫌慢就調大——節流是拿時間換不被擋，沒有兩全的設定值。
+DEEP_AGENT_REQUESTS_PER_SECOND = float(os.getenv("DEEP_AGENT_RPS", "0.5"))
+
 
 def _get_deep_agent_graph(model_type: str = "gemini"):
     if model_type not in _deep_agent_graphs:
         from manager_agent import get_default_chat_model
         from deep_agent import build_deep_agent
-        _deep_agent_graphs[model_type] = build_deep_agent(get_default_chat_model(model_type))
+        # 主 agent 與五個 subagent 共用同一個 chat_model 實例（見 deep_agent
+        # ._build_subagents），所以一個 rate limiter 就管到整張圖。
+        _deep_agent_graphs[model_type] = build_deep_agent(
+            get_default_chat_model(model_type, requests_per_second=DEEP_AGENT_REQUESTS_PER_SECOND)
+        )
     return _deep_agent_graphs[model_type]
 
 

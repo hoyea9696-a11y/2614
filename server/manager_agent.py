@@ -12,6 +12,7 @@ agent_tools.py，不重新實作那些邏輯。
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 from langchain_core.messages import SystemMessage
 from langgraph.graph import StateGraph, START, END, MessagesState
@@ -63,7 +64,7 @@ def _load_env():
 LLM_REQUEST_TIMEOUT_SECONDS = 60
 
 
-def get_default_chat_model(model_type: str = "gemini"):
+def get_default_chat_model(model_type: str = "gemini", requests_per_second: Optional[float] = None):
     """依 model_type 選擇 Manager Agent 底層的 LLM。設定（API Key、模型名稱）直接
     沿用 ai_service.py 的 _get_config()，不重複定義一次同樣的 .env 讀取邏輯。
 
@@ -79,12 +80,28 @@ def get_default_chat_model(model_type: str = "gemini"):
 
     Manager Agent 的 ReAct 迴圈跟 Decision Engine 都依賴 tool-calling／structured
     output，這三個選項都經過 with_structured_output(method="function_calling")
-    驗證過可以跑，不是隨便換一個模型都保證能跑完整個多輪協調流程。"""
+    驗證過可以跑，不是隨便換一個模型都保證能跑完整個多輪協調流程。
+
+    requests_per_second 不傳時完全不節流，行為跟以前一樣（Manager 模式就是這樣用的，
+    它一輪只有幾次呼叫，撞不到 provider 的 RPM）。傳了才掛 rate limiter，目前只有
+    Deep Agent 模式會傳——理由見 main.py 的 DEEP_AGENT_REQUESTS_PER_SECOND。"""
     _load_env()
     from ai_service import AIService
 
     conf = AIService()._get_config()
     platform = (model_type or "gemini").lower()
+
+    # BaseChatModel 的 rate_limiter 欄位（所有 provider 都吃這個），在真正發出 HTTP
+    # 請求前先擋一道。max_bucket_size=1 是刻意的：允許 burst 就等於允許並行 fan-out
+    # 一口氣把整分鐘的額度打完，那正是要防的情況。
+    rate_limiter = None
+    if requests_per_second:
+        from langchain_core.rate_limiters import InMemoryRateLimiter
+
+        rate_limiter = InMemoryRateLimiter(
+            requests_per_second=requests_per_second,
+            max_bucket_size=1,
+        )
 
     if platform in ("gemini", "gemini-pro"):
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -94,6 +111,7 @@ def get_default_chat_model(model_type: str = "gemini"):
             model=model_name,
             google_api_key=conf.get("gemini_api_key"),
             timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+            rate_limiter=rate_limiter,
         )
 
     from langchain_openai import ChatOpenAI
@@ -103,6 +121,7 @@ def get_default_chat_model(model_type: str = "gemini"):
             model=conf.get("openai_model", "gpt-4.1-mini"),
             api_key=conf.get("openai_api_key"),
             timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+            rate_limiter=rate_limiter,
         )
 
     if platform in ("gpt-oss", "llama4-scout", "llama-4-scout"):
@@ -111,6 +130,7 @@ def get_default_chat_model(model_type: str = "gemini"):
             api_key=conf.get("groq_api_key"),
             base_url="https://api.groq.com/openai/v1",
             timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+            rate_limiter=rate_limiter,
         )
 
     raise ValueError(f"Manager Agent 不支援的 model_type：{model_type}")
