@@ -561,9 +561,15 @@ def build_resume_value(approved: bool) -> dict:
     return {"decisions": [{"type": "reject", "message": "使用者在確認視窗選擇取消，不要執行這個操作，也不要重試。"}]}
 
 
-def _describe_empty_generation(m) -> str:
-    """模型回了一則「既沒有文字也沒有 tool call」的訊息時，把 provider 真正的收尾原因
-    撈出來。
+def _describe_empty_generation(m):
+    """模型回了一則「既沒有文字也沒有 tool call」的訊息時，把線索撈出來。
+
+    回傳 (給 UI 的短摘要, 給 console 的完整傾印)。
+
+    為什麼要整包倒出來而不是挑欄位：第一版只挑了 finish_reason／safety_ratings／
+    invalid_tool_calls，結果實測拿到 finish_reason=STOP、invalid_tool_calls 空的、
+    output_tokens=0——也就是「模型正常收尾但什麼都沒生成」，這三個欄位全部問不出原因。
+    真正的線索可能在 prompt_feedback／block_reason／usage 明細裡，事前挑就會再漏一次。
 
     為什麼需要這個：這種回應在 HTTP 層是成功的（200），LangChain 不會拋例外，所以
     stream_deep_trace 的 except 完全不會觸發。ReAct 迴圈拿到一則沒有 tool call 的
@@ -578,15 +584,20 @@ def _describe_empty_generation(m) -> str:
     """
     meta = getattr(m, "response_metadata", None) or {}
     reason = meta.get("finish_reason") or meta.get("stop_reason") or meta.get("done_reason")
-    parts = [f"finish_reason={reason}" if reason else "finish_reason=（provider 沒提供）"]
-    if meta.get("safety_ratings"):
-        parts.append(f"safety_ratings={json.dumps(meta['safety_ratings'], ensure_ascii=False, default=str)}")
-    # 不合法的 function call 會被 LangChain 收在這裡而不是 tool_calls，正是
-    # MALFORMED_FUNCTION_CALL 這類問題最直接的證據。
+    summary = f"finish_reason={reason}" if reason else "finish_reason=（provider 沒提供）"
+    # 不合法的 function call 會被 LangChain 收在這裡而不是 tool_calls。
     invalid = getattr(m, "invalid_tool_calls", None)
     if invalid:
-        parts.append(f"invalid_tool_calls={json.dumps(invalid, ensure_ascii=False, default=str)}")
-    return "；".join(parts)
+        summary += f"；invalid_tool_calls={len(invalid)} 筆"
+
+    dump = {
+        "response_metadata": meta,
+        "additional_kwargs": getattr(m, "additional_kwargs", None),
+        "usage_metadata": getattr(m, "usage_metadata", None),
+        "invalid_tool_calls": invalid,
+        "content_repr": repr(getattr(m, "content", None))[:500],
+    }
+    return summary, json.dumps(dump, ensure_ascii=False, default=str, indent=2)[:6000]
 
 
 def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None, resume_value: Optional[dict] = None):
@@ -708,11 +719,12 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
                     }
 
                 if empty_generations:
-                    detail = " ｜ ".join(empty_generations)
-                    entry["warning"] = f"模型沒有產生任何文字或工具呼叫（{detail}）"
-                    # 也印到 server console：使用者不一定會展開 trace，而這個訊息是
-                    # 判斷「換模型還是縮 schema」的唯一依據。
-                    print(f"[deep_agent] 空回應 node={depth_prefix}{node_name} {detail}", flush=True)
+                    summaries = " ｜ ".join(s for s, _ in empty_generations)
+                    entry["warning"] = f"模型沒有產生任何文字或工具呼叫（{summaries}）"
+                    # 完整傾印只印到 console：它動輒上千字，塞進 trace 卡片會蓋掉
+                    # 其他步驟，但這包東西才是真正能定位原因的依據。
+                    for _, dump in empty_generations:
+                        print(f"[deep_agent] 空回應 node={depth_prefix}{node_name}\n{dump}", flush=True)
                     saw_empty_generation = True
 
                 if tool_calls:
@@ -741,9 +753,11 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
         # 沒有 tool call 的訊息就收工了。這裡一定要明講，不然前端拿到空字串會走
         # appendMessage("") 畫出一顆空氣泡，使用者分不出「跑完了」跟「靜默失敗」。
         if saw_empty_generation:
+            # 不要在這裡猜原因。第一版寫死「MALFORMED_FUNCTION_CALL 代表…」，實測拿到的
+            # 卻是 STOP，等於把一個錯的結論當成診斷顯示給使用者看。
             message = ("模型回了空訊息（既沒有文字也沒有工具呼叫）而提前結束。"
-                       "展開上方決策過程看 finish_reason：MALFORMED_FUNCTION_CALL 代表模型"
-                       "生不出合法的工具呼叫，換一個 function calling 較穩的引擎會比較實在。")
+                       "上方決策過程有 finish_reason，server console 有完整的 "
+                       "response_metadata 傾印，判斷原因要看那一包。")
         else:
             message = "Deep Agent 沒有產生任何回覆，展開上方決策過程可以看到實際執行到哪一步。"
         yield {"type": "error", "message": message}
