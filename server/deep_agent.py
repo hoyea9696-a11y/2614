@@ -283,6 +283,8 @@ DEEP_AGENT_SYSTEM_PROMPT = """你是 AI Detector 系統的協調者，負責把�
 evaluation_agent 與 experiment_analyst 的分工：問「這個模型好不好」派前者，問
 「這幾次訓練哪個好」「參數改了有沒有用」「有沒有過擬合」「之前訓練過哪些東西」
 派後者——後者會去翻 /runs 底下每次訓練的 results.csv 與 args.yaml，看的是歷程不是單點。
+派給 experiment_analyst 時「不要」在任務描述裡指定資料夾路徑（不要寫 /runs/detect
+之類的），它自己知道去哪裡找；你猜的路徑通常不存在，只會讓它多花兩輪繞回來。
 
 你自己只有 read_file 與 edit_file 兩個檔案工具，用途只有一個：維護 /memories/AGENTS.md
 這份長期記憶。翻目錄、找檔案、讀訓練紀錄都是 experiment_analyst 的工作，不要自己做。
@@ -403,9 +405,15 @@ ANALYST_SUBAGENT_PROMPT = """你是 Experiment Analyst，負責從訓練紀錄�
 - /memories：可讀寫，長期記憶。
 
 做法：
-1. 先 glob 或 ls 確認有哪些實驗資料夾，不要憑印象猜實驗名稱。
-2. read_file 讀 results.csv 與 args.yaml。results.csv 可能很長，重點是「最後幾個 epoch 的
-   數值」與「整條曲線的走勢」，不要把整份原文貼回去。
+1. 用 glob("/runs/train/*/results.csv") 一次拿到所有有紀錄的實驗，不要用 ls 一層一層翻，
+   也不要憑印象猜實驗名稱。沒有 results.csv 的資料夾代表那次沒跑出東西，直接跳過。
+2. read_file 讀 results.csv 與 args.yaml。**一則回覆只發一個 read_file**，讀到結果再發
+   下一個——同一則回覆裡發出多個 read_file 會讓模型端生不出合法的工具呼叫，整個任務
+   會直接失敗（實測 finish_reason=MALFORMED_FUNCTION_CALL、什麼都不回）。
+   實驗超過 6 個時不要全部讀，挑「檔名看起來是正式實驗的」與「最近修改的」6 個以內，
+   並在回報裡說明你挑了哪幾個、跳過哪幾個。
+   results.csv 可能很長，重點是「最後幾個 epoch 的數值」與「整條曲線的走勢」，
+   不要把整份原文貼回去。
 3. 交叉比對參數與結果，找出可解讀的因果：哪個參數改了之後 mAP 有進步、哪次是過擬合
   （train loss continue 下降但 val mAP 停滯或下滑）、哪次根本沒跑完。
 4. 把比較結果寫成一份 markdown 存進 /workspace，然後在回報裡直接給結論。
@@ -470,10 +478,17 @@ def _build_backend():
     )
 
 
-def _build_subagents(chat_model):
+def _build_subagents(chat_model, unsupported_tools=frozenset()):
     """三個宣告式 SubAgent。model 明確指定成跟主 agent 同一個 chat_model，
     不讓 deepagents 掉回它預設的 claude-sonnet——這個專案的 .env 沒有
-    ANTHROPIC_API_KEY，掉回預設會直接在執行期噴驗證錯誤。"""
+    ANTHROPIC_API_KEY，掉回預設會直接在執行期噴驗證錯誤。
+
+    unsupported_tools 跟 build_deep_agent 收的是同一份（見 GEMINI_UNSUPPORTED_TOOLS）。
+    subagent 各自組自己的 middleware 清單、也各自有完整的 base stack，所以 provider
+    吃不下的工具「每一個 subagent 都要再排除一次」——只套在主 agent 上不夠。實測就是
+    這樣踩到的：experiment_analyst 的排除清單只有 execute，於是它拿得到 write_todos，
+    在讀檔那一步回了 finish_reason=MALFORMED_FUNCTION_CALL 的空訊息。三個 domain
+    subagent 沒事，是因為 DOMAIN_SUBAGENT_EXCLUDED_TOOLS 本來就含 write_todos。"""
     return [
         {
             "name": "data_agent",
@@ -482,7 +497,7 @@ def _build_subagents(chat_model):
             "system_prompt": DATA_SUBAGENT_PROMPT,
             "tools": DATA_TOOLS,
             "model": chat_model,
-            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS | frozenset(unsupported_tools))],
         },
         {
             "name": "model_agent",
@@ -490,7 +505,7 @@ def _build_subagents(chat_model):
             "system_prompt": MODEL_SUBAGENT_PROMPT,
             "tools": MODEL_TOOLS,
             "model": chat_model,
-            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS | frozenset(unsupported_tools))],
         },
         {
             "name": "evaluation_agent",
@@ -499,7 +514,7 @@ def _build_subagents(chat_model):
             "system_prompt": EVAL_SUBAGENT_PROMPT,
             "tools": EVAL_TOOLS,
             "model": chat_model,
-            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS | frozenset(unsupported_tools))],
         },
         {
             # 階段 B 新增的角色，也是 Manager 模式做不到的那件事：它不綁任何領域工具，
@@ -519,7 +534,7 @@ def _build_subagents(chat_model):
             # 它要用的是 FilesystemMiddleware 注入的內建工具，不是領域工具。
             "tools": [],
             "model": chat_model,
-            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(ANALYST_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(ANALYST_EXCLUDED_TOOLS | frozenset(unsupported_tools))],
         },
         {
             # 這個 spec 的名稱必須正好是 "general-purpose"：create_deep_agent 預設會自動
@@ -544,7 +559,7 @@ def _build_subagents(chat_model):
             "system_prompt": GENERAL_PURPOSE_SUBAGENT_PROMPT,
             "tools": [],
             "model": chat_model,
-            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(GENERAL_PURPOSE_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(GENERAL_PURPOSE_EXCLUDED_TOOLS | frozenset(unsupported_tools))],
         },
     ]
 
@@ -575,7 +590,7 @@ def build_deep_agent(chat_model, unsupported_tools=frozenset()):
     return create_deep_agent(
         model=chat_model,
         system_prompt=system_prompt,
-        subagents=_build_subagents(chat_model),
+        subagents=_build_subagents(chat_model, unsupported_tools),
         # 頂層設定會被宣告式 SubAgent 繼承，所以 model_agent 裡的 skill_train
         # 也會先暫停等確認，不用在 subagent 上再設一次。
         interrupt_on={TRAIN_TOOL_NAME: True},
