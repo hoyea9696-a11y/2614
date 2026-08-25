@@ -1179,6 +1179,11 @@ async function finishOrResumeAgentTurn(result, threadId, modelType, resumeUrl = 
         }
         chatMessages.push({ role: 'assistant', content: reply });
         persistChatHistory();
+        // 有回覆但過程中出過錯：回覆可能不完整，甚至是模型在沒有結果的情況下編出來的。
+        // 只把警告留在決策過程卡片裡不夠——那要展開才看得到，使用者會直接相信上面那段話。
+        if (sawError) {
+            appendMessage("⚠️ 這一輪有步驟失敗，上面的回覆可能不完整或不準確，請展開決策過程確認。", 'error');
+        }
     } else if (sawError) {
         appendMessage("執行中發生錯誤，詳情請展開上方決策過程", 'error');
     } else {

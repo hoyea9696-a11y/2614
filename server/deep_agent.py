@@ -224,6 +224,51 @@ _PLANNING_STEP_NO_TODOS = """1. 需求需要兩個步驟以上時，先在回覆
    這個引擎沒有 write_todos 可用，不要嘗試呼叫它。單一步驟的請求（例如「檢查一下資料集」）
    直接派工，也不要先探查環境。"""
 
+def _is_empty_generation(response) -> bool:
+    """判斷一次模型呼叫是不是「既沒有文字也沒有 tool call」的空回應。
+
+    handler() 回的是 ModelResponse（.result 是訊息 list），也可能是包了一層 Command 的
+    ExtendedModelResponse，所以先解外層再看內容。
+    """
+    inner = getattr(response, "model_response", None) or response
+    for m in getattr(inner, "result", None) or []:
+        if getattr(m, "tool_calls", None):
+            return False
+        if _extract_text(getattr(m, "content", None)):
+            return False
+    return True
+
+
+class RetryEmptyGenerationMiddleware(AgentMiddleware):
+    """模型回空訊息時就地重試一次，不要讓那一步靜默失敗。
+
+    為什麼需要：Gemini 偶爾會回一個「finish_reason=MALFORMED_FUNCTION_CALL、
+    output_tokens=0」的空 candidate——實測發生在 experiment_analyst 拿到 11 個檔案路徑、
+    要一次發多個 read_file 的時候。這種失敗在 HTTP 層是成功的，ReAct 迴圈拿到沒有
+    tool call 的訊息就認定「沒有下一步」，那個 subagent 就這樣空手回報。
+
+    這跟 multi_agent._invoke_with_retry 處理的是同一類問題（那邊的註解寫「這種通常
+    換一次生成就會恢復正常，不是每次都會發生」），只是這裡沒辦法包在 .invoke() 外面
+    ——呼叫是 deepagents 的 ReAct 迴圈自己發的，只能用 middleware 從裡面攔。
+
+    重試不是無代價的：失敗時會多花一次呼叫的額度。所以預設只重一次，兩次都空就讓它
+    往下走，由 stream_deep_trace 的診斷把 finish_reason 報出來。
+    """
+
+    def __init__(self, retries: int = 1):
+        super().__init__()
+        self._retries = retries
+
+    def wrap_model_call(self, request, handler):
+        response = handler(request)
+        for attempt in range(self._retries):
+            if not _is_empty_generation(response):
+                return response
+            print(f"[deep_agent] 模型回空訊息，重試第 {attempt + 1} 次", flush=True)
+            response = handler(request)
+        return response
+
+
 DEEP_AGENT_SYSTEM_PROMPT = """你是 AI Detector 系統的協調者，負責把使用者的需求拆解成步驟，
 再交給專責的 subagent 執行。你自己不直接呼叫任何訓練／推論／資料集工具。
 
@@ -408,12 +453,19 @@ def _build_backend():
             encoding="utf-8",
         )
 
+    # route 的 key「一定」要帶結尾斜線。CompositeBackend.__init__ 的 docstring 寫
+    # 「Prefixes must start with / and should end with /」，而 _remap_file_info_path
+    # 是用 route_prefix[:-1] 把前綴接回 ls／glob 的結果——它假設最後一個字元是斜線。
+    # 寫成 "/runs" 的話砍掉的是真正的字元，ls／glob 回給模型的路徑會變成 /run/train/...
+    # （少一個 s）。讀寫本身還是通的（_route_for_path 會自己補斜線再比對），所以症狀
+    # 不是報錯，是模型照著回傳的路徑去 read_file，那些路徑不匹配任何 route、掉到
+    # StateBackend，然後「檔案不存在」——experiment_analyst 整條路是死的。
     return CompositeBackend(
         default=StateBackend(),
         routes={
-            "/runs": FilesystemBackend(root_dir=RUNS_DIR, virtual_mode=True),
-            "/memories": FilesystemBackend(root_dir=MEMORY_DIR, virtual_mode=True),
-            "/workspace": FilesystemBackend(root_dir=WORKSPACE_DIR, virtual_mode=True),
+            "/runs/": FilesystemBackend(root_dir=RUNS_DIR, virtual_mode=True),
+            "/memories/": FilesystemBackend(root_dir=MEMORY_DIR, virtual_mode=True),
+            "/workspace/": FilesystemBackend(root_dir=WORKSPACE_DIR, virtual_mode=True),
         },
     )
 
@@ -430,7 +482,7 @@ def _build_subagents(chat_model):
             "system_prompt": DATA_SUBAGENT_PROMPT,
             "tools": DATA_TOOLS,
             "model": chat_model,
-            "middleware": [DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
         },
         {
             "name": "model_agent",
@@ -438,7 +490,7 @@ def _build_subagents(chat_model):
             "system_prompt": MODEL_SUBAGENT_PROMPT,
             "tools": MODEL_TOOLS,
             "model": chat_model,
-            "middleware": [DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
         },
         {
             "name": "evaluation_agent",
@@ -447,7 +499,7 @@ def _build_subagents(chat_model):
             "system_prompt": EVAL_SUBAGENT_PROMPT,
             "tools": EVAL_TOOLS,
             "model": chat_model,
-            "middleware": [DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(DOMAIN_SUBAGENT_EXCLUDED_TOOLS)],
         },
         {
             # 階段 B 新增的角色，也是 Manager 模式做不到的那件事：它不綁任何領域工具，
@@ -467,7 +519,7 @@ def _build_subagents(chat_model):
             # 它要用的是 FilesystemMiddleware 注入的內建工具，不是領域工具。
             "tools": [],
             "model": chat_model,
-            "middleware": [DropToolsMiddleware(ANALYST_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(ANALYST_EXCLUDED_TOOLS)],
         },
         {
             # 這個 spec 的名稱必須正好是 "general-purpose"：create_deep_agent 預設會自動
@@ -492,7 +544,7 @@ def _build_subagents(chat_model):
             "system_prompt": GENERAL_PURPOSE_SUBAGENT_PROMPT,
             "tools": [],
             "model": chat_model,
-            "middleware": [DropToolsMiddleware(GENERAL_PURPOSE_EXCLUDED_TOOLS)],
+            "middleware": [RetryEmptyGenerationMiddleware(), DropToolsMiddleware(GENERAL_PURPOSE_EXCLUDED_TOOLS)],
         },
     ]
 
@@ -537,7 +589,9 @@ def build_deep_agent(chat_model, unsupported_tools=frozenset()):
         memory=[MEMORY_FILE_VPATH],
         # 使用者 middleware 會插在 base stack（Todo/Filesystem/SubAgent 等注入工具的
         # middleware）之後，所以這裡拿得到、也拿得掉它們注入的工具。
-        middleware=[DropToolsMiddleware(excluded)],
+        # 順序跟 _build_subagents 一致：Retry 在外、DropTools 在內。兩種順序功能上
+        # 等價（重試時 DropTools 會再套一次），統一寫法只是為了少一個要記的例外。
+        middleware=[RetryEmptyGenerationMiddleware(), DropToolsMiddleware(excluded)],
         checkpointer=SqliteSaver(conn),
     )
 
@@ -767,7 +821,7 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
                 if last_text:
                     entry["text"] = last_text
                     # 給使用者的最終回覆只能取最外層主 agent 的最後一段文字——subagent
-                    # 的結論是寫給主 agent 看的中間產物（而且是英文的），拿它當回覆會
+                    # 的結論是寫給主 agent 看的中間產物，拿它當回覆會
                     # 蓋掉主 agent 整理過的版本。
                     if not namespace:
                         last_reply = last_text
@@ -801,5 +855,16 @@ def stream_deep_trace(graph, thread_id: str, user_message: Optional[str] = None,
         # 該顯示的 token 統計不會因為這條路徑而消失。
         yield {"type": "final", "reply": None, "usage": total_usage, "llm_calls": llm_calls}
         return
+
+    if saw_empty_generation:
+        # 有回覆，但這一輪出現過空回應（而且 RetryEmptyGenerationMiddleware 重試也沒
+        # 救回來）。這比「完全沒有回覆」更危險：實測看過 experiment_analyst 空手回報後，
+        # 主 agent 拿到空的 task 回傳，自己編了一句「我正在比較…請稍候」就結束——讀起來
+        # 像成功，實際上什麼都沒做。所以回覆照送，但一定要同時明講它不可信。
+        yield {
+            "type": "error",
+            "message": "這一輪有步驟回了空訊息（重試後仍然失敗），下面的回覆可能不完整、"
+                       "或是模型在沒有實際結果的情況下自己編出來的。請展開決策過程確認每一步。",
+        }
 
     yield {"type": "final", "reply": last_reply, "usage": total_usage, "llm_calls": llm_calls}
